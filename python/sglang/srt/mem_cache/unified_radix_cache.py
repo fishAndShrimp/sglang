@@ -791,6 +791,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
 
+        from _zzz_dbgtrace import DBGTRACE, fmt_tree_after_change
+        DBGTRACE(is_insert and result is not None, lambda: fmt_tree_after_change(self, req, "cache_finished_req"))
+
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
@@ -896,6 +899,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 insert_result=result,
                 insert_params=insert_params,
             )
+
+        from _zzz_dbgtrace import DBGTRACE, fmt_tree_after_change
+        DBGTRACE(True, lambda: fmt_tree_after_change(self, req, "cache_unfinished_req"))
 
     # ---- Internal Helpers ----
 

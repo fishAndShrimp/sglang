@@ -96,6 +96,10 @@ class SchedulerRequestReceiver:
 
         self._finalize_shm_features(recv_reqs)
 
+        from _zzz_dbgtrace import DBGTRACE, fmt_recv_reqs, log_input_prefix_matches
+        DBGTRACE(bool(recv_reqs), lambda: fmt_recv_reqs(recv_reqs))
+        DBGTRACE(bool(recv_reqs), lambda: log_input_prefix_matches(recv_reqs))
+
         return recv_reqs
 
     def _pull_raw_reqs(self) -> Optional[List]:

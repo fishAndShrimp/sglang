@@ -1083,6 +1083,47 @@ class SchedulerDisaggregationPrefillMixin:
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 
+            # ── walk tree from last_node.parent to find mamba at start_idx boundary ──
+            pf_tree_mamba_idx = None   # prefill-side GPU pool index for tree mamba
+            pf_tree_mamba_prefix = 0   # cumulative prefix length (from root)
+            pf_tree_mamba_node_id = 0
+            if (
+                start_idx > 0
+                and req.last_node is not None
+                and req.last_node != self.tree_cache.root_node
+            ):
+                from sglang.srt.mem_cache.unified_cache_components import ComponentType
+                node = req.last_node.parent
+                cumulative = 0
+                ct_m = ComponentType.MAMBA
+                while node is not None and node != self.tree_cache.root_node:
+                    cumulative += len(node.key) if node.key else 0
+                    if cumulative == start_idx and len(node.component_data) > ct_m:
+                        cd = node.component_data[ct_m]
+                        if cd.value is not None:
+                            pf_tree_mamba_idx = cd.value.cpu().numpy()
+                            pf_tree_mamba_prefix = cumulative
+                            pf_tree_mamba_node_id = node.id
+                            break
+                    node = node.parent
+
+            # ── stash tree-mamba metadata into spare cached_tokens slots ──
+            # cached_tokens is (size, 16) int32. Slot map (see MetadataBuffers):
+            #   0=cached  1=device  2=host  3=storage  4=image  5=audio  6=video
+            #   7-15 = spare (unused by the base protocol)
+            # We use slot 7 for the cumulative prefix length of the tree mamba,
+            # and slot 8 for its originating radix-tree node id.
+            if pf_tree_mamba_idx is not None:
+                buf = self.disagg_metadata_buffers
+                buf.cached_tokens[req.metadata_buffer_index][7] = pf_tree_mamba_prefix
+                buf.cached_tokens[req.metadata_buffer_index][8] = pf_tree_mamba_node_id
+
+            from _zzz_dbgtrace import DBGTRACE, fmt_tree_mamba_sent
+            DBGTRACE(True, lambda: fmt_tree_mamba_sent(
+                req, start_idx, pf_tree_mamba_idx,
+                pf_tree_mamba_prefix, pf_tree_mamba_node_id,
+            ))
+
             # Most state payloads read token-pool rows and should match the KV
             # range actually materialized on prefill. C128 state is request
             # scoped, so its transfer index must use the logical input length
@@ -1091,6 +1132,10 @@ class SchedulerDisaggregationPrefillMixin:
             c128_seq_len = transfer_input_len
 
             def _mamba_payload():
+                # TODO: when decode-side transfer protocol supports multiple mamba
+                # indices, prepend pf_tree_mamba_idx here (if not None) so the
+                # tree-node mamba state at the start_idx page boundary is sent
+                # alongside the request's own mamba.
                 return [
                     self.req_to_token_pool.req_index_to_mamba_index_mapping[
                         req.req_pool_idx
@@ -1098,6 +1143,9 @@ class SchedulerDisaggregationPrefillMixin:
                     .cpu()
                     .numpy()
                 ]
+
+            from _zzz_dbgtrace import DBGTRACE, fmt_pd_send_mamba_states
+            DBGTRACE(last_chunk, lambda: fmt_pd_send_mamba_states(self.tree_cache, req))
 
             def _swa_payload():
                 window_size = self.sliding_window_size
@@ -1174,6 +1222,16 @@ class SchedulerDisaggregationPrefillMixin:
             req.req_pool_idx, start_idx:end_idx
         ]
         page_indices = kv_to_page_indices(kv_indices, page_size)
+
+        from _zzz_dbgtrace import DBGTRACE, fmt_kv_send_detail
+        DBGTRACE(True, lambda: fmt_kv_send_detail(
+            req, page_indices, start_idx, end_idx, last_chunk,
+            state_indices,
+            self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types,
+            page_size,
+            self.tree_cache,
+        ))
+
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return
         req.disagg_kv_sender.send(page_indices, state_indices)

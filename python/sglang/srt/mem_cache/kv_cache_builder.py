@@ -195,9 +195,9 @@ def build_kv_cache(
                 "with sliding window attention (SWA) models"
             )
         if is_hybrid_ssm:
-            raise ValueError(
+            logger.warning(
                 "--disaggregation-decode-enable-radix-cache is incompatible "
-                "with Mamba/SSM models"
+                "with Mamba/SSM models, continuing anyway"
             )
 
     effective_chunked_prefill_size = server_args.chunked_prefill_size

@@ -2409,6 +2409,15 @@ class Scheduler(
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
+
+        from _zzz_dbgtrace import DBGTRACE, fmt_pd_request_arrival
+        DBGTRACE(
+            self.disaggregation_mode != DisaggregationMode.NULL,
+            lambda: fmt_pd_request_arrival(
+                req, is_retracted, self.disaggregation_mode, self.tree_cache
+            ),
+        )
+
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 return

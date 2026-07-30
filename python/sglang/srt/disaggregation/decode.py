@@ -1944,6 +1944,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 else:
                     transferred_reqs.append(decode_req.req)
+                    from _zzz_dbgtrace import DBGTRACE, fmt_pd_recv
+                    DBGTRACE(True, lambda: fmt_pd_recv(decode_req.req, self.scheduler.page_size))
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,
