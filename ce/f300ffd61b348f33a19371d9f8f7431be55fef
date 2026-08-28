@@ -1,0 +1,251 @@
+python/sglang/srt/models/qwen4_exp.py
+  s_c8bb210e7be9a0::t_01fafb5242d8e6 428
+python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
+  s_9fc9d5d390af90::t_0cebe8f3871adb 1059
+  s_15801e44eab4f5::t_bd815e9b8da756 1638
+  h_a73ec97772d974 1404
+python/sglang/srt/layers/hyperconnection.py
+  h_a73ec97772d974 13
+  s_9079235f6d5158::t_92649507b6dead 257
+  s_ffd8647fc4224a::t_2aeea69746da52 56
+  s_78ceac07f7f619::t_8286bec368b820 308
+python/sglang/srt/layers/hc_mix_triton.py
+  s_46f71fae0951fd::t_ec0cc3b8c87291 193
+python/sglang/srt/layers/attention/qsa/qsa_indexer.py
+  s_a46faae9d0f930::t_f0aa894516a3e1 124
+  s_5c2460f1b9e0e8::t_ba095a73780d59 131
+  h_a73ec97772d974 662-674
+  s_b212140b60e58e::t_88bce3e0dc613e 526
+python/sglang/kernels/ops/attention/fla/layernorm_gated.py
+  h_a73ec97772d974 316,330,332-348
+python/sglang/srt/layers/attention/qsa/kernel.py
+  s_1994a254d6b2ae::t_6ac3a79bc26759 33
+  h_a73ec97772d974 58-59,66-70,72-83,314-316,331-343,357-358,363,367,369-374
+  s_f3a9112aa577c6::t_9661959c6cc284 285
+python/sglang/srt/layers/attention/qsa/mqa.py
+  s_b13e9ae02e0765::t_cda3db26cfe806 411
+  s_49cc90f4ab43c7::t_e05227ee3da0d1 398
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "cef300ffd61b348f33a19371d9f8f7431be55fef",
+  "prompts": {},
+  "humans": {
+    "h_a73ec97772d974": {
+      "author": "Estrella-xx <820167017@qq.com>"
+    }
+  },
+  "sessions": {
+    "s_15801e44eab4f5": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-9f88a83b-a189-4521-8278-12e3179ce2b0",
+        "model": "default"
+      },
+      "human_author": "Estrella-xx <820167017@qq.com>",
+      "custom_attributes": {
+        "client_type": "ide",
+        "source_scene": "cue",
+        "edit_kind": "file_edit",
+        "tool": "trae-cue",
+        "external_session_id": "icr-9f88a83b-a189-4521-8278-12e3179ce2b0"
+      }
+    },
+    "s_1994a254d6b2ae": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-69c9dbe2-173c-45a5-bfc5-951a75e54061",
+        "model": "default"
+      },
+      "human_author": "Estrella-xx <820167017@qq.com>",
+      "custom_attributes": {
+        "edit_kind": "file_edit",
+        "source_scene": "cue",
+        "client_type": "ide",
+        "tool": "trae-cue",
+        "external_session_id": "icr-69c9dbe2-173c-45a5-bfc5-951a75e54061"
+      }
+    },
+    "s_46f71fae0951fd": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-4820d551-625b-457b-92a4-10ed247c9f13",
+        "model": "default"
+      },
+      "human_author": "Estrella-xx <820167017@qq.com>",
+      "custom_attributes": {
+        "source_scene": "cue",
+        "client_type": "ide",
+        "tool": "trae-cue",
+        "edit_kind": "file_edit",
+        "external_session_id": "icr-4820d551-625b-457b-92a4-10ed247c9f13"
+      }
+    },
+    "s_49cc90f4ab43c7": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-bb76cb9b-2f10-4142-b7d9-7bc980c59968",
+        "model": "default"
+      },
+      "human_author": "Estrella-xx <820167017@qq.com>",
+      "custom_attributes": {
+        "external_session_id": "icr-bb76cb9b-2f10-4142-b7d9-7bc980c59968",
+        "edit_kind": "file_edit",
+        "client_type": "ide",
+        "source_scene": "cue",
+        "tool": "trae-cue"
+      }
+    },
+    "s_5c2460f1b9e0e8": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-e9cb5ad2-8524-4aab-907a-72806bb311d8",
+        "model": "default"
+      },
+      "human_author": "Estrella-xx <820167017@qq.com>",
+      "custom_attributes": {
+        "edit_kind": "file_edit",
+        "source_scene": "cue",
+        "tool": "trae-cue",
+        "external_session_id": "icr-e9cb5ad2-8524-4aab-907a-72806bb311d8",
+        "client_type": "ide"
+      }
+    },
+    "s_78ceac07f7f619": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-806996cf-6923-4367-ae9b-dbe966b44ba4",
+        "model": "default"
+      },
+      "human_author": "Estrella-xx <820167017@qq.com>",
+      "custom_attributes": {
+        "edit_kind": "file_edit",
+        "client_type": "ide",
+        "external_session_id": "icr-806996cf-6923-4367-ae9b-dbe966b44ba4",
+        "source_scene": "cue",
+        "tool": "trae-cue"
+      }
+    },
+    "s_9079235f6d5158": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-abf528ac-4930-4ac7-a5a6-dbe9ce82089b",
+        "model": "default"
+      },
+      "human_author": "Estrella-xx <820167017@qq.com>",
+      "custom_attributes": {
+        "client_type": "ide",
+        "tool": "trae-cue",
+        "source_scene": "cue",
+        "external_session_id": "icr-abf528ac-4930-4ac7-a5a6-dbe9ce82089b",
+        "edit_kind": "file_edit"
+      }
+    },
+    "s_9fc9d5d390af90": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-21350c57-a0ff-4c7d-a958-88765fbdab79",
+        "model": "default"
+      },
+      "human_author": "Estrella-xx <820167017@qq.com>",
+      "custom_attributes": {
+        "client_type": "ide",
+        "edit_kind": "file_edit",
+        "source_scene": "cue",
+        "external_session_id": "icr-21350c57-a0ff-4c7d-a958-88765fbdab79",
+        "tool": "trae-cue"
+      }
+    },
+    "s_a46faae9d0f930": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-b144133b-ba89-4a07-bbf3-726e215e5104",
+        "model": "default"
+      },
+      "human_author": "Estrella-xx <820167017@qq.com>",
+      "custom_attributes": {
+        "tool": "trae-cue",
+        "source_scene": "cue",
+        "external_session_id": "icr-b144133b-ba89-4a07-bbf3-726e215e5104",
+        "edit_kind": "file_edit",
+        "client_type": "ide"
+      }
+    },
+    "s_b13e9ae02e0765": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-9b23137d-b904-4a1b-b427-51dacf02e4e6",
+        "model": "default"
+      },
+      "human_author": "Estrella-xx <820167017@qq.com>",
+      "custom_attributes": {
+        "source_scene": "cue",
+        "external_session_id": "icr-9b23137d-b904-4a1b-b427-51dacf02e4e6",
+        "client_type": "ide",
+        "edit_kind": "file_edit",
+        "tool": "trae-cue"
+      }
+    },
+    "s_b212140b60e58e": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-1467215b-d576-4d89-9547-bbeb358ec432",
+        "model": "default"
+      },
+      "human_author": "Estrella-xx <820167017@qq.com>",
+      "custom_attributes": {
+        "client_type": "ide",
+        "external_session_id": "icr-1467215b-d576-4d89-9547-bbeb358ec432",
+        "edit_kind": "file_edit",
+        "tool": "trae-cue",
+        "source_scene": "cue"
+      }
+    },
+    "s_c8bb210e7be9a0": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-75d10fce-6b65-4f9e-8f48-6d361e4fd6f4",
+        "model": "default"
+      },
+      "human_author": "Estrella-xx <820167017@qq.com>",
+      "custom_attributes": {
+        "tool": "trae-cue",
+        "external_session_id": "icr-75d10fce-6b65-4f9e-8f48-6d361e4fd6f4",
+        "client_type": "ide",
+        "source_scene": "cue",
+        "edit_kind": "file_edit"
+      }
+    },
+    "s_f3a9112aa577c6": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-c76b4cca-fa26-4eee-a526-261a129d224b",
+        "model": "default"
+      },
+      "human_author": "Estrella-xx <820167017@qq.com>",
+      "custom_attributes": {
+        "edit_kind": "file_edit",
+        "client_type": "ide",
+        "tool": "trae-cue",
+        "source_scene": "cue",
+        "external_session_id": "icr-c76b4cca-fa26-4eee-a526-261a129d224b"
+      }
+    },
+    "s_ffd8647fc4224a": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-2450bec0-1efc-4084-b8bd-b1340ab2cddd",
+        "model": "default"
+      },
+      "human_author": "Estrella-xx <820167017@qq.com>",
+      "custom_attributes": {
+        "source_scene": "cue",
+        "external_session_id": "icr-2450bec0-1efc-4084-b8bd-b1340ab2cddd",
+        "client_type": "ide",
+        "edit_kind": "file_edit",
+        "tool": "trae-cue"
+      }
+    }
+  }
+}
