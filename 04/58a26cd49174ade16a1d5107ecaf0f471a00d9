@@ -1,0 +1,65 @@
+python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py
+  s_420e24af948be1::t_ce69e10cfb25bf 16,37-44
+  s_420e24af948be1::t_c6fff5ad284510 179,183-186,192-208
+  s_420e24af948be1::t_c187bbec089aff 15,36
+python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
+  s_420e24af948be1::t_cbfd56e90363ee 289-292,1357,1365,1375,1377
+  s_1c77281ea74dfa::t_0f0a739361fb0d 1366-1372
+python/sglang/srt/models/qwen4_exp.py
+  h_a73ec97772d974 40,66,1017-1035,1052-1082
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "0458a26cd49174ade16a1d5107ecaf0f471a00d9",
+  "prompts": {},
+  "humans": {
+    "h_a73ec97772d974": {
+      "author": "Estrella-xx <820167017@qq.com>"
+    }
+  },
+  "sessions": {
+    "s_1c77281ea74dfa": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a92998c748d937a59ae30f7",
+        "model": "glm-5.3"
+      },
+      "human_author": "Estrella-xx <820167017@qq.com>",
+      "custom_attributes": {
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "tool_use_id": "6a929ae6748d937a59ae316e",
+        "external_session_id": "6a92998c748d937a59ae30f7",
+        "source_scene": "agent",
+        "operation_id": "6a929ae6748d937a59ae316e",
+        "dedupe_key": "6a92998c748d937a59ae30f7:6a929ae6748d937a59ae316e:afterEdit:4246cae8",
+        "session_id": "6a92998c748d937a59ae30f7",
+        "runtime_client": "trae-tob-git-ai",
+        "edit_kind": "file_edit",
+        "client_type": "ide",
+        "tool_type": "builtin"
+      }
+    },
+    "s_420e24af948be1": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a923b01748d937a59ae2e49",
+        "model": "glm-5.3"
+      },
+      "human_author": "Estrella-xx <820167017@qq.com>",
+      "custom_attributes": {
+        "tool_use_id": "6a9285c4748d937a59ae303c",
+        "external_session_id": "6a923b01748d937a59ae2e49",
+        "source_scene": "agent",
+        "tool_type": "builtin",
+        "session_id": "6a923b01748d937a59ae2e49",
+        "runtime_client": "trae-tob-git-ai",
+        "dedupe_key": "6a923b01748d937a59ae2e49:6a9285c4748d937a59ae303c:afterEdit:eb480f70",
+        "edit_kind": "file_edit",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "operation_id": "6a9285c4748d937a59ae303c",
+        "client_type": "ide"
+      }
+    }
+  }
+}
