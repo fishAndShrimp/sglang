@@ -5,7 +5,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.layers import hc_mix_triton
+from sglang.srt.layers import hc_mix_triton, hyperconnection
 from sglang.srt.layers.hyperconnection import _is_cuda_jit_tensor
 from sglang.srt.layers.hc_mix_triton import (
     _FUSED_MIX_MAX_ROWS,
@@ -58,9 +58,10 @@ _TOLERANCES = {
 def test_npu_cuda_compat_shim_does_not_enable_cuda_kernels(monkeypatch):
     npu_tensor = SimpleNamespace(
         is_cuda=True,
-        device=SimpleNamespace(type="npu"),
     )
 
+    monkeypatch.setattr(hyperconnection, "_is_npu", True)
+    monkeypatch.setattr(hc_mix_triton, "_is_npu", True)
     assert not _is_cuda_jit_tensor(npu_tensor)
     monkeypatch.setattr(hc_mix_triton, "_deterministic_inference_cached", False)
     assert not fused_hc_mix_supported(npu_tensor, npu_tensor, npu_tensor)

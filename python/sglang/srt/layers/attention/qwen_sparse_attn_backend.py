@@ -39,9 +39,11 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_packed_decode_triton,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_npu
 
 logger = logging.getLogger(__name__)
+
+_is_npu = is_npu()
 
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
@@ -512,7 +514,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         # to a host-side check, introducing a synchronization in every decode
         # step. Keep the asynchronous guard on backends that implement it;
         # QSA metadata validation on NPU must not add a host sync to this path.
-        if device.type != "npu":
+        if not _is_npu:
             torch._assert_async(
                 (end_blocks * compress_ratio <= token_slot_table.shape[1]).all()
             )
@@ -581,7 +583,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         # misaligned prefix would leave a shared group half-written.
         # See _qsa_write_plan: this is a diagnostic invariant, while the NPU
         # fallback turns it into a device-to-host synchronization.
-        if prefix_lens.device.type != "npu":
+        if not _is_npu:
             torch._assert_async((prefix_lens % ratio == 0).all())
         # Each row spans at most ceil(extend_len / ratio) blocks, so the
         # token count and row count bound the plan without a sync.
@@ -1067,8 +1069,12 @@ class QwenSparseAttnBackend(AttentionBackend):
             supports_graph_metadata_kernels,
         )
 
-        return seq_lens.device.type == "cuda" and supports_graph_metadata_kernels(
-            metadata.indexer_metadata.token_to_kv_pool, seq_lens.device
+        return (
+            not _is_npu
+            and seq_lens.is_cuda
+            and supports_graph_metadata_kernels(
+                metadata.indexer_metadata.token_to_kv_pool, seq_lens.device
+            )
         )
 
     def _stage_extend_lens(self, spec_info, bs: int, num_tokens: int):
@@ -1417,7 +1423,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 q, layer, forward_batch, topk_indices
             )
             return self._pad_extend_output(output, num_output_rows)
-        if q.device.type != "cuda":
+        if _is_npu or not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
             pool = self.token_to_kv_pool
@@ -1651,7 +1657,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         pool = self.token_to_kv_pool
         k_buffer = pool.get_key_buffer(layer.layer_id)
         v_buffer = pool.get_value_buffer(layer.layer_id)
-        if q.device.type != "cuda":
+        if _is_npu or not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
             output = qsa_sparse_attention(q, k_buffer, v_buffer, slots, layer.scaling)

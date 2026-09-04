@@ -12,8 +12,8 @@ _is_npu = is_npu()
 
 
 def _is_cuda_jit_tensor(x: torch.Tensor) -> bool:
-    """Use the real device type; transfer_to_npu may make ``is_cuda`` true."""
-    return x.device.type == "cuda"
+    """Exclude NPU before using the transfer-compatible ``is_cuda`` flag."""
+    return not _is_npu and x.is_cuda
 
 
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
