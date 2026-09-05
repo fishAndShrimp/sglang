@@ -47,6 +47,37 @@ BLOCK_TOPK = TOKEN_TOPK // COMPRESS_RATIO
 FINAL_TOPK = TOKEN_TOPK + COMPRESS_RATIO - 1
 
 
+def _has_npu() -> bool:
+    try:
+        import torch_npu  # noqa: F401
+
+        return torch.npu.is_available()
+    except (ImportError, RuntimeError):
+        return False
+
+
+requires_npu = pytest.mark.skipif(not _has_npu(), reason="requires an Ascend NPU")
+
+
+def _qsa_npu_decode_inputs(batch: int = 3, context: int = 1024):
+    device = torch.device("npu:0")
+    page_size = 16
+    pages_per_request = context // page_size
+    num_pages = batch * pages_per_request
+    q = torch.randn(batch, 4, 128, dtype=torch.bfloat16, device=device)
+    k_cache = torch.randn(
+        num_pages, page_size, 1, 128, dtype=torch.bfloat16, device=device
+    )
+    page_table = torch.randperm(
+        num_pages, dtype=torch.int32, device=device
+    ).reshape(batch, pages_per_request)
+    context_lens = torch.full(
+        (batch,), context, dtype=torch.int32, device=device
+    )
+    context_lens -= torch.arange(batch, dtype=torch.int32, device=device) * 7
+    return q, k_cache, page_table, context_lens
+
+
 def test_qwen4_exp_indexer_config_is_read_from_text_config():
     config = Qwen4ExpConfig(
         text_config={
@@ -1829,6 +1860,89 @@ def test_qsa_decode_mqa_four_heads_gpu():
         max_model_len=192,
     )
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@requires_npu
+def test_qsa_npu_triton_decode_matches_torch_reference():
+    from sglang.srt.hardware_backend.npu.kernels.qwen3_8_flash_next.qsa import (
+        can_run_qsa_mqa_decode,
+        triton_qsa_mqa_decode,
+    )
+
+    q, k_cache, page_table, context_lens = _qsa_npu_decode_inputs()
+    assert can_run_qsa_mqa_decode(q, k_cache, page_table, context_lens)
+    expected = torch_qsa_mqa_decode(
+        q, k_cache, page_table, context_lens, max_model_len=1024
+    )
+    actual = triton_qsa_mqa_decode(
+        q, k_cache, page_table, context_lens, max_model_len=1024
+    )
+    torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=2e-2, atol=2e-2)
+
+
+@requires_npu
+def test_qsa_npu_supported_shape_dispatches_to_staged_kernel(monkeypatch):
+    import sglang.srt.hardware_backend.npu.kernels.qwen3_8_flash_next.qsa as staged
+    import sglang.srt.layers.attention.qsa.mqa as mqa
+
+    q, k_cache, page_table, context_lens = _qsa_npu_decode_inputs(batch=1)
+    sentinel = torch.randn(1, 1024, dtype=torch.float32, device=q.device)
+    calls = []
+
+    def fake_kernel(*args, **kwargs):
+        calls.append((args, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(staged, "triton_qsa_mqa_decode", fake_kernel)
+    actual = mqa.qsa_mqa_decode(
+        q, k_cache, page_table, context_lens, max_model_len=1024
+    )
+    assert actual is sentinel
+    assert len(calls) == 1
+
+
+@requires_npu
+def test_qsa_npu_unsupported_shape_uses_torch_fallback(monkeypatch):
+    import sglang.srt.layers.attention.qsa.mqa as mqa
+
+    device = torch.device("npu:0")
+    q = torch.randn(1, 4, 64, dtype=torch.bfloat16, device=device)
+    k_cache = torch.randn(64, 16, 1, 64, dtype=torch.bfloat16, device=device)
+    page_table = torch.arange(64, dtype=torch.int32, device=device).reshape(1, 64)
+    context_lens = torch.tensor([1024], dtype=torch.int32, device=device)
+    sentinel = torch.randn(1, 1024, dtype=torch.float32, device=device)
+    calls = []
+
+    def fake_fallback(*args, **kwargs):
+        calls.append((args, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(mqa, "torch_qsa_mqa_decode", fake_fallback)
+    actual = mqa.qsa_mqa_decode(
+        q, k_cache, page_table, context_lens, max_model_len=1024
+    )
+    assert actual is sentinel
+    assert len(calls) == 1
+
+
+@requires_npu
+def test_qsa_npu_wrapper_rejects_bypassed_unsupported_shape():
+    from sglang.srt.hardware_backend.npu.kernels.qwen3_8_flash_next.qsa import (
+        can_run_qsa_mqa_decode,
+        triton_qsa_mqa_decode,
+    )
+
+    device = torch.device("npu:0")
+    q = torch.randn(1, 4, 64, dtype=torch.bfloat16, device=device)
+    k_cache = torch.randn(64, 16, 1, 64, dtype=torch.bfloat16, device=device)
+    page_table = torch.arange(64, dtype=torch.int32, device=device).reshape(1, 64)
+    context_lens = torch.tensor([1024], dtype=torch.int32, device=device)
+
+    assert not can_run_qsa_mqa_decode(q, k_cache, page_table, context_lens)
+    with pytest.raises(ValueError, match="unsupported temporary QSA"):
+        triton_qsa_mqa_decode(
+            q, k_cache, page_table, context_lens, max_model_len=1024
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")

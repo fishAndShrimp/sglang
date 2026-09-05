@@ -410,10 +410,23 @@ def qsa_mqa_decode(
     max_model_len: int,
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
+    _validate_decode_inputs(q, k_cache, page_table, context_lens)
     if not _is_npu and q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_decode(
             q, k_cache, page_table, context_lens, max_model_len, score_scale
         )
+    if _is_npu:
+        # TODO(qsa-npu): Replace this local staging import with the final
+        # sgl_kernel_npu.indexer API after the kernel is migrated.
+        from sglang.srt.hardware_backend.npu.kernels.qwen3_8_flash_next.qsa import (
+            can_run_qsa_mqa_decode,
+            triton_qsa_mqa_decode,
+        )
+
+        if can_run_qsa_mqa_decode(q, k_cache, page_table, context_lens):
+            return triton_qsa_mqa_decode(
+                q, k_cache, page_table, context_lens, max_model_len, score_scale
+            )
     return torch_qsa_mqa_decode(
         q, k_cache, page_table, context_lens, max_model_len, score_scale
     )

@@ -250,7 +250,7 @@ def triton_expand_qsa_block_indices(
     compress_ratio: int,
     token_topk: int,
 ) -> torch.Tensor:
-    """CUDA fast path for fast_topk_v2 output (valid blocks precede -1 padding)."""
+    """Triton fast path for top-k output (valid blocks precede -1 padding)."""
     rows, block_topk = block_indices.shape
     final_topk = token_topk + compress_ratio - 1
     output = torch.empty(
@@ -282,7 +282,7 @@ def expand_qsa_block_indices(
     compress_ratio: int,
     token_topk: int,
 ) -> torch.Tensor:
-    """Expand compressed blocks with Triton on CUDA and Torch elsewhere."""
+    """Expand compressed blocks with Triton on CUDA/NPU and Torch elsewhere."""
 
     block_topk = (token_topk + compress_ratio - 1) // compress_ratio
     if block_indices.ndim != 2 or block_indices.shape[1] != block_topk:
@@ -293,7 +293,7 @@ def expand_qsa_block_indices(
     rows = block_indices.shape[0]
     if query_positions.numel() != rows or sequence_lengths.numel() != rows:
         raise ValueError("query positions and sequence lengths must match top-k rows")
-    if block_indices.device.type == "cuda":
+    if _is_npu or block_indices.is_cuda:
         # The Triton kernel loads positions/lengths as scalars, so any integer
         # dtype works; skip the int64 conversion copies.
         return triton_expand_qsa_block_indices(
