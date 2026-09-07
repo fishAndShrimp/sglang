@@ -1881,6 +1881,30 @@ def test_qsa_npu_triton_decode_matches_torch_reference():
 
 
 @requires_npu
+def test_qsa_npu_batched_topk_matches_rowwise_reference():
+    torch.manual_seed(19)
+    logits_cpu = torch.randn(4, 17, dtype=torch.float32)
+    starts_cpu = torch.tensor([0, 3, 8, 15], dtype=torch.int32)
+    ends_cpu = torch.tensor([17, 12, 13, 17], dtype=torch.int32)
+    # Cover the short-prefill contract: output remains fixed-width when the
+    # available key width is smaller than topk.
+    topk = 32
+
+    expected = []
+    for logits_row, start, end in zip(logits_cpu, starts_cpu, ends_cpu):
+        valid_width = min(int(end - start), topk)
+        selected = torch.topk(logits_row[int(start) : int(end)], valid_width).indices
+        row = torch.full((topk,), -1, dtype=torch.int32)
+        row[:valid_width] = selected.to(torch.int32)
+        expected.append(row)
+
+    actual = qsa_fast_topk(
+        logits_cpu.npu(), starts_cpu.npu(), ends_cpu.npu(), topk
+    ).cpu()
+    assert torch.equal(actual, torch.stack(expected))
+
+
+@requires_npu
 def test_qsa_npu_supported_shape_dispatches_to_staged_kernel(monkeypatch):
     import sglang.srt.hardware_backend.npu.kernels.qwen3_8_flash_next.qsa as staged
     import sglang.srt.layers.attention.qsa.mqa as mqa

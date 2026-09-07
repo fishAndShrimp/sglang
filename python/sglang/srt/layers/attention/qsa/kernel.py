@@ -72,6 +72,23 @@ def qsa_fast_topk(
         return output
     columns = torch.arange(logits.shape[1], device=logits.device)
     ranks = torch.arange(select_width, device=logits.device)
+    if _is_npu:
+        # Launching topk once per prefill row dominates TTFT on NPU. Keep the
+        # same fixed-width, sequence-relative contract while selecting all rows
+        # in one device operation.
+        valid = (columns.unsqueeze(0) >= starts.unsqueeze(1)) & (
+            columns.unsqueeze(0) < (starts + lengths).unsqueeze(1)
+        )
+        selected = torch.topk(
+            logits.masked_fill(~valid, -float("inf")), select_width, dim=1
+        ).indices
+        relative = (selected - starts.unsqueeze(1)).to(torch.int32)
+        output[:, :select_width] = torch.where(
+            ranks.unsqueeze(0) < valid.sum(dim=1, keepdim=True),
+            relative,
+            torch.full_like(relative, -1),
+        )
+        return output
     for row in range(logits.shape[0]):
         start = starts[row]
         length = lengths[row].clamp(min=0, max=logits.shape[1])
