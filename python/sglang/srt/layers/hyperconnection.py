@@ -6,6 +6,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.srt.layers.hc_mix_triton import fused_hc_mix, fused_hc_mix_supported
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
@@ -44,8 +47,9 @@ class GroupedGemmaRMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if (
-            self._jit_group_size is not None
+            not _is_npu
             and x.is_cuda
+            and self._jit_group_size is not None
             and x.dtype in (torch.bfloat16, torch.float16)
         ):
             from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import (
@@ -151,7 +155,8 @@ class GatedResidual(HyperConnectionBase):
             )
             lowrank = self.config.hc_lowrank
             self._jit_mix_ok = (
-                torch.cuda.is_available()
+                not _is_npu
+                and torch.cuda.is_available()
                 # The CuTe split-K pair is tcgen05 (sm_100 family) only.
                 and torch.cuda.get_device_capability()[0] == 10
                 and (self.hc_count * self.hidden_size) % 2048 == 0
@@ -234,8 +239,9 @@ class GatedResidual(HyperConnectionBase):
                 hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
             ).flatten(-2)
         if (
-            self._jit_mix_ok
+            not _is_npu
             and hyper_input_normed.is_cuda
+            and self._jit_mix_ok
             and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
             and hyper_input_normed.shape[0] <= 24
         ):
@@ -285,8 +291,9 @@ class GatedResidual(HyperConnectionBase):
             return hyper_input.to(self.params_dtype)
 
         if (
-            self._jit_combine_ok
+            not _is_npu
             and block_output.is_cuda
+            and self._jit_combine_ok
             and block_output.dtype in (torch.bfloat16, torch.float16)
             and hyper_input.dtype == block_output.dtype
             and hyper_input_normed.dtype == block_output.dtype

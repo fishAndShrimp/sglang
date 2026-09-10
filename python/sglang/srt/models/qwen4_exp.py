@@ -61,7 +61,9 @@ from sglang.srt.models.qwen3_5 import (
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import logger
+from sglang.srt.utils import is_npu, logger
+
+_is_npu = is_npu()
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
@@ -388,8 +390,9 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if (
-            self._jit_group_size is not None
+            not _is_npu
             and x.is_cuda
+            and self._jit_group_size is not None
             and x.dtype in (torch.bfloat16, torch.float16)
         ):
             from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import (
