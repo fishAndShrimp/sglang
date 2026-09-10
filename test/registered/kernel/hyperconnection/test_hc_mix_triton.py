@@ -54,6 +54,26 @@ _TOLERANCES = {
 
 
 @pytest.mark.parametrize("npu_platform", [False, True])
+def test_hyperconnection_fallback_compile_policy(monkeypatch, npu_platform):
+    calls = []
+
+    def record_compile(fn, **kwargs):
+        calls.append((fn.__name__, kwargs))
+        return fn
+
+    monkeypatch.setattr(hyperconnection, "_is_npu", npu_platform)
+    monkeypatch.setattr(torch, "compile", record_compile)
+    # The fallback functions are created regardless of weight allocation.
+    hyperconnection.GatedResidual(
+        hyperconnection.HyperConnectionConfig(), use_mix=False, use_combine=False
+    )
+    assert calls == [
+        ("_mix_compute", {"disable": npu_platform}),
+        ("_combine_compute", {"disable": npu_platform}),
+    ]
+
+
+@pytest.mark.parametrize("npu_platform", [False, True])
 @pytest.mark.parametrize("tensor_is_cuda", [False, True])
 @pytest.mark.parametrize("ple_norm", [False, True])
 def test_grouped_norm_cuda_jit_dispatch(

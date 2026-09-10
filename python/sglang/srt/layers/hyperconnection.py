@@ -221,8 +221,24 @@ class GatedResidual(HyperConnectionBase):
             )
             return (R + injection).flatten(-2)
 
-        self._mix_compute = torch.compile(_mix_compute)
-        self._combine_compute = torch.compile(_combine_compute)
+        # In multi-rank runs, a rank that reuses compiled code can reach a
+        # collective while other ranks are still compiling. To allow for that
+        # wait, Inductor calls a timeout-extension helper on a cache hit, using
+        # the compile time saved as extra communication timeout. A cache miss
+        # compiles the function instead and skips this helper.
+        #
+        # With PyTorch 2.10.0+cpu and torch_npu 2.10.0, this helper's CUDA backend
+        # lookup is redirected to NPU by transfer_to_npu. A process group without
+        # an NPU backend then raises "No backend type associated with device
+        # type npu". Thus fresh compilation succeeds, but a cached restart fails
+        # in the extra timeout step, not in the compiled mix/combine operations.
+        # Run these two functions as ordinary Torch ops on NPU for now.
+        # Other platforms keep compilation; server NPU graph capture is unchanged.
+        # TODO: Remove disable=_is_npu once dependency compatibility is verified
+        # by both fresh-cache and cached-restart tests on NPU. Newer torch_npu
+        # source has related timeout handling, but an upgrade alone is not proof.
+        self._mix_compute = torch.compile(_mix_compute, disable=_is_npu)
+        self._combine_compute = torch.compile(_combine_compute, disable=_is_npu)
 
     def mix(self, hyper_input: torch.Tensor):
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
