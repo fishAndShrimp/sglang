@@ -125,7 +125,7 @@ def test_npu_grouped_norm_fallback_matches_reference(monkeypatch, ple_norm):
     from sglang.srt.models import qwen4_exp
 
     if not hasattr(torch, "npu") or not torch.npu.is_available():
-        pytest.skip("requires an Ascend NPU")
+        pytest.skip("requires an NPU")
     monkeypatch.setattr(hyperconnection, "_is_npu", True)
     monkeypatch.setattr(qwen4_exp, "_is_npu", True)
     norm_cls = (
