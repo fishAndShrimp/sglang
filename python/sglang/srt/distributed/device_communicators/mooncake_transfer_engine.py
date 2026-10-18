@@ -23,6 +23,24 @@ logger = logging.getLogger(__name__)
 _mooncake_transfer_engine: Optional[MooncakeTransferEngine] = None
 
 
+def init_mooncake_memfabric_device(
+    device: Optional[int] = None, *, store: bool = False
+) -> Optional[str]:
+    """Bind the initialization thread's device and return its MemFabric protocol."""
+    protocol = os.getenv("MF_PROTOCOL")
+    if store:
+        protocol = os.getenv("MF_STORE_PROTOCOL") or protocol
+    if not protocol:
+        return None
+
+    import torch
+
+    from sglang.srt.runtime_context import get_device
+
+    torch.npu.set_device(get_device().gpu_id if device is None else device)
+    return protocol
+
+
 def parse_ib_device_config(
     ib_device_str: Optional[str],
 ) -> Optional[Union[str, Dict[int, str]]]:
@@ -208,13 +226,17 @@ class MooncakeTransferEngine:
             # Default is "rdma"; set MOONCAKE_PROTOCOL=efa on AWS EFA hardware.
             protocol = envs.MOONCAKE_PROTOCOL.get()
 
-        ret_value = run_with_deadline(
-            lambda: self.engine.initialize(
+        def initialize_engine():
+            init_mooncake_memfabric_device(device=self.gpu_id)
+            return self.engine.initialize(
                 hostname,
                 "P2PHANDSHAKE",
                 protocol,
                 device_name if device_name is not None else "",
-            ),
+            )
+
+        ret_value = run_with_deadline(
+            initialize_engine,
             timeout_s=envs.SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT.get(),
             what=f"Mooncake TransferEngine.initialize({hostname!r}, {protocol!r}, {device_name!r})",
         )

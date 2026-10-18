@@ -192,6 +192,20 @@ class NpuMemcacheStore(HiCacheStorage):
             ctrl = config.ctrl
             device_id = _resolve_memcache_device_id(ctrl, storage_config)
             init_bm = bool(ctrl.get("init_bm", True))
+            if (
+                init_bm
+                and local_cfg.protocol == "device_rdma"
+                and torch.distributed.is_initialized()
+                and torch.distributed.get_backend() == "hccl"
+            ):
+                from sglang.srt.distributed.device_communicators.npu_communicator import (
+                    warmup_hccl,
+                )
+
+                # MemCache may initialize RDMA before the PD transfer engine.
+                # Materialize lazy HCCL communicators before MemFabric owns RDMA.
+                warmup_hccl(device_id)
+                logger.info("HCCL initialized before MemCache device RDMA.")
             if self.store.init(device_id, init_bm) != 0:
                 raise RuntimeError("memcache_hybrid.DistributedObjectStore.init failed")
             tp_rank = storage_config.tp_rank if storage_config is not None else 0

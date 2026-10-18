@@ -11,6 +11,9 @@ from typing import Any, List, Optional, Tuple
 import requests
 import torch
 
+from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+    init_mooncake_memfabric_device,
+)
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
@@ -530,6 +533,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
                 while True:
                     try:
+                        memfabric_protocol = init_mooncake_memfabric_device(store=True)
+                        if memfabric_protocol == "device_rdma":
+                            from sglang.srt.distributed.device_communicators.npu_communicator import (
+                                warmup_hccl,
+                            )
+
+                            warmup_hccl(torch.npu.current_device())
                         ret_code = self.store.setup(
                             client_hostname,
                             self.config.metadata_server,

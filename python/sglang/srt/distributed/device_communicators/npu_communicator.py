@@ -11,6 +11,20 @@ if _is_npu:
     from torch_npu import npu_dynamic_quant
 
 
+def warmup_hccl(device_id: int) -> None:
+    """Materialize HCCL communicators before MemFabric initializes RDMA."""
+    if not dist.is_initialized() or dist.get_backend() != "hccl":
+        return
+
+    from sglang.srt.distributed.parallel_state import get_world_group
+
+    tensor = torch.zeros(1, device=f"npu:{device_id}")
+    for group in (None, get_world_group().device_group):
+        outputs = [torch.empty_like(tensor) for _ in range(dist.get_world_size(group))]
+        dist.all_gather(outputs, tensor, group=group)
+    torch.npu.synchronize()
+
+
 class NpuCommunicator:
     def __init__(self, group: ProcessGroup):
         if not _is_npu:
