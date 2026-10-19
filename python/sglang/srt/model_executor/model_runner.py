@@ -247,7 +247,6 @@ from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.offloader import (
     create_offloader,
-    get_offloader,
     set_offloader,
 )
 from sglang.srt.utils.profile_utils import build_step_span_name
@@ -350,6 +349,7 @@ class ModelRunner:
         draft_model_idx: Optional[int] = None,
         draft_attention_backend: Optional[str] = None,
         load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
+        moe_offloader=None,
     ):
         # Parse args
         self.mem_fraction_static = mem_fraction_static
@@ -388,6 +388,21 @@ class ModelRunner:
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
         )
+        if moe_offloader is not None:
+            if is_draft_worker or not self.spec_algorithm.is_none():
+                raise ValueError("MoE offload does not support speculative decoding")
+            if (
+                get_exec().moe.enable_eplb
+                or get_exec().moe.enable_paged_experts
+                or get_exec().overlap.enable_two_batch_overlap
+                or get_exec().overlap.enable_single_batch_overlap
+                or not get_schedule().disable_overlap_schedule
+            ):
+                raise ValueError(
+                    "MoE offload requires non-overlapping forwards without EPLB "
+                    "or another expert pager"
+                )
+        self.capture_head_hooks = []
         self.capture_tail_hooks = []
         self.page_size = get_schedule().page_size
         self.req_to_token_pool = req_to_token_pool
@@ -469,7 +484,8 @@ class ModelRunner:
         self.prefill_shared_read_stager: Optional[Callable[[ForwardBatch], bool]] = None
 
         # CPU offload
-        set_offloader(create_offloader())
+        self.offloader = create_offloader(moe_offloader=moe_offloader)
+        set_offloader(self.offloader)
 
         self._weight_checker = WeightChecker(get_model=lambda: self.model)
 
@@ -1316,7 +1332,8 @@ class ModelRunner:
             )
 
         if not self.is_draft_worker:
-            get_offloader().post_init()
+            self.offloader.post_init()
+            self.offloader.bind_model_runner(self)
 
         self.maybe_precompile_model_kernels_after_loading()
         install_monokernel_forward(
@@ -1838,6 +1855,11 @@ class ModelRunner:
         with (
             canary_ctx,
             step_span_ctx,
+            (
+                self.offloader.forward_scope(forward_batch)
+                if not self.is_draft_worker
+                else contextlib.nullcontext()
+            ),
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,

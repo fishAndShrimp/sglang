@@ -1303,6 +1303,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                             self.model_runner.model, forward_batch.input_ids, state
                         )
 
+                for capture_hook in self.model_runner.capture_head_hooks:
+                    capture_hook(self, forward_batch, num_tokens)
                 out = forward(
                     forward_batch.input_ids,
                     forward_batch.positions,

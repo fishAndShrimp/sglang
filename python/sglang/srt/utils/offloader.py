@@ -12,6 +12,8 @@ from sglang.srt.distributed.naive_distributed import (
     set_naive_distributed,
 )
 from sglang.srt.layers.parameter import ModelWeightParameter
+from sglang.srt.offloading.base import BaseOffloader
+from sglang.srt.offloading.transfer import TorchTransferBackend
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -28,23 +30,6 @@ logger = logging.getLogger(__name__)
 
 _SubmoduleAccessor = Callable[[torch.nn.Module], torch.nn.Module]
 _WhitelistParamNamesCreator = Callable[[torch.nn.Module], List[str]]
-
-
-class BaseOffloader(ABC):
-    def wrap_modules(
-        self,
-        all_modules_generator: Generator[torch.nn.Module, None, None],
-        submodule_accessor: Optional[_SubmoduleAccessor] = None,
-        whitelist_param_names_creator: Optional[_WhitelistParamNamesCreator] = None,
-    ):
-        return list(all_modules_generator)
-
-    def post_init(self):
-        pass
-
-    @property
-    def forbid_copy_engine_usage(self):
-        return False
 
 
 class NoopOffloader(BaseOffloader):
@@ -65,7 +50,20 @@ def set_offloader(instance: BaseOffloader):
     _instance = instance
 
 
-def create_offloader():
+def create_offloader(*, moe_offloader=None):
+    # Explicit injection until an accelerator binding has passed full-graph
+    # validation. Existing server configuration keeps the legacy selection.
+    if moe_offloader is not None:
+        from sglang.srt.offloading.moe import MoEOffloaderV2
+
+        if not isinstance(moe_offloader, MoEOffloaderV2):
+            raise TypeError("moe_offloader must be a MoEOffloaderV2 binding")
+        cfg = get_exec().offload
+        if cfg.cpu_offload_gb > 0 or cfg.offload_group_size > 0:
+            raise ValueError(
+                "Module offload and MoE offload cannot own the same weights"
+            )
+        return moe_offloader
     if get_exec().offload.cpu_offload_gb > 0:
         return OffloaderV1(
             cpu_offload_max_bytes=int(get_exec().offload.cpu_offload_gb * 1024**3)
@@ -424,10 +422,11 @@ class _MetaParamOffloader(_BaseParamOffloader):
 class _CpuParamOffloader(_BaseParamOffloader):
     def __init__(self, module, param_name):
         super().__init__(module, param_name)
+        self._device = self._param.device
         _move_param_to_cpu(self._param, pin_memory=True)
 
     def create_device_tensor(self):
-        return self._param.to("cuda", non_blocking=True)
+        return TorchTransferBackend.allocate_and_copy(self._param, self._device)
 
 
 class _ShmCpuParamOffloader(_BaseParamOffloader):
