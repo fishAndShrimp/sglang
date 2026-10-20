@@ -43,8 +43,8 @@ classDiagram
     MoEOffloaderV2 *-- MoEOffloadOwner
     MoEOffloadOwner *-- PrefillController
     MoEOffloadOwner *-- DecodeController
-    MoEOffloadOwner *-- ResourceLedger
-    MoEOffloadOwner *-- SlotArena
+    MoEOffloadOwner *-- AllocationLedger
+    MoEOffloadOwner *-- SlotLeaseManager
     MoEOffloadOwner *-- BoundMoERuntime
     BoundMoERuntime *-- HostExpertStore
     BoundMoERuntime *-- ResidencyState
@@ -65,6 +65,16 @@ classDiagram
     TorchTransferBackend --> DeviceTransferOps
 ```
 
+The component responsibilities are:
+
+- **HostExpertStore** holds the authoritative pinned-DRAM copies of complete offloadable expert bundles owned by this rank, along with host-memory registration handles.
+- **CachePolicy** decides which experts should remain in the hot cache.
+- **ResidencyState** stores device tensors describing which expert occupies each slot.
+- **ResidencyOps** queries and updates that state, producing safe load and replacement plans.
+- **WeightTransferBackend** performs the actual weight transfers.
+- **AllocationLedger** accounts for unique physical allocations, enforces byte budgets, and retains allocation keepalive references.
+- **SlotLeaseManager** reserves usage rights to banks or slot regions outside graph capture.
+
 ## Concrete framework versus backend extension points
 
 | API | Current implementation / backend obligation |
@@ -73,7 +83,8 @@ classDiagram
 | `DeepSeekV4Adapter` | V4 layer detection, rank ownership, first three/hash layer residency; rejects fused shared slots and MoE TP. |
 | `MoEOffloadOwner` | Budgets, serialized submissions, two controllers, snapshot/restore transitions, graph leases, explicit teardown. |
 | `HostExpertStore` | Owns pinned bundles and registration handles; freezes bindings and enumerates physical allocations without extra copies. |
-| `SlotArena` | Host-time region reservations with generations; retiring leases remain unavailable until idle completion. |
+| `AllocationLedger` | Accounts unique physical allocations and enforces byte budgets; it retains allocation keepalives. |
+| `SlotLeaseManager` | Reserves logical slot regions with lease generations; retiring leases remain unavailable until idle completion. Physical tensors are owned by the runtime. |
 | `ResidencyState` | Fixed-address public maps, validity/generation, execution keys, step counts and device update flag. |
 | `TensorLFUPolicy` | Device-tensor frequency accumulation, optional aging, deterministic selection and snapshot copies. CPU tested; device operator/capture support requires validation. |
 | `ComposedDFCProgram` | Fixed rounds of D/F/C, one dispatcher handle at a time, accumulation and one common tail. |
@@ -129,13 +140,17 @@ capture remain unimplemented; the tests make no graph or performance claim.
 
 ## Identity, memory and execution rules
 
+`owner.allocation_ledger` accounts for physical memory. `owner.hot_slot_leases` and
+`owner.execution_slot_leases` track reservations and deferred reuse of logical
+slot regions. Returning a lease does not free the runtime-owned tensors.
+
 - `ExpertCatalog` keys cover eligible **rank-local** experts across layers.
   `hot_slots = floor(cache_ratio * catalog.num_experts)`. Resident layers are
   excluded. EP ownership and communication expert counts never become slot counts.
 - `execution_slots` is the **total** explicit temporary capacity, including both
   banks when double buffering. The native binding must validate its wave/bank
   schedule against that capacity. Prefill may also borrow views of the hot arena.
-- `ResourceLedger` accounts unique physical allocations, not views. The initial
+- `AllocationLedger` accounts unique physical allocations, not views. The initial
   homogeneous V4 format uses one physical bundle byte size including scales and
   padding. Host/hot/execution weight allocations must match their slot budgets;
   metadata and workspace have separate explicit byte limits (default zero).
@@ -166,7 +181,7 @@ capture remain unimplemented; the tests make no graph or performance claim.
    state and generations, then lends the arena. Consecutive prefill calls do not
    resnapshot. Returning to decode reloads original weights from HostStore and
    restores metadata. No hidden HBM backup of expert weights is permitted.
-5. `SlotArena` leases are host-time program reservations. Replay safety must be
+5. `SlotLeaseManager` leases are host-time program reservations. Replay safety must be
    implemented in device `ResidencyOps`, not by expecting Python leases or hooks
    to execute again. Before overwrite wait for readers; before reading/publishing
    wait for **all** expert bundle components to be ready.

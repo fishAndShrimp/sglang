@@ -129,6 +129,9 @@ classDiagram
     }
     class MoEOffloadOwner {
         <<framework>>
+        allocation_ledger
+        hot_slot_leases
+        execution_slot_leases
         begin_forward()
         finish_forward()
         switch_phase()
@@ -160,6 +163,9 @@ classDiagram
     direction TB
     class MoEOffloadOwner {
         <<framework>>
+        allocation_ledger
+        hot_slot_leases
+        execution_slot_leases
         begin_forward()
         finish_forward()
         fail_forward()
@@ -167,11 +173,11 @@ classDiagram
         acquire_graph()
         close()
     }
-    class ResourceLedger {
+    class AllocationLedger {
         <<framework>>
         physical_allocation_budgets
     }
-    class SlotArena {
+    class SlotLeaseManager {
         <<framework>>
         acquire()
         retire()
@@ -280,8 +286,8 @@ classDiagram
         <<interface>>
         materialize_into()
     }
-    MoEOffloadOwner *-- ResourceLedger
-    MoEOffloadOwner *-- "2" SlotArena : hot / execution reservations
+    MoEOffloadOwner *-- AllocationLedger
+    MoEOffloadOwner *-- "2" SlotLeaseManager : hot / execution reservations
     MoEOffloadOwner *-- PrefillController
     MoEOffloadOwner *-- DecodeController
     MoEOffloadOwner *-- BoundMoERuntime
@@ -311,14 +317,24 @@ classDiagram
     FusedDFCProgram --> ResidencyOps : public state protocol
 ```
 
-图中 runtime 的资源持有关系、local program 对 runner 的绑定是后端必须兑现的契约。`SlotArena` 本身只管理 host 侧预约与 generation，不分配专家权重 tensor，也不执行 replay 中的动态替换；物理池由 runtime 创建并列入 `resources`。
+几个组件的职责边界可以这样理解：
+
+- **HostExpertStore**：持有本 rank 可卸载专家完整权重 bundle 的 pinned DRAM 权威副本及相关主机内存注册句柄。
+- **CachePolicy**：决定谁值得留在热缓存。
+- **ResidencyState**：保存“谁在哪个 slot”的设备 tensor 数据。
+- **ResidencyOps**：查询和修改这些数据，生成安全的加载、替换计划。
+- **WeightTransferBackend（传输后端）**：执行实际权重搬运。
+- **AllocationLedger**：记录唯一物理内存分配、校验字节预算，并持有分配对象的保活引用。
+- **SlotLeaseManager**：在图外预约 bank/区域的使用权。
+
+图中 runtime 的资源持有关系、local program 对 runner 的绑定是后端必须兑现的契约。`AllocationLedger` 通过 `owner.allocation_ledger` 记录唯一物理分配并校验字节预算；`SlotLeaseManager` 通过 `owner.hot_slot_leases` 和 `owner.execution_slot_leases` 管理 host 侧 slot 预约、租约 generation 与延迟回收。归还租约只释放使用权，物理权重 tensor 仍由 runtime 持有。replay 内的动态替换由设备侧 `ResidencyOps` 实现；物理池由 runtime 创建并列入 `resources`。
 
 之前 UML 中的概念与当前代码对应如下，避免把设计名当作已存在的类：
 
 | 原设计名称 | 当前落点与状态 |
 | --- | --- |
 | `OffloadStorage` | 新 MoE 路径为 `HostExpertStore`；旧 V2 仍使用原参数适配器，没有名为 `OffloadStorage` 的统一实现。 |
-| `ExpertArena` / `HotArena` / `ExecutionArena` | owner 的两个 `SlotArena` 预约管理器，加上 runtime 提供的实际物理池。 |
+| `ExpertArena` / `HotArena` / `ExecutionArena` | owner 的两个 `SlotLeaseManager` 预约管理器，加上 runtime 提供的实际物理池。 |
 | `ResidencyManager` | 拆为已实现的 `ResidencyState` 数据协议和待实现的 `ResidencyOps` 设备操作。 |
 | `LFUPolicy` | `TensorLFUPolicy`；算法状态为独立 `LFUState`。 |
 | `begin_step()` / `finish_step()` | host 事务为 `begin_forward()` / `finish_forward()`；图内每步操作为 runtime 的 `emit_step_begin()` / `emit_step_end()`。 |
@@ -446,7 +462,7 @@ EXECUTION_WEIGHTS = S * B
 
 首版预算按同构专家 bundle 计算。若各层格式或专家字节数不同，必须扩展格式分组和预算协议，不能用平均字节数掩盖差异。常驻权重由原模型持有，不计入上述可卸载池。
 
-`ResourceLedger` 对 host/hot/execution 三类权重要求实际申报量与 slot 预算一致，metadata/workspace 则不能超过显式上限，默认上限为零。LFU 排序临时量、快照、传输计划、graph 内存峰值及任何 staging 都要申报。视图不重复计费；不得省略真实分配。它校验的是后端的资源申报，实机仍需核对 allocator 峰值。
+`AllocationLedger` 对 host/hot/execution 三类权重要求实际申报量与 slot 预算一致，metadata/workspace 则不能超过显式上限，默认上限为零。LFU 排序临时量、快照、传输计划、graph 内存峰值及任何 staging 都要申报。视图不重复计费；不得省略真实分配。它校验的是后端的资源申报，实机仍需核对 allocator 峰值。
 
 三种身份必须分开：global expert ID 用于路由和 EP，`ExpertCatalog.key(layer_id, local_id)` 用于本 rank 的跨层缓存，bank lane 用于本轮专家计算。cache slot 数不能替换模型的逻辑专家数或通信专家数。
 
