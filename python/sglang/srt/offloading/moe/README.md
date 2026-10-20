@@ -1,5 +1,9 @@
 # MoE offload framework
 
+English | [中文](README.zh-CN.md)
+
+[Three-person development plan (Chinese)](DEVELOPMENT_PLAN.zh-CN.md)
+
 This package provides the framework for DeepSeek V4 Flash routed-expert offload.
 It is opt-in and **does not yet provide an A5 or CUDA inference backend**. Full
 decode graph remains a required backend capability, not an eager fallback.
