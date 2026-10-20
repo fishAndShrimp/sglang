@@ -105,12 +105,13 @@ class LocalExpertProgram(ABC):
         """Prepare fixed bank bindings, wait for readiness, run F, record readers."""
 
 
-class WaveDispatcher(ABC):
-    """Adapter to existing Dispatcher/CombineInput without changing EP identity."""
+class MoEDispatcher(ABC):
+    """Common D/C boundary; preserve EP identity and original routing weights.
 
-    @abstractmethod
-    def mask_routes(self, routing, wave, context):
-        pass
+    The runtime retains the dispatch handle and all communication buffers until
+    their device consumers finish, including work submitted before an exception.
+    A Python return from combine does not establish device completion.
+    """
 
     @abstractmethod
     def dispatch(self, hidden_states, routing, context):
@@ -121,6 +122,18 @@ class WaveDispatcher(ABC):
         pass
 
     @abstractmethod
+    def finish(self, accumulator, context):
+        """Apply any common tail/reduction exactly once."""
+
+
+class WaveDispatcher(MoEDispatcher):
+    """Repeated DFC additionally needs route masking and result accumulation."""
+
+    @abstractmethod
+    def mask_routes(self, routing, wave, context):
+        pass
+
+    @abstractmethod
     def accumulator(self, hidden_states, context):
         """Return a zeroed, budgeted output buffer."""
 
@@ -128,9 +141,48 @@ class WaveDispatcher(ABC):
     def accumulate(self, accumulator, partial, context):
         pass
 
+
+class DispatchLayoutAdapter(ABC):
+    """Slice a single full dispatch and assemble its original combine layout.
+
+    These methods emit device operations; Python is not rerun during replay.
+    Use device counts/masks with fixed-capacity storage, never host decisions
+    from .item()/.tolist(). Compact and padded layouts need backend adapters.
+    """
+
     @abstractmethod
-    def finish(self, accumulator, context):
-        """Apply any common tail/reduction exactly once."""
+    def bind(self, dispatch_output, context):
+        """Return a per-invocation layout over runtime-owned, budgeted buffers.
+
+        Retain the full dispatch metadata, activation scales and combine handle.
+        Initialize output/padding as required, including entirely empty demand.
+        The runtime keeps buffers alive through resources_idle and graph leases;
+        releasing this Python layout must not release in-flight device storage.
+        """
+
+    @abstractmethod
+    def select_wave(self, layout, wave, context):
+        """Return LocalExpertProgram input for [local_start, local_end).
+
+        Preserve scales, counts and inverse row mapping; bank lanes are local to
+        F and must not change EP IDs. Support empty waves and the partial tail.
+        """
+
+    @abstractmethod
+    def write_wave(self, layout, wave, local_output, context):
+        """Place F output at its original receive rows, without top-k weighting.
+
+        Establish dependencies before reusing per-wave input/output scratch.
+        This assembles the full combine input; it is not token accumulation.
+        """
+
+    @abstractmethod
+    def combine_input(self, layout, context):
+        """Join all wave writes; return full output with original D metadata.
+
+        Preserve the backend's weighting convention without applying weights a
+        second time. Keep layout storage live until combine finishes reading it.
+        """
 
 
 class BoundMoERuntime(ABC):
