@@ -17,7 +17,7 @@ import tempfile
 from pathlib import Path
 from threading import RLock
 
-from .npu_transfer import (
+from .transfer import (
     AclBatchHostTransferOps,
     DeviceMemoryRegion,
     _npu_completion,
@@ -153,7 +153,7 @@ def _load_native_acl(directory):
         except ImportError as error:
             raise RuntimeError(
                 "ACL extension is unbuilt. Run python -m "
-                "sglang.srt.offloading.moe.native_acl --build-directory PATH "
+                "sglang.srt.offloading.moe.npu.native_acl --build-directory PATH "
                 "on the target CANN/torch_npu host and pass that directory."
             ) from error
     directory = Path(directory)

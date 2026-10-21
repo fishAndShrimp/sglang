@@ -7,7 +7,7 @@ import os
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
-from .config import MoEOffloadConfig
+from ..config import MoEOffloadConfig
 
 
 def validate_native_environment():
@@ -114,8 +114,8 @@ class NpuOffloadSettings:
 
 def create_npu_offloader(path, *, hf_config, parallel, device):
     # Called after distributed/device setup, before constructing model weights.
-    from .npu_backend import NpuMoEBackend
-    from .offloader import MoEOffloaderV2
+    from ..offloader import MoEOffloaderV2
+    from .backend import NpuMoEBackend
 
     settings = NpuOffloadSettings.from_file(path)
     config = settings.owner_config(

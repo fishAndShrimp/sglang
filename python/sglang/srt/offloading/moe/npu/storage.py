@@ -16,8 +16,8 @@ import sys
 import threading
 from dataclasses import dataclass
 
-from .resources import Allocation, ResourceKind
-from .storage import HostMemoryCapability
+from ..resources import Allocation, ResourceKind
+from ..storage import HostMemoryCapability
 
 _GIB = 1024**3
 

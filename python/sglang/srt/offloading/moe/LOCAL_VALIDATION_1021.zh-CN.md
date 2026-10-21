@@ -26,11 +26,19 @@ Python >=3.11 / torch_npu 运行环境验收。
 尝试 Python 3.13 的 `python -m sglang.launch_server --help`，在顶层导入时因
 `ModuleNotFoundError: No module named 'torch'` 停止；未把该项记为 CLI 启动通过。
 
-启动示例与目标机验收步骤见 [NPU runtime](NPU_RUNTIME.zh-CN.md)、
-[ACL build/smoke](native/README.zh-CN.md)、[V4 storage](NPU_V4_STORAGE.md) 和
-[EP/FFN](NPU_EXPERTS_IMPLEMENTATION.zh-CN.md)。剩余的是目标机原生编译/链接、
+启动示例与目标机验收步骤见 [NPU runtime](npu/README.zh-CN.md)、
+[ACL build/smoke](npu/native/README.zh-CN.md)、[V4 storage](npu/V4_STORAGE.md) 和
+[EP/FFN](npu/EXPERTS_IMPLEMENTATION.zh-CN.md)。剩余的是目标机原生编译/链接、
 同份 host 双路径搬运、FP4 数值、真实 EP、完整 graph、多 bucket 模式切换、内存峰值及性能验收；
 不把 CPU 模拟结果记为硬件通过。
+
+## 目录整理验证
+
+目录整理后再次运行同一套件，223 项通过。NPU 实现、原生扩展及示例统一位于
+`moe/npu/`，对应测试导入、ModelRunner factory 和四卡启动脚本均已更新。
+另检查了相对导入、文档链接、包及资源发现、ACL build/smoke 命令入口；在阻止
+`torch_npu`、MemFabric 和 DeepEP 导入的 CPU 环境中，公共框架、NPU 包及九个
+NPU 模块均可导入。四卡脚本的 dry-run 和模拟构建/启动流程通过。
 
 ## 前序 cache / H2D 提交记录
 

@@ -10,7 +10,7 @@
 在安装了匹配版本的 PyTorch、torch_npu、CANN SDK 和 C++ 编译器的目标机执行：
 
 ```bash
-python -m sglang.srt.offloading.moe.native_acl \
+python -m sglang.srt.offloading.moe.npu.native_acl \
   --build-directory /absolute/path/to/moe-acl-build \
   --cann-home /usr/local/Ascend/ascend-toolkit/latest --verbose
 ```
@@ -21,7 +21,7 @@ Python 环境的 torch_npu。此目录绑定该编译环境，不是可跨 CANN/
 版本复制的通用二进制。源码由项目现有 `srt/**/*` package-data 配置打包。
 
 ```python
-from sglang.srt.offloading.moe.native_acl import get_native_acl, make_acl_host_ops
+from sglang.srt.offloading.moe.npu.native_acl import get_native_acl, make_acl_host_ops
 
 native = get_native_acl("/absolute/path/to/moe-acl-build")
 host_ops = make_acl_host_ops(
@@ -113,7 +113,7 @@ MemFabric 共享存储。它使用两个非默认复制流、另一个生产流�
 stream wait、分批 ACL 提交及 event 完成，再原始 D2H 逐字节核对，包括非对齐尾部：
 
 ```bash
-python -m sglang.srt.offloading.moe.native_smoke \
+python -m sglang.srt.offloading.moe.npu.native_smoke \
   --build-directory /absolute/path/to/moe-acl-build \
   --device 0 --bytes 4093 --repeats 8 --queued-ops 64
 ```

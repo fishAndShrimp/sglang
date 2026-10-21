@@ -9,7 +9,7 @@ from unittest import mock
 
 import sglang
 import torch
-from sglang.srt.offloading.moe.npu_backend import NpuMoEBackend
+from sglang.srt.offloading.moe.npu.backend import NpuMoEBackend
 
 ROOT = Path(__file__).resolve().parents[4]
 FP4_MODULE = "sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods"

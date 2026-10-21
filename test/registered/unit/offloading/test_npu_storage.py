@@ -4,7 +4,7 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt.offloading.moe.npu_storage import (
+from sglang.srt.offloading.moe.npu.storage import (
     MemFabricHostPool,
     _check_host_registration_platform,
 )

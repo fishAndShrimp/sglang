@@ -11,11 +11,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
 
-from ..transfer import EventCompletion, TransferTicket
-from .config import Phase
-from .interfaces import BoundMoERuntime, RuntimeCapabilities
-from .resources import Allocation, AllocationLedger, ResourceKind
-from .runtime import ManagedExecutionContext
+from ...transfer import EventCompletion, TransferTicket
+from ..config import Phase
+from ..interfaces import BoundMoERuntime, RuntimeCapabilities
+from ..resources import Allocation, AllocationLedger, ResourceKind
+from ..runtime import ManagedExecutionContext
 
 
 class NpuDeviceRuntime:

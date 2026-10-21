@@ -24,7 +24,6 @@ from typing import Callable, List, Optional, Union
 
 import torch
 import torch.distributed as dist
-
 from sglang.srt.configs.load_config import (
     _DEFAULT_LOAD_GROUP,
     LoadConfig,
@@ -519,7 +518,7 @@ class ModelRunner:
         # Native MoE loading is installed before model construction, so routed
         # weights are never first materialized as a full device-resident layer.
         if moe_offload_path:
-            from sglang.srt.offloading.moe.npu_config import create_npu_offloader
+            from sglang.srt.offloading.moe.npu.config import create_npu_offloader
 
             moe_offloader = create_npu_offloader(
                 moe_offload_path,

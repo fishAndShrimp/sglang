@@ -19,12 +19,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.offloading.moe import native_acl
-from sglang.srt.offloading.moe.native_acl import (
+from sglang.srt.offloading.moe.npu import native_acl
+from sglang.srt.offloading.moe.npu.native_acl import (
     NativeAclBatchSubmitter,
     probe_batch_abi,
 )
-from sglang.srt.offloading.moe.npu_transfer import AclCopyBatch, DeviceMemoryRegion
+from sglang.srt.offloading.moe.npu.transfer import AclCopyBatch, DeviceMemoryRegion
 from sglang.srt.offloading.moe.storage import HostMemoryCapability
 from sglang.srt.offloading.transfer import (
     HostCopyPlan,
@@ -36,7 +36,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 _SOURCE = (
-    Path(__file__).resolve().parents[4] / "python/sglang/srt/offloading/moe/native"
+    Path(__file__).resolve().parents[4] / "python/sglang/srt/offloading/moe/npu/native"
 )
 
 _ACL_HEADER = r"""

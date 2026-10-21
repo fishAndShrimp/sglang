@@ -19,7 +19,7 @@ from sglang.srt.offloading.moe.execution import (
     ExecutionRequest,
     ExpertWeightAccess,
 )
-from sglang.srt.offloading.moe.npu_transfer import (
+from sglang.srt.offloading.moe.npu.transfer import (
     DeviceMemoryRegion,
     MemFabricCopyComponent,
     MemFabricDeviceTransferOps,

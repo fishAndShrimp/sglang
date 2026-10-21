@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 import torch
 from sglang.srt.offloading.moe.config import ExpertWave, Phase, fixed_waves
-from sglang.srt.offloading.moe.npu_experts import (
+from sglang.srt.offloading.moe.npu.experts import (
     NPUDispatch,
     NPUDispatchLayout,
     NPUExpertBank,
@@ -624,7 +624,7 @@ class DispatcherTest(unittest.TestCase):
         native_patcher.start()
         self.addCleanup(native_patcher.stop)
         with patch(
-            "sglang.srt.offloading.moe.npu_experts.NPUExpertRunner", return_value=Core()
+            "sglang.srt.offloading.moe.npu.experts.NPUExpertRunner", return_value=Core()
         ):
             programs = build_npu_layer_programs(
                 experts,
@@ -649,7 +649,7 @@ class DispatcherTest(unittest.TestCase):
             len({item.storage_key for item in allocations}), len(allocations)
         )
         with patch(
-            "sglang.srt.offloading.moe.npu_experts.NPUExpertRunner", return_value=Core()
+            "sglang.srt.offloading.moe.npu.experts.NPUExpertRunner", return_value=Core()
         ):
             shared = build_npu_layer_programs(
                 experts,

@@ -2,15 +2,19 @@
 
 > **2026-10-21 实现更新**：已接入 Tensor cache、有界 prefill、原生 ACL batch、
 > ACL/MemFabric 共用 host 存储、V4 FP4 loader、具体运行时和 DeepEP/Ascend FFN bank。
-> 启动入口和支持范围见 [运行时](NPU_RUNTIME.zh-CN.md)；实现见
-> [ACL](native/README.zh-CN.md)、[存储](NPU_V4_STORAGE.md)、
-> [EP/FFN](NPU_EXPERTS_IMPLEMENTATION.zh-CN.md)，测试见
+> 启动入口和支持范围见 [运行时](npu/README.zh-CN.md)；实现见
+> [ACL](npu/native/README.zh-CN.md)、[存储](npu/V4_STORAGE.md)、
+> [EP/FFN](npu/EXPERTS_IMPLEMENTATION.zh-CN.md)，测试见
 > [本地验证](LOCAL_VALIDATION_1021.zh-CN.md)。
 > A5/CANN 原生编译、数值对齐、完整图和性能仍待目标机验收。
 
 [English](README.md) | 中文
 
 [三人开发分工与任务计划](DEVELOPMENT_PLAN.zh-CN.md)
+
+公共 cache、policy、资源协议和执行编排保留在本目录。仅用于 Ascend 的实现归入
+[npu/](npu/README.zh-CN.md)：backend、runtime、transfer、原生 V4 存储、ACL C++
+源码、启动配置及对应说明。`npu/__init__.py` 不加载原生库或初始化设备。
 
 本目录面向 **DeepSeek V4 Flash 原生 FP4 权重、A5 多卡 TP + EP**，为 CUDA / NPU 提供共同的专家身份、缓存策略、资源所有权和执行程序接口。
 

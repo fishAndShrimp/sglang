@@ -1,17 +1,16 @@
-import ctypes
 import concurrent.futures
+import ctypes
 import unittest
 
 import torch
-
 from sglang.srt.offloading.moe.config import ExpertLayerSpec
-from sglang.srt.offloading.moe.npu_storage import MemFabricHostPool
-from sglang.srt.offloading.moe.resources import ResourceKind
-from sglang.srt.offloading.moe.v4_format import (
+from sglang.srt.offloading.moe.npu.storage import MemFabricHostPool
+from sglang.srt.offloading.moe.npu.v4_format import (
     NpuV4FP4Format,
     V4LayerStorage,
     _scale_view,
 )
+from sglang.srt.offloading.moe.resources import ResourceKind
 from test_npu_storage import FakeAcl, FakeOffload
 
 

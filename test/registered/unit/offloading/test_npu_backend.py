@@ -12,8 +12,6 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
-
-from sglang.srt.offloading.moe import native_acl, npu_backend, npu_experts
 from sglang.srt.offloading.moe.config import (
     ExpertCatalog,
     ExpertLayerSpec,
@@ -22,8 +20,11 @@ from sglang.srt.offloading.moe.config import (
     Phase,
 )
 from sglang.srt.offloading.moe.execution import ExecutionRequest
-from sglang.srt.offloading.moe.npu_backend import NpuMoEBackend
-from sglang.srt.offloading.moe.npu_transfer import (
+from sglang.srt.offloading.moe.npu import backend as npu_backend
+from sglang.srt.offloading.moe.npu import experts as npu_experts
+from sglang.srt.offloading.moe.npu import native_acl
+from sglang.srt.offloading.moe.npu.backend import NpuMoEBackend
+from sglang.srt.offloading.moe.npu.transfer import (
     DeviceMemoryRegion,
     MemFabricDeviceTransferOps,
     MemFabricTransferBindings,

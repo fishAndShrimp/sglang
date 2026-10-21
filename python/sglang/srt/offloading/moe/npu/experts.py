@@ -15,17 +15,17 @@ from dataclasses import dataclass, fields, replace
 
 import torch
 
-from ..transfer import EventCompletion, JoinedCompletion, TransferTicket
-from .config import Phase
-from .execution import ExecutionRequest, LocalExecution
-from .interfaces import DispatchLayoutAdapter, MoEDispatcher
-from .programs import (
+from ...transfer import EventCompletion, JoinedCompletion, TransferTicket
+from ..config import Phase
+from ..execution import ExecutionRequest, LocalExecution
+from ..interfaces import DispatchLayoutAdapter, MoEDispatcher
+from ..programs import (
     DecodeLocalExpertProgram,
     DispatchOnceProgram,
     PrefillDispatchOnceProgram,
     PrefillLocalExpertProgram,
 )
-from .resources import Allocation, ResourceKind
+from ..resources import Allocation, ResourceKind
 
 
 def _compute_scope(context, device):

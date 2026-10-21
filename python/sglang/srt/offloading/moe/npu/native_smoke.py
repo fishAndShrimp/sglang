@@ -8,10 +8,10 @@ import argparse
 import ctypes
 import json
 
-from ..transfer import HostCopyPlan, HostCopyRegion
+from ...transfer import HostCopyPlan, HostCopyRegion
+from ..storage import HostMemoryCapability
 from .native_acl import get_native_acl, make_acl_host_ops
-from .npu_transfer import DeviceMemoryRegion
-from .storage import HostMemoryCapability
+from .transfer import DeviceMemoryRegion
 
 
 def run_smoke(

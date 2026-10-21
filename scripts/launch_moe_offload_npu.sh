@@ -15,7 +15,7 @@ GLM/modelslim, converted FP8 experts and speculative decoding are not supported.
 
 Overrides:
   SGLANG_ROOT, PYTHON_BIN, WORLD_SIZE, ASCEND_RT_VISIBLE_DEVICES
-  MOE_OFFLOAD_CONFIG (defaults to the repository's examples/npu_v4.json)
+  MOE_OFFLOAD_CONFIG (defaults to the repository's npu/examples/v4.json)
   SERVER_HOST=127.0.0.1 SERVER_PORT=8818 SERVED_MODEL_NAME=deepseek-v4-moe-offload
   MAX_RUNNING_REQUESTS=8 CHUNKED_PREFILL_SIZE=1024 CONTEXT_LENGTH=8192
   MEM_FRACTION_STATIC=0.8 BUILD_NATIVE=1 RUN_NATIVE_SMOKE=0
@@ -51,7 +51,7 @@ CONTEXT_LENGTH=${CONTEXT_LENGTH:-8192}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.8}
 BUILD_NATIVE=${BUILD_NATIVE:-1}
 RUN_NATIVE_SMOKE=${RUN_NATIVE_SMOKE:-0}
-MOE_OFFLOAD_CONFIG=${MOE_OFFLOAD_CONFIG:-$SGLANG_ROOT/python/sglang/srt/offloading/moe/examples/npu_v4.json}
+MOE_OFFLOAD_CONFIG=${MOE_OFFLOAD_CONFIG:-$SGLANG_ROOT/python/sglang/srt/offloading/moe/npu/examples/v4.json}
 
 [[ -n "$MODEL_PATH" ]] || die "Set MODEL_PATH to a DeepSeek V4 native-FP4 checkpoint; see --help."
 for name in WORLD_SIZE SERVER_PORT MAX_RUNNING_REQUESTS CHUNKED_PREFILL_SIZE CONTEXT_LENGTH; do
@@ -141,8 +141,8 @@ PY
 GRAPH_BS=()
 for ((bs=1; bs<MAX_RUNNING_REQUESTS; bs*=2)); do GRAPH_BS+=("$bs"); done
 GRAPH_BS+=("$MAX_RUNNING_REQUESTS")
-BUILD_CMD=("$PYTHON_BIN" -m sglang.srt.offloading.moe.native_acl --build-directory "$NATIVE_BUILD_DIR")
-SMOKE_CMD=("$PYTHON_BIN" -m sglang.srt.offloading.moe.native_smoke --build-directory "$NATIVE_BUILD_DIR")
+BUILD_CMD=("$PYTHON_BIN" -m sglang.srt.offloading.moe.npu.native_acl --build-directory "$NATIVE_BUILD_DIR")
+SMOKE_CMD=("$PYTHON_BIN" -m sglang.srt.offloading.moe.npu.native_smoke --build-directory "$NATIVE_BUILD_DIR")
 SERVER_CMD=(
     "$PYTHON_BIN" -m sglang.launch_server
     --model-path "$MODEL_PATH" --served-model-name "$SERVED_MODEL_NAME"

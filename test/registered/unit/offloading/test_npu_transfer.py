@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-from sglang.srt.offloading.moe.npu_transfer import (
+from sglang.srt.offloading.moe.npu.transfer import (
     AclBatchHostTransferOps,
     DeviceMemoryRegion,
     MemFabricCopyComponent,

@@ -17,7 +17,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass
 
-from ..transfer import (
+from ...transfer import (
     Completion,
     CopySourceKind,
     DeviceCopyPlan,
@@ -27,8 +27,8 @@ from ..transfer import (
     HostTransferOps,
     TransferTicket,
 )
-from .resources import Allocation, ResourceKind
-from .storage import HostMemoryCapability
+from ..resources import Allocation, ResourceKind
+from ..storage import HostMemoryCapability
 
 _UINT32_MAX = 2**32 - 1
 _INT64_MAX = 2**63 - 1

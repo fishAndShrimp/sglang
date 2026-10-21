@@ -10,17 +10,16 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
-
 from sglang.srt.offloading.moe.config import (
     ExpertCatalog,
     ExpertLayerSpec,
     MoEOffloadConfig,
 )
-from sglang.srt.offloading.moe.npu_config import (
+from sglang.srt.offloading.moe.npu.config import (
     NpuOffloadSettings,
     validate_native_environment,
 )
-from sglang.srt.offloading.moe.npu_runtime import LayerPrograms, NpuBoundMoERuntime
+from sglang.srt.offloading.moe.npu.runtime import LayerPrograms, NpuBoundMoERuntime
 from sglang.srt.offloading.moe.owner import MoEOffloadOwner, OwnerState
 from sglang.srt.offloading.moe.policy import TensorLFUPolicy
 from sglang.srt.offloading.moe.resources import Allocation, ResourceKind

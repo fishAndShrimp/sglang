@@ -14,10 +14,10 @@ import threading
 from dataclasses import dataclass
 from types import MappingProxyType
 
-from .npu_storage import _align
-from .npu_transfer import DeviceMemoryRegion
-from .resources import Allocation, ResourceKind
-from .storage import HostExpertStore, HostMemoryCapability
+from ..resources import Allocation, ResourceKind
+from ..storage import HostExpertStore, HostMemoryCapability
+from .storage import _align
+from .transfer import DeviceMemoryRegion
 
 _WEIGHTS = ("w13_weight", "w2_weight")
 _SCALES = ("w13_weight_scale_inv", "w2_weight_scale_inv")

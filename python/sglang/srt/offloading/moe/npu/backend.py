@@ -5,34 +5,34 @@ from __future__ import annotations
 from dataclasses import dataclass, fields
 from types import SimpleNamespace
 
-from ..transfer import (
+from ...transfer import (
     ComposedTransferBackend,
     CopySourceKind,
     DeviceCopyPlan,
     HostCopyPlan,
     HostCopyRegion,
 )
-from .config import ExpertLayerSpec, Phase, fixed_waves
-from .execution import (
+from ..config import ExpertLayerSpec, Phase, fixed_waves
+from ..execution import (
     CacheUpdateCoordinator,
     ExecutionRequest,
     ExecutionReservation,
     ExpertWeightAccess,
     SourcePolicy,
 )
-from .interfaces import MoEBackend
-from .npu_config import validate_native_environment
-from .npu_runtime import NpuBoundMoERuntime, NpuDeviceRuntime
-from .npu_transfer import (
+from ..interfaces import MoEBackend
+from ..prefill import BoundedPrefillWeightPipeline, PrefillPipelineConfig
+from ..residency import BoundExecutionWave, TensorResidencyOps
+from ..resources import Allocation, ResourceKind
+from ..runtime import DecodeStateSnapshot
+from ..state import ResidencyState
+from .config import validate_native_environment
+from .runtime import NpuBoundMoERuntime, NpuDeviceRuntime
+from .transfer import (
     MemFabricCopyComponent,
     MemFabricDeviceTransferOps,
     MemFabricTransferBindings,
 )
-from .prefill import BoundedPrefillWeightPipeline, PrefillPipelineConfig
-from .residency import BoundExecutionWave, TensorResidencyOps
-from .resources import Allocation, ResourceKind
-from .runtime import DecodeStateSnapshot
-from .state import ResidencyState
 
 
 def _tensor_allocations(prefix, tensors, kind=ResourceKind.METADATA):
@@ -108,7 +108,7 @@ class NpuMoEBackend(MoEBackend):
         params_dtype,
         extra_weight_attrs,
     ):
-        from .npu_storage import MemFabricHostPool
+        from .storage import MemFabricHostPool
         from .v4_format import NpuV4FP4Format, V4LayerStorage
 
         layer_id = layer.layer_id
@@ -171,8 +171,9 @@ class NpuMoEBackend(MoEBackend):
 
     def finalize(self, layers, catalog, config, policy):
         import torch
+
+        from .experts import NPUExpertBank, build_npu_layer_programs
         from .native_acl import make_acl_host_ops
-        from .npu_experts import NPUExpertBank, build_npu_layer_programs
 
         if self.runtime is not None or self._closed:
             raise RuntimeError("Backend already finalized or closed")

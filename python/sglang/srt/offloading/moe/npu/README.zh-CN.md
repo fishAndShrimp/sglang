@@ -1,5 +1,18 @@
 # Ascend V4 offload 运行时装配
 
+本目录集中放置 NPU 实现；公共框架见 [上级目录](../README.zh-CN.md)。
+
+| 文件 / 目录 | 职责 |
+| --- | --- |
+| `config.py` / `backend.py` / `runtime.py` | 启动配置、资源装配与运行时生命周期 |
+| `transfer.py` / `experts.py` | ACL/MemFabric 搬运、DeepEP 与原生 FFN |
+| `storage.py` / `v4_format.py` | 共享 host master、FP4 有界加载与 bank |
+| `native_acl.py` / `native_smoke.py` / `native/` | ACL 扩展构建、真实 smoke 与 C++ 源码 |
+| `examples/v4.json` | 每 rank 的 offload 容量配置 |
+
+实现说明：[存储](V4_STORAGE.md)、[EP/FFN](EXPERTS_IMPLEMENTATION.zh-CN.md)、
+[ACL](native/README.zh-CN.md)；本地验证见 [验证记录](../LOCAL_VALIDATION_1021.zh-CN.md)。
+
 `NpuMoEBackend` 在模型构造前安装，由 V4 FP4 quant method 的 create_weights 接管
 host 参数分配；post-load 后装配共享 host master、hot/execution bank、固定 Tensor
 residency、LFU、ACL eager prefill、MemFabric decode 和现有 Ascend EP/FFN。
@@ -51,7 +64,7 @@ MODEL_PATH=/path/to/DeepSeek-V4-Flash \
 offload JSON 的 `native_extension_directory`，避免构建与运行使用不同目录。
 
 `MOE_OFFLOAD_CONFIG` 可指定自己的 JSON，默认使用
-`python/sglang/srt/offloading/moe/examples/npu_v4.json`。默认 host 保留量为
+`python/sglang/srt/offloading/moe/npu/examples/v4.json`。默认 host 保留量为
 **每 rank 128 GiB，四 rank 合计 512 GiB**，workspace/metadata 限额也是每 rank 的；
 启动前应按机器和模型调整 JSON 中的预算。
 
@@ -71,8 +84,8 @@ FP8/V4 量化配置入口，routed experts 由原生 FP4 method 接管；明确�
 ### 手动构建与启动
 
 ```bash
-python -m sglang.srt.offloading.moe.native_acl --build-directory /tmp/sglang-moe-acl
-python -m sglang.srt.offloading.moe.native_smoke --build-directory /tmp/sglang-moe-acl
+python -m sglang.srt.offloading.moe.npu.native_acl --build-directory /tmp/sglang-moe-acl
+python -m sglang.srt.offloading.moe.npu.native_smoke --build-directory /tmp/sglang-moe-acl
 export MOE_ENABLE_TOPK_NEG_ONE=1
 export DEEP_USE_MODE=default
 export MOE_EXPERT_TOKEN_NUMS_TYPE=1
@@ -82,7 +95,7 @@ python -m sglang.launch_server \
   --moe-a2a-backend deepep --deepep-mode auto --moe-runner-backend ascend \
   --disable-overlap-schedule --disable-shared-experts-fusion \
   --cuda-graph-backend-decode full --cuda-graph-backend-prefill disabled \
-  --moe-offload-config python/sglang/srt/offloading/moe/examples/npu_v4.json
+  --moe-offload-config python/sglang/srt/offloading/moe/npu/examples/v4.json
 ```
 
 示例中的 host_pool_gib、workspace/metadata 及 max_dispatch_rows 是明确的容量配置，
