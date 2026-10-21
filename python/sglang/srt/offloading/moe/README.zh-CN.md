@@ -1,9 +1,12 @@
 # MoE 权重 Offload 框架
 
-> **2026-10-21 draft 更新**：新增可运行的 Tensor cache 规划、graph 资源生命周期、
-> 有界 prefill worker 和 ACL/MemFabric 搬运适配。实现与本地验收范围见
-> [cache 说明](CACHE_IMPLEMENTATION.zh-CN.md) 和 [H2D 说明](H2D_IMPLEMENTATION.zh-CN.md)。
-> 下文历史状态不代表这些新组件尚未实现；原生 loader/FP4/EP、目标 SDK 封装及 A5 完整图仍待装配与实机验证。
+> **2026-10-21 实现更新**：已接入 Tensor cache、有界 prefill、原生 ACL batch、
+> ACL/MemFabric 共用 host 存储、V4 FP4 loader、具体运行时和 DeepEP/Ascend FFN bank。
+> 启动入口和支持范围见 [运行时](NPU_RUNTIME.zh-CN.md)；实现见
+> [ACL](native/README.zh-CN.md)、[存储](NPU_V4_STORAGE.md)、
+> [EP/FFN](NPU_EXPERTS_IMPLEMENTATION.zh-CN.md)，测试见
+> [本地验证](LOCAL_VALIDATION_1021.zh-CN.md)。
+> A5/CANN 原生编译、数值对齐、完整图和性能仍待目标机验收。
 
 [English](README.md) | 中文
 
@@ -11,9 +14,9 @@
 
 本目录面向 **DeepSeek V4 Flash 原生 FP4 权重、A5 多卡 TP + EP**，为 CUDA / NPU 提供共同的专家身份、缓存策略、资源所有权和执行程序接口。
 
-**当前交付是代码框架，尚未提供可运行的 A5 / CUDA MoE offload 推理后端。** 已实现公共控制逻辑、Tensor LFU 和 CPU 契约测试；完整 decode graph 是首版必须满足的验收条件，不能用 eager fallback 替代。
+当前包含公共框架及实验性 Ascend 具体后端，CUDA 仍是扩展点。完整 decode graph 是必须满足的验收条件，不能用 eager fallback 替代；本地 CPU 测试不代表硬件验收。
 
-本文以 `moe-offload-proto-v1` 分支的框架提交 `65e5c53ebb` 及后续 DispatchOnce 扩展为实现基线，更新于 **2026-10-20**。下文保留之前讨论的三张 UML 的主题，并按实际代码名称更新、标注实现状态；另补一张 prefill/decode 切换状态图。
+本文的架构图沿用框架提交 `65e5c53ebb` 及后续 DispatchOnce 扩展；接口标记描述可移植契约，具体 Ascend 实现以顶部链接的说明为准。下文保留之前讨论的三张 UML 的主题及 prefill/decode 切换状态图。
 
 ## 2026 年 10 月 21 日 H2D 抽象落地
 
@@ -24,13 +27,13 @@
 | [transfer.py](../transfer.py) | `HostCopyRegion` / `HostCopyPlan`、`HostTransferOps`、`ComposedTransferBackend`，与已有 `DeviceTransferOps` 组合；不绑定默认硬件后端 |
 | [execution.py](execution.py) | `ExecutionRequest`、`ExecutionReservation`、`UpdatePlan`、`WeightLease`、`ExpertWeightAccess`、`CacheUpdateCoordinator` |
 | [interfaces.py](interfaces.py) | `ExecutionContext` 的保活/完成契约；临时驻留发布与 reader 结束；Dispatch completion；runtime 层首/尾部默认委托 |
-| [prefill.py](prefill.py) | `PrefillWeightPipeline` 抽象：start / validate_session / seal / acquire / finish / abort；具体 worker 和 ACL 调度待实现 |
+| [prefill.py](prefill.py) | `PrefillWeightPipeline` 契约及 `BoundedPrefillWeightPipeline` 有界 worker：start / validate_session / seal / acquire / finish / abort |
 | [programs.py](programs.py) | `PrefillDispatchOnceProgram`、`PrefillLocalExpertProgram`、`DecodeLocalExpertProgram`；复用公共 D/F/C，不复制整套 forward |
 | [test_h2d_contracts.py](../../../../../test/registered/unit/offloading/test_h2d_contracts.py) | CPU 契约测试：模式隔离、每趟 K、异步依赖、失败保活、LFU 尾部更新及无预取 decode |
 
 实际接入时，runtime 绑定 `ComposedTransferBackend(host_ops=..., device_ops=...)` 和 `ExpertWeightAccess`，并设置 `cache_updates = CacheUpdateCoordinator(...)`。prefill 另行注入具体 pipeline；local program 的 `run_experts` 返回 `LocalExecution(output, read_done)`。所有对象与物理分配仍由 bound runtime / owner 管理。
 
-**ACL batch 扩展、MemFabric device lowering、设备 ResidencyOps、prefetch worker、真实模型 hooks 与完整 A5 graph 验收仍待实现。** 当前代码不会用 Torch copy 或 CPU 决策偷偷替代这些后端。Decode 当前 wave 的复制还需等待计算流 frontier，保证相邻 wave 即使用不同 bank 也不提前搬运。
+ACL batch 扩展、MemFabric device lowering、TensorResidencyOps、prefill worker 和模型 hooks 已实现；完整 A5 graph 仍待硬件验收。Decode 当前 wave 的复制还需等待计算流 frontier，保证相邻 wave 即使用不同 bank 也不提前搬运。
 
 ## 1. 已确认的设计边界
 
@@ -52,7 +55,7 @@
 
 ## 2. 代码入口与接入顺序
 
-开发入口为 `ModelRunner(..., moe_offloader=MoEOffloaderV2(config, backend))`。必须显式提供具体 `MoEBackend`；当前没有默认 accelerator backend，也没有 serving CLI 开关。
+开发入口为 `ModelRunner(..., moe_offloader=MoEOffloaderV2(config, backend))`。Ascend 另提供 `--moe-offload-config` JSON 启动入口，由 `NpuMoEBackend` 在模型构造前接管 FP4 host 分配；未启用时保留原 offloader 选择。
 
 ```python
 from sglang.srt.offloading.moe import MoEOffloadConfig, MoEOffloaderV2, TensorLFUPolicy
@@ -76,10 +79,10 @@ offloader = MoEOffloaderV2(config, backend, policy=TensorLFUPolicy())
 | --- | --- | --- |
 | 1 | [create_offloader](../../utils/offloader.py)、[ModelRunner](../../model_executor/model_runner.py) | 接受显式 MoE 实例，拒绝与旧模块 offloader 共同拥有权重；不传入时保留原有 V1/V2/Noop 选择。 |
 | 2 | [make_layers / make_pp_layers](../../utils/common.py) → `wrap_modules()` | 沿用现有层构造接入点。`DeepSeekV4Adapter.describe()` 描述层及 EP 归属，对可卸载层调用 `backend.prepare_layer()`。 |
-| 3 | `post_init()` → `backend.finalize()` | 在平台 post-load 后绑定原生格式、固定地址资源和执行程序，创建 owner，检查能力声明及预算。具体有界加载流程仍待后端实现。 |
-| 4 | `bind_model_runner()` | 设置在线更新限制标记，委托 runtime 安装 layer-start、router、step 和 graph hooks。具体模型 hook 安装器仍是抽象接口。 |
+| 3 | `post_init()` → `backend.finalize()` | 在平台 post-load 后绑定原生格式、固定地址资源和执行程序，创建 owner，检查能力声明及预算。Ascend 由 `V4LayerStorage` 实现有界加载。 |
+| 4 | `bind_model_runner()` | 设置在线更新限制标记，委托 `NpuBoundMoERuntime` 安装 layer-start、router、step 和 graph hooks。 |
 | 5 | `ModelRunner.forward()` → `forward_scope()` | 包围 eager 执行或 graph replay。runtime 负责调用 owner 的 begin/finish/fail，以及为每次提交生成新的完成凭据。 |
-| 6 | [DecodeCudaGraphRunner](../../model_executor/runner/decode_cuda_graph_runner.py) | 已加入 `capture_head_hooks` 调用点，与既有 `capture_tail_hooks` 对齐；NPU 及实际 MoE hook 接入仍待完成。 |
+| 6 | [DecodeCudaGraphRunner](../../model_executor/runner/decode_cuda_graph_runner.py) | `capture_head_hooks` 与 `capture_tail_hooks` 对齐；NPU 由具体 runtime 绑定。 |
 | 7 | `close()` | 显式销毁 graph、释放 graph lease，再排空工作、释放资源。实际模型销毁路径由 runtime 接入。 |
 
 主要源文件：

@@ -1,27 +1,31 @@
 # MoE offload framework
 
-> **2026-10-21 draft update:** concrete tensor cache planning, graph ownership,
-> bounded prefill scheduling and ACL/MemFabric transfer adapters are now available.
-> See [cache implementation](CACHE_IMPLEMENTATION.zh-CN.md) and
-> [H2D implementation](H2D_IMPLEMENTATION.zh-CN.md) for binding contracts and test scope.
-> Native model/FP4/EP integration, the SDK-matched ACL shim and A5 graph acceptance remain outstanding.
+> **2026-10-21 implementation update:** tensor cache planning, bounded prefill,
+> native ACL submission, shared MemFabric/ACL host storage, V4 FP4 loading,
+> runtime hooks and DeepEP/Ascend bank execution are implemented.
+> See [startup and runtime](NPU_RUNTIME.zh-CN.md), [native ACL](native/README.zh-CN.md),
+> [weight storage](NPU_V4_STORAGE.md), [EP/FFN](NPU_EXPERTS_IMPLEMENTATION.zh-CN.md)
+> and [local validation](LOCAL_VALIDATION_1021.zh-CN.md).
+> Target A5/CANN compilation, numerical parity, full graph and performance acceptance
+> remain unverified; CPU contracts do not certify hardware execution.
 
 English | [中文](README.zh-CN.md)
 
 [Three-person development plan (Chinese)](DEVELOPMENT_PLAN.zh-CN.md)
 
 This package provides the framework for DeepSeek V4 Flash routed-expert offload.
-It is opt-in and **does not yet provide an A5 or CUDA inference backend**. Full
-decode graph remains a required backend capability, not an eager fallback.
+It provides an opt-in experimental Ascend backend; CUDA remains an extension point.
+Full decode graph is required, with no eager decode fallback.
 The CPU contract suite validates the framework and tensor LFU, not accelerator
 graph capture, native FP4 repacking, HCCL/DeepEP, or performance.
 
 ## Entry points and growth from V2
 
 `ModelRunner(..., moe_offloader=MoEOffloaderV2(config, backend))` is the development
-entry point. It passes the explicit instance through `create_offloader()`.
-There is no serving CLI switch until a concrete backend passes the graph gate.
-Normal callers keep existing V1/V2/Noop selection. Module offload and MoE offload
+entry point. Native Ascend assembly is available through `--moe-offload-config`
+using the strict JSON example in the runtime guide. Both pass an explicit instance
+through `create_offloader()`. Normal callers keep existing V1/V2/Noop selection.
+Module offload and MoE offload
 are mutually exclusive owners of the routed weights.
 
 - `BaseOffloader` moved to `srt.offloading.base`; the old `utils.offloader` import
@@ -81,7 +85,12 @@ The component responsibilities are:
 - **AllocationLedger** accounts for unique physical allocations, enforces byte budgets, and retains allocation keepalive references.
 - **SlotLeaseManager** reserves usage rights to banks or slot regions outside graph capture.
 
-## Concrete framework versus backend extension points
+## Concrete framework and accelerator implementations
+
+The interface table below describes the portable contracts. Ascend implementations
+are `NpuMoEBackend`, `NpuV4FP4Format`, `NpuBoundMoERuntime`, `TensorResidencyOps`,
+`MemFabricDeviceTransferOps` and the adapters in `npu_experts.py`. Other backends
+must implement these same obligations.
 
 | API | Current implementation / backend obligation |
 | --- | --- |
@@ -95,15 +104,15 @@ The component responsibilities are:
 | `TensorLFUPolicy` | Device-tensor frequency accumulation, optional aging, deterministic selection and snapshot copies. CPU tested; device operator/capture support requires validation. |
 | `ComposedDFCProgram` | Fixed rounds of D/F/C, one dispatcher handle at a time, accumulation and one common tail. |
 | `DispatchOnceProgram` | One full D, fixed local F waves, one full C and common tail; validates complete local-expert coverage before communication. |
-| `MoEBackend` | **Implement:** bounded checkpoint preparation, native post-load binding and cleanup of partial initialization. |
-| `ExpertFormat` | **Implement:** native FP4 weights/scales, physical layout/bytes and bounded lossless repacking. Adapt existing `paged_experts.ExpertFormat` concepts. |
-| `BoundMoERuntime` | **Implement:** actual allocations, model/eager/graph hooks, prefetch, exact snapshot/restore, all-stream completion and teardown. |
-| `ResidencyOps` | **Implement:** device demand/miss planning, target-set diff, safe victim reservation, generation checks and publication after transfer. |
-| `DeviceTransferOps` | **Implement:** dynamic source selection into fixed destinations within full graph; registered-host handles must remain owned. |
-| `MoEDispatcher` | **Implement:** common dispatch/combine/tail boundary and communication buffer lifetime. |
-| `DispatchLayoutAdapter` | **Implement:** slice received activations/scales/counts, restore original receive rows, and build one full combine input. |
-| `WaveDispatcher` | **Implement:** adapt current EP dispatch/combine, preserve original global IDs and top-k weights, support empty/partial waves. |
-| `LocalExpertProgram` | **Implement:** demand after dispatch, hit D2D/miss H2D into explicit banks, native runner binding and reader completion. |
+| `MoEBackend` | **Backend contract:** bounded checkpoint preparation, native post-load binding and cleanup of partial initialization. |
+| `ExpertFormat` | **Backend contract:** native FP4 weights/scales, physical layout/bytes and bounded lossless repacking. Adapt existing `paged_experts.ExpertFormat` concepts. |
+| `BoundMoERuntime` | **Backend contract:** actual allocations, model/eager/graph hooks, prefetch, exact snapshot/restore, all-stream completion and teardown. |
+| `ResidencyOps` | **Backend contract:** device demand/miss planning, target-set diff, safe victim reservation, generation checks and publication after transfer. |
+| `DeviceTransferOps` | **Backend contract:** dynamic source selection into fixed destinations within full graph; registered-host handles must remain owned. |
+| `MoEDispatcher` | **Backend contract:** common dispatch/combine/tail boundary and communication buffer lifetime. |
+| `DispatchLayoutAdapter` | **Backend contract:** slice received activations/scales/counts, restore original receive rows, and build one full combine input. |
+| `WaveDispatcher` | **Backend contract:** adapt current EP dispatch/combine, preserve original global IDs and top-k weights, support empty/partial waves. |
+| `LocalExpertProgram` | **Backend contract:** demand after dispatch, hit D2D/miss H2D into explicit banks, native runner binding and reader completion. |
 | `WholeMoEProgram` | Full offload+DFC fusion can replace this interface while honoring the public residency and ownership protocol. |
 
 `TorchTransferBackend.copy_into` implements host-planned ordinary PyTorch copies
