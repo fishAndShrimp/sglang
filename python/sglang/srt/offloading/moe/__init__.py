@@ -1,5 +1,10 @@
 """Opt-in MoE offloading framework; accelerator execution is backend supplied."""
 
+from .cache_backend import CacheBackend, CacheBackendBinding
+from .cache_metadata import CacheMetadataAdapter
+from .cache_residency import CopySource
+from .cache_residency import TensorResidencyOps as CacheResidencyOps
+from .cache_runtime import CacheExecutionContext, CacheRuntime
 from .config import ExpertCatalog, ExpertLayerSpec, MoEOffloadConfig, Phase
 from .execution import (
     CacheUpdateCoordinator,
@@ -11,9 +16,10 @@ from .execution import (
     UpdatePlan,
     WeightLease,
 )
-from .interfaces import ExecutionContext
+from .interfaces import ExecutionContext, LocalRoutes
 from .offloader import MoEOffloaderV2
 from .owner import MoEOffloadOwner
+from .periodic_lfu import PeriodicLFUConfig, PeriodicLFUPolicy, PeriodicLFUState
 from .policy import TensorLFUPolicy
 from .prefill import (
     BoundedPrefillWeightPipeline,
@@ -34,8 +40,15 @@ from .storage import HostMemoryCapability
 __all__ = [
     "BoundExecutionWave",
     "BoundedPrefillWeightPipeline",
+    "CacheBackend",
+    "CacheBackendBinding",
+    "CacheExecutionContext",
+    "CacheMetadataAdapter",
+    "CacheResidencyOps",
+    "CacheRuntime",
     "CacheUpdateCoordinator",
     "ComposedDFCProgram",
+    "CopySource",
     "DecodeLocalExpertProgram",
     "DecodeStateSnapshot",
     "DispatchOnceProgram",
@@ -47,9 +60,13 @@ __all__ = [
     "ExpertWeightAccess",
     "LocalExecution",
     "ManagedExecutionContext",
+    "LocalRoutes",
     "MoEOffloadConfig",
-    "MoEOffloaderV2",
     "MoEOffloadOwner",
+    "MoEOffloaderV2",
+    "PeriodicLFUConfig",
+    "PeriodicLFUPolicy",
+    "PeriodicLFUState",
     "Phase",
     "HostMemoryCapability",
     "PrefillPipelineConfig",
