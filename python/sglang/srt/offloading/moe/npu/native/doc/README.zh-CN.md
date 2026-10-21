@@ -1,6 +1,6 @@
 # ACL batch 原生适配
 
-`native_acl.py` 将 `AclBatchHostTransferOps` 接到本目录的 C++ 扩展。
+`../../native_acl.py` 将 `AclBatchHostTransferOps` 接到上级目录的 C++ 扩展。
 扩展直接包含目标机的 `acl/acl.h`、torch_npu 的 `NPUStream.h` 和
 `NPUGuard.h`；不复制 ACL 结构布局、不使用 ctypes 调用真实运行库，
 也不把 Python raw stream handle 当作已经排空的 torch_npu 提交队列。

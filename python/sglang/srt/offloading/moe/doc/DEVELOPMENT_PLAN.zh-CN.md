@@ -30,9 +30,9 @@ Prefill 与 decode 共用底层存储、搬运和计算适配。各任务沿用�
 
 | 人员 | 主责 | 主要代码落点 | 对其他人的交付 |
 | --- | --- | --- | --- |
-| **A：特性 owner** | 公共接口、device residency、LFU 接入、runtime 生命周期、模型与 graph 集成、最终验收 | `interfaces.py`、`owner.py`、`state.py`、`policy.py`，具体 `BoundMoERuntime` | 固定数据协议、执行计划、缓存更新事务、完整 runtime。 |
-| **B：存储与传输** | 原生 FP4 bundle、pinned 加载、物理池、动态 H2D/D2D、传输事件与资源保活 | `storage.py`、`transfer.py`，具体 `ExpertFormat`、`DeviceTransferOps` | runner 可使用的固定权重 bank，以及可信的完成依赖。 |
-| **C：EP 与计算** | wave 路由、dispatch/combine、原生 F、执行 bank 绑定、prefill 双缓冲 | `programs.py`，具体 `WaveDispatcher`、`LocalExpertProgram`，模型执行接入点 | 单层完整 MoE 执行程序及其正确性测试。 |
+| **A：特性 owner** | 公共接口、device residency、LFU 接入、runtime 生命周期、模型与 graph 集成、最终验收 | `../interfaces.py`、`../owner.py`、`../state.py`、`../policy.py`，具体 `BoundMoERuntime` | 固定数据协议、执行计划、缓存更新事务、完整 runtime。 |
+| **B：存储与传输** | 原生 FP4 bundle、pinned 加载、物理池、动态 H2D/D2D、传输事件与资源保活 | `../storage.py`、`transfer.py`，具体 `ExpertFormat`、`DeviceTransferOps` | runner 可使用的固定权重 bank，以及可信的完成依赖。 |
+| **C：EP 与计算** | wave 路由、dispatch/combine、原生 F、执行 bank 绑定、prefill 双缓冲 | `../programs.py`，具体 `WaveDispatcher`、`LocalExpertProgram`，模型执行接入点 | 单层完整 MoE 执行程序及其正确性测试。 |
 
 上述文件主要位于 `python/sglang/srt/offloading/moe/`；公共 `transfer.py` 位于上一级 `python/sglang/srt/offloading/`。
 
@@ -120,7 +120,7 @@ B/C 两条路径通过后，由 A 组合成 T3；遇到图内动态传输、原�
 | 搬运完成 | B 保证 `weights_ready` 覆盖完整 bundle；A 才能发布新映射；C 才能执行 F。 |
 | Step 完成 | A 汇合 B/C 的完成依赖，产生覆盖计算、搬运、通信及预取的 `resources_idle`。 |
 | 精确恢复 | A 决定恢复哪些 key、slot 和策略状态；B 执行原 slot 重载；C 释放 prefill bank 使用权。 |
-| 公共接口变更 | A 维护 `interfaces.py` 和公共状态协议；B/C 在各自后端文件开发，接口变化共同评审。 |
+| 公共接口变更 | A 维护 `../interfaces.py` 和公共状态协议；B/C 在各自后端文件开发，接口变化共同评审。 |
 | CUDA/NPU 共用 | 公共控制逻辑保持设备无关；布局、传输、事件和计算差异由各职责线的后端实现承担。 |
 
 任何实现都不得绕过 owner 私建权重缓存或隐藏 staging。普通 PyTorch copy、device 发起传输或融合算子使用相同资源与完成契约；首轮只需打通一种满足完整 graph 的实现。

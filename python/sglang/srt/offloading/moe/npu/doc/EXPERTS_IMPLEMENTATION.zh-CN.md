@@ -1,6 +1,6 @@
 # 原生 NPU EP / FFN 接入
 
-`experts.py` 将已有 `DispatchOnceProgram` / `PrefillDispatchOnceProgram`
+`../experts.py` 将已有 `DispatchOnceProgram` / `PrefillDispatchOnceProgram`
 连接到仓库内的 DeepEP dispatcher 与 `AscendRunnerCore`。模型的 shared expert、
 routed scaling 仍由外层 DeepSeek MLP 执行；返回值包含原 `FusedMoE.forward_impl`
 的 hidden-size 裁剪与 `reduce_results` 收尾。

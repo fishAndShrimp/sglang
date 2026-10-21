@@ -1,17 +1,17 @@
 # Ascend V4 offload 运行时装配
 
-本目录集中放置 NPU 实现；公共框架见 [上级目录](../README.zh-CN.md)。
+上级 `npu/` 目录集中放置 NPU 实现；公共框架见 [公共说明](../../doc/README.zh-CN.md)。
 
 | 文件 / 目录 | 职责 |
 | --- | --- |
-| `config.py` / `backend.py` / `runtime.py` | 启动配置、资源装配与运行时生命周期 |
-| `transfer.py` / `experts.py` | ACL/MemFabric 搬运、DeepEP 与原生 FFN |
-| `storage.py` / `v4_format.py` | 共享 host master、FP4 有界加载与 bank |
-| `native_acl.py` / `native_smoke.py` / `native/` | ACL 扩展构建、真实 smoke 与 C++ 源码 |
-| `examples/v4.json` | 每 rank 的 offload 容量配置 |
+| `../config.py` / `../backend.py` / `../runtime.py` | 启动配置、资源装配与运行时生命周期 |
+| `../transfer.py` / `../experts.py` | ACL/MemFabric 搬运、DeepEP 与原生 FFN |
+| `../storage.py` / `../v4_format.py` | 共享 host master、FP4 有界加载与 bank |
+| `../native_acl.py` / `../native_smoke.py` / `../native/` | ACL 扩展构建、真实 smoke 与 C++ 源码 |
+| `../examples/v4.json` | 每 rank 的 offload 容量配置 |
 
 实现说明：[存储](V4_STORAGE.md)、[EP/FFN](EXPERTS_IMPLEMENTATION.zh-CN.md)、
-[ACL](native/README.zh-CN.md)；本地验证见 [验证记录](../LOCAL_VALIDATION_1021.zh-CN.md)。
+[ACL](../native/doc/README.zh-CN.md)；本地验证见 [验证记录](../../doc/LOCAL_VALIDATION_1021.zh-CN.md)。
 
 `NpuMoEBackend` 在模型构造前安装，由 V4 FP4 quant method 的 create_weights 接管
 host 参数分配；post-load 后装配共享 host master、hot/execution bank、固定 Tensor

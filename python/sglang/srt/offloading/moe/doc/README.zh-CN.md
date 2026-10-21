@@ -2,9 +2,9 @@
 
 > **2026-10-21 实现更新**：已接入 Tensor cache、有界 prefill、原生 ACL batch、
 > ACL/MemFabric 共用 host 存储、V4 FP4 loader、具体运行时和 DeepEP/Ascend FFN bank。
-> 启动入口和支持范围见 [运行时](npu/README.zh-CN.md)；实现见
-> [ACL](npu/native/README.zh-CN.md)、[存储](npu/V4_STORAGE.md)、
-> [EP/FFN](npu/EXPERTS_IMPLEMENTATION.zh-CN.md)，测试见
+> 启动入口和支持范围见 [运行时](../npu/doc/README.zh-CN.md)；实现见
+> [ACL](../npu/native/doc/README.zh-CN.md)、[存储](../npu/doc/V4_STORAGE.md)、
+> [EP/FFN](../npu/doc/EXPERTS_IMPLEMENTATION.zh-CN.md)，测试见
 > [本地验证](LOCAL_VALIDATION_1021.zh-CN.md)。
 > A5/CANN 原生编译、数值对齐、完整图和性能仍待目标机验收。
 
@@ -12,11 +12,11 @@
 
 [三人开发分工与任务计划](DEVELOPMENT_PLAN.zh-CN.md)
 
-公共 cache、policy、资源协议和执行编排保留在本目录。仅用于 Ascend 的实现归入
-[npu/](npu/README.zh-CN.md)：backend、runtime、transfer、原生 V4 存储、ACL C++
-源码、启动配置及对应说明。`npu/__init__.py` 不加载原生库或初始化设备。
+公共 cache、policy、资源协议和执行编排位于上级 `moe/` 目录。仅用于 Ascend 的实现归入
+[npu/](../npu/doc/README.zh-CN.md)：backend、runtime、transfer、原生 V4 存储、ACL C++
+源码、启动配置及对应说明。`../npu/__init__.py` 不加载原生库或初始化设备。
 
-本目录面向 **DeepSeek V4 Flash 原生 FP4 权重、A5 多卡 TP + EP**，为 CUDA / NPU 提供共同的专家身份、缓存策略、资源所有权和执行程序接口。
+本模块面向 **DeepSeek V4 Flash 原生 FP4 权重、A5 多卡 TP + EP**，为 CUDA / NPU 提供共同的专家身份、缓存策略、资源所有权和执行程序接口。
 
 当前包含公共框架及实验性 Ascend 具体后端，CUDA 仍是扩展点。完整 decode graph 是必须满足的验收条件，不能用 eager fallback 替代；本地 CPU 测试不代表硬件验收。
 
@@ -28,12 +28,12 @@
 
 | 入口 | 当前实现 |
 | --- | --- |
-| [transfer.py](../transfer.py) | `HostCopyRegion` / `HostCopyPlan`、`HostTransferOps`、`ComposedTransferBackend`，与已有 `DeviceTransferOps` 组合；不绑定默认硬件后端 |
-| [execution.py](execution.py) | `ExecutionRequest`、`ExecutionReservation`、`UpdatePlan`、`WeightLease`、`ExpertWeightAccess`、`CacheUpdateCoordinator` |
-| [interfaces.py](interfaces.py) | `ExecutionContext` 的保活/完成契约；临时驻留发布与 reader 结束；Dispatch completion；runtime 层首/尾部默认委托 |
-| [prefill.py](prefill.py) | `PrefillWeightPipeline` 契约及 `BoundedPrefillWeightPipeline` 有界 worker：start / validate_session / seal / acquire / finish / abort |
-| [programs.py](programs.py) | `PrefillDispatchOnceProgram`、`PrefillLocalExpertProgram`、`DecodeLocalExpertProgram`；复用公共 D/F/C，不复制整套 forward |
-| [test_h2d_contracts.py](../../../../../test/registered/unit/offloading/test_h2d_contracts.py) | CPU 契约测试：模式隔离、每趟 K、异步依赖、失败保活、LFU 尾部更新及无预取 decode |
+| [transfer.py](../../transfer.py) | `HostCopyRegion` / `HostCopyPlan`、`HostTransferOps`、`ComposedTransferBackend`，与已有 `DeviceTransferOps` 组合；不绑定默认硬件后端 |
+| [execution.py](../execution.py) | `ExecutionRequest`、`ExecutionReservation`、`UpdatePlan`、`WeightLease`、`ExpertWeightAccess`、`CacheUpdateCoordinator` |
+| [interfaces.py](../interfaces.py) | `ExecutionContext` 的保活/完成契约；临时驻留发布与 reader 结束；Dispatch completion；runtime 层首/尾部默认委托 |
+| [prefill.py](../prefill.py) | `PrefillWeightPipeline` 契约及 `BoundedPrefillWeightPipeline` 有界 worker：start / validate_session / seal / acquire / finish / abort |
+| [programs.py](../programs.py) | `PrefillDispatchOnceProgram`、`PrefillLocalExpertProgram`、`DecodeLocalExpertProgram`；复用公共 D/F/C，不复制整套 forward |
+| [test_h2d_contracts.py](../../../../../../test/registered/unit/offloading/test_h2d_contracts.py) | CPU 契约测试：模式隔离、每趟 K、异步依赖、失败保活、LFU 尾部更新及无预取 decode |
 
 实际接入时，runtime 绑定 `ComposedTransferBackend(host_ops=..., device_ops=...)` 和 `ExpertWeightAccess`，并设置 `cache_updates = CacheUpdateCoordinator(...)`。prefill 另行注入具体 pipeline；local program 的 `run_experts` 返回 `LocalExecution(output, read_done)`。所有对象与物理分配仍由 bound runtime / owner 管理。
 
@@ -81,28 +81,28 @@ offloader = MoEOffloaderV2(config, backend, policy=TensorLFUPolicy())
 
 | 顺序 | 入口 | 当前行为与边界 |
 | --- | --- | --- |
-| 1 | [create_offloader](../../utils/offloader.py)、[ModelRunner](../../model_executor/model_runner.py) | 接受显式 MoE 实例，拒绝与旧模块 offloader 共同拥有权重；不传入时保留原有 V1/V2/Noop 选择。 |
-| 2 | [make_layers / make_pp_layers](../../utils/common.py) → `wrap_modules()` | 沿用现有层构造接入点。`DeepSeekV4Adapter.describe()` 描述层及 EP 归属，对可卸载层调用 `backend.prepare_layer()`。 |
+| 1 | [create_offloader](../../../utils/offloader.py)、[ModelRunner](../../../model_executor/model_runner.py) | 接受显式 MoE 实例，拒绝与旧模块 offloader 共同拥有权重；不传入时保留原有 V1/V2/Noop 选择。 |
+| 2 | [make_layers / make_pp_layers](../../../utils/common.py) → `wrap_modules()` | 沿用现有层构造接入点。`DeepSeekV4Adapter.describe()` 描述层及 EP 归属，对可卸载层调用 `backend.prepare_layer()`。 |
 | 3 | `post_init()` → `backend.finalize()` | 在平台 post-load 后绑定原生格式、固定地址资源和执行程序，创建 owner，检查能力声明及预算。Ascend 由 `V4LayerStorage` 实现有界加载。 |
 | 4 | `bind_model_runner()` | 设置在线更新限制标记，委托 `NpuBoundMoERuntime` 安装 layer-start、router、step 和 graph hooks。 |
 | 5 | `ModelRunner.forward()` → `forward_scope()` | 包围 eager 执行或 graph replay。runtime 负责调用 owner 的 begin/finish/fail，以及为每次提交生成新的完成凭据。 |
-| 6 | [DecodeCudaGraphRunner](../../model_executor/runner/decode_cuda_graph_runner.py) | `capture_head_hooks` 与 `capture_tail_hooks` 对齐；NPU 由具体 runtime 绑定。 |
+| 6 | [DecodeCudaGraphRunner](../../../model_executor/runner/decode_cuda_graph_runner.py) | `capture_head_hooks` 与 `capture_tail_hooks` 对齐；NPU 由具体 runtime 绑定。 |
 | 7 | `close()` | 显式销毁 graph、释放 graph lease，再排空工作、释放资源。实际模型销毁路径由 runtime 接入。 |
 
 主要源文件：
 
 | 文件 | 职责 |
 | --- | --- |
-| [base.py](../base.py) | `BaseOffloader` 公共接入契约；旧 `utils.offloader` 导入路径继续暴露该类。 |
-| [transfer.py](../transfer.py) | `Completion`、`TransferTicket`、`DeviceCopyPlan`、传输接口与普通 PyTorch 实现。 |
-| [config.py](config.py) | `MoEOffloadConfig`、`ExpertLayerSpec`、`ExpertCatalog`、`ExpertWave`、`fixed_waves()`。 |
-| [offloader.py](offloader.py) | `MoEOffloaderV2` 门面和 `DeepSeekV4Adapter`。 |
-| [owner.py](owner.py) | 唯一 owner、两个模式控制器、forward token、graph lease、切换与关闭流程。 |
-| [resources.py](resources.py)、[storage.py](storage.py) | 物理内存记账、host 侧 slot 预约、pinned 权重及注册句柄持有。 |
-| [state.py](state.py)、[policy.py](policy.py) | 公共缓存 tensor 状态、独立 LFU 状态及策略实现。 |
-| [interfaces.py](interfaces.py)、[programs.py](programs.py) | 后端扩展点、固定多轮 DFC 和一次 D / 分片 F / 一次 C 编排。 |
-| [test_dispatch_once.py](../../../../../test/registered/unit/offloading/test_dispatch_once.py) | DispatchOnce 的 CPU 数值对照与边界测试；不验证真实 DeepEP 或 graph。 |
-| [test_moe_framework.py](../../../../../test/registered/unit/offloading/test_moe_framework.py) | CPU 契约测试与测试用 fake runtime；fake runtime 不属于推理后端。 |
+| [base.py](../../base.py) | `BaseOffloader` 公共接入契约；旧 `utils.offloader` 导入路径继续暴露该类。 |
+| [transfer.py](../../transfer.py) | `Completion`、`TransferTicket`、`DeviceCopyPlan`、传输接口与普通 PyTorch 实现。 |
+| [config.py](../config.py) | `MoEOffloadConfig`、`ExpertLayerSpec`、`ExpertCatalog`、`ExpertWave`、`fixed_waves()`。 |
+| [offloader.py](../offloader.py) | `MoEOffloaderV2` 门面和 `DeepSeekV4Adapter`。 |
+| [owner.py](../owner.py) | 唯一 owner、两个模式控制器、forward token、graph lease、切换与关闭流程。 |
+| [resources.py](../resources.py)、[storage.py](../storage.py) | 物理内存记账、host 侧 slot 预约、pinned 权重及注册句柄持有。 |
+| [state.py](../state.py)、[policy.py](../policy.py) | 公共缓存 tensor 状态、独立 LFU 状态及策略实现。 |
+| [interfaces.py](../interfaces.py)、[programs.py](../programs.py) | 后端扩展点、固定多轮 DFC 和一次 D / 分片 F / 一次 C 编排。 |
+| [test_dispatch_once.py](../../../../../../test/registered/unit/offloading/test_dispatch_once.py) | DispatchOnce 的 CPU 数值对照与边界测试；不验证真实 DeepEP 或 graph。 |
+| [test_moe_framework.py](../../../../../../test/registered/unit/offloading/test_moe_framework.py) | CPU 契约测试与测试用 fake runtime；fake runtime 不属于推理后端。 |
 
 ## 3. UML：从当前框架生长
 

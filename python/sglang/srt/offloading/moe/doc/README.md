@@ -3,8 +3,8 @@
 > **2026-10-21 implementation update:** tensor cache planning, bounded prefill,
 > native ACL submission, shared MemFabric/ACL host storage, V4 FP4 loading,
 > runtime hooks and DeepEP/Ascend bank execution are implemented.
-> See [startup and runtime](npu/README.zh-CN.md), [native ACL](npu/native/README.zh-CN.md),
-> [weight storage](npu/V4_STORAGE.md), [EP/FFN](npu/EXPERTS_IMPLEMENTATION.zh-CN.md)
+> See [startup and runtime](../npu/doc/README.zh-CN.md), [native ACL](../npu/native/doc/README.zh-CN.md),
+> [weight storage](../npu/doc/V4_STORAGE.md), [EP/FFN](../npu/doc/EXPERTS_IMPLEMENTATION.zh-CN.md)
 > and [local validation](LOCAL_VALIDATION_1021.zh-CN.md).
 > Target A5/CANN compilation, numerical parity, full graph and performance acceptance
 > remain unverified; CPU contracts do not certify hardware execution.
@@ -13,8 +13,8 @@ English | [中文](README.zh-CN.md)
 
 [Three-person development plan (Chinese)](DEVELOPMENT_PLAN.zh-CN.md)
 
-The files in this directory define the shared cache, policy, resource and program
-contracts. Ascend-specific code lives in [npu/](npu/README.zh-CN.md): backend,
+The parent `moe/` directory defines the shared cache, policy, resource and program
+contracts. Ascend-specific code lives in [npu/](../npu/doc/README.zh-CN.md): backend,
 runtime, transport, native V4 storage, ACL C++ sources and launch examples.
 Importing the NPU package does not initialize a device or load native libraries.
 
@@ -94,7 +94,7 @@ The component responsibilities are:
 
 The interface table below describes the portable contracts. Ascend implementations
 are `NpuMoEBackend`, `NpuV4FP4Format`, `NpuBoundMoERuntime`, `TensorResidencyOps`,
-`MemFabricDeviceTransferOps` and the adapters in `npu/experts.py`. Other backends
+`MemFabricDeviceTransferOps` and the adapters in `../npu/experts.py`. Other backends
 must implement these same obligations.
 
 | API | Current implementation / backend obligation |

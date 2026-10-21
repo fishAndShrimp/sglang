@@ -11,10 +11,10 @@
 v0.4 已实现公共接口和组合程序，设备后端仍需注入。代码包括：
 
 - `transfer.py`：HostCopyRegion / HostCopyPlan / HostTransferOps / ComposedTransferBackend。
-- `execution.py`：ExecutionRequest / ExecutionReservation / UpdatePlan / WeightLease / LocalExecution，以及 ExpertWeightAccess、CacheUpdateCoordinator。
-- `interfaces.py`：ExecutionContext、ResidencyOps 的 publish_execution / finish_execution、WholeMoEProgram.layer_start、MoEDispatcher.dispatch_completion；BoundMoERuntime 的层首与尾部默认委托。
-- `prefill.py`：PrefillWeightPipeline 的 start / validate_session / seal / acquire / finish / abort 契约。acquire 负责当前组绑定及下一组预取，具体 worker 尚未实现。
-- `programs.py`：PrefillDispatchOnceProgram、PrefillLocalExpertProgram、DecodeLocalExpertProgram，复用 DispatchOnceProgram 公共循环。
+- `../execution.py`：ExecutionRequest / ExecutionReservation / UpdatePlan / WeightLease / LocalExecution，以及 ExpertWeightAccess、CacheUpdateCoordinator。
+- `../interfaces.py`：ExecutionContext、ResidencyOps 的 publish_execution / finish_execution、WholeMoEProgram.layer_start、MoEDispatcher.dispatch_completion；BoundMoERuntime 的层首与尾部默认委托。
+- `../prefill.py`：PrefillWeightPipeline 的 start / validate_session / seal / acquire / finish / abort 契约。acquire 负责当前组绑定及下一组预取，具体 worker 尚未实现。
+- `../programs.py`：PrefillDispatchOnceProgram、PrefillLocalExpertProgram、DecodeLocalExpertProgram，复用 DispatchOnceProgram 公共循环。
 
 `publish_execution` 和 `commit_update` 的实际接口均返回 TransferTicket，覆盖元数据发布完成；调用方不能拿复制完成代替映射发布完成。`LocalExecution.read_done` 同样是 TransferTicket。ExecutionContext.retain 在提交前保活资源，并将票据依赖纳入 resources_idle；record_compute_completion 在 decode 的复制前建立计算流 frontier，禁止下一 wave 复制与上一 wave FFN 重叠。
 
@@ -217,7 +217,7 @@ prefill_program.run
   -> Combine
 ```
 
-`layer_start` 为 WholeMoEProgram 提供默认空实现，prefill 派生 program 覆盖；pipeline 的具体方法见 `prefill.py`。外部不传 K、不操作 copy stream、不等待首批 H2D，也不增加一个模型级“Dispatch 已结束”回调。Dispatch 已在 program 内执行，由 program 与 dispatcher adapter 完成反馈连接；设备是否可读权重仍由 ready 事件决定。
+`layer_start` 为 WholeMoEProgram 提供默认空实现，prefill 派生 program 覆盖；pipeline 的具体方法见 `../prefill.py`。外部不传 K、不操作 copy stream、不等待首批 H2D，也不增加一个模型级“Dispatch 已结束”回调。Dispatch 已在 program 内执行，由 program 与 dispatcher adapter 完成反馈连接；设备是否可读权重仍由 ready 事件决定。
 
 ### Residency 与搬运适配方
 

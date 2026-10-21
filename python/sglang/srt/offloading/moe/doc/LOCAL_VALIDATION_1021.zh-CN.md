@@ -26,9 +26,9 @@ Python >=3.11 / torch_npu 运行环境验收。
 尝试 Python 3.13 的 `python -m sglang.launch_server --help`，在顶层导入时因
 `ModuleNotFoundError: No module named 'torch'` 停止；未把该项记为 CLI 启动通过。
 
-启动示例与目标机验收步骤见 [NPU runtime](npu/README.zh-CN.md)、
-[ACL build/smoke](npu/native/README.zh-CN.md)、[V4 storage](npu/V4_STORAGE.md) 和
-[EP/FFN](npu/EXPERTS_IMPLEMENTATION.zh-CN.md)。剩余的是目标机原生编译/链接、
+启动示例与目标机验收步骤见 [NPU runtime](../npu/doc/README.zh-CN.md)、
+[ACL build/smoke](../npu/native/doc/README.zh-CN.md)、[V4 storage](../npu/doc/V4_STORAGE.md) 和
+[EP/FFN](../npu/doc/EXPERTS_IMPLEMENTATION.zh-CN.md)。剩余的是目标机原生编译/链接、
 同份 host 双路径搬运、FP4 数值、真实 EP、完整 graph、多 bucket 模式切换、内存峰值及性能验收；
 不把 CPU 模拟结果记为硬件通过。
 
