@@ -10,6 +10,23 @@
 
 本文以 `moe-offload-proto-v1` 分支的框架提交 `65e5c53ebb` 及后续 DispatchOnce 扩展为实现基线，更新于 **2026-10-20**。下文保留之前讨论的三张 UML 的主题，并按实际代码名称更新、标注实现状态；另补一张 prefill/decode 切换状态图。
 
+## 2026 年 10 月 21 日 H2D 抽象落地
+
+[H2D 设计与调用契约](moe-h2d-design.zh-CN.md) 对应的公共抽象和组合逻辑已落地：
+
+| 入口 | 当前实现 |
+| --- | --- |
+| [transfer.py](../transfer.py) | `HostCopyRegion` / `HostCopyPlan`、`HostTransferOps`、`ComposedTransferBackend`，与已有 `DeviceTransferOps` 组合；不绑定默认硬件后端 |
+| [execution.py](execution.py) | `ExecutionRequest`、`ExecutionReservation`、`UpdatePlan`、`WeightLease`、`ExpertWeightAccess`、`CacheUpdateCoordinator` |
+| [interfaces.py](interfaces.py) | `ExecutionContext` 的保活/完成契约；临时驻留发布与 reader 结束；Dispatch completion；runtime 层首/尾部默认委托 |
+| [prefill.py](prefill.py) | `PrefillWeightPipeline` 抽象：start / validate_session / seal / acquire / finish / abort；具体 worker 和 ACL 调度待实现 |
+| [programs.py](programs.py) | `PrefillDispatchOnceProgram`、`PrefillLocalExpertProgram`、`DecodeLocalExpertProgram`；复用公共 D/F/C，不复制整套 forward |
+| [test_h2d_contracts.py](../../../../../test/registered/unit/offloading/test_h2d_contracts.py) | CPU 契约测试：模式隔离、每趟 K、异步依赖、失败保活、LFU 尾部更新及无预取 decode |
+
+实际接入时，runtime 绑定 `ComposedTransferBackend(host_ops=..., device_ops=...)` 和 `ExpertWeightAccess`，并设置 `cache_updates = CacheUpdateCoordinator(...)`。prefill 另行注入具体 pipeline；local program 的 `run_experts` 返回 `LocalExecution(output, read_done)`。所有对象与物理分配仍由 bound runtime / owner 管理。
+
+**ACL batch 扩展、MemFabric device lowering、设备 ResidencyOps、prefetch worker、真实模型 hooks 与完整 A5 graph 验收仍待实现。** 当前代码不会用 Torch copy 或 CPU 决策偷偷替代这些后端。Decode 当前 wave 的复制还需等待计算流 frontier，保证相邻 wave 即使用不同 bank 也不提前搬运。
+
 ## 1. 已确认的设计边界
 
 | 维度 | 首版约定 |

@@ -10,7 +10,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from ..transfer import TransferTicket
+from ..transfer import Completion, TransferTicket
+from .config import Phase
 from .state import ResidencyState
 
 
@@ -40,6 +41,33 @@ class ForwardCompletion:
     residency_ready: TransferTicket
     resources_idle: TransferTicket
     # idle joins copy/compute/communication/prefetch.
+
+
+class ExecutionContext(ABC):
+    """Runtime-owned invocation/capture context; phase/capturing are host constants.
+
+    emit_* submits eager operations or emits captured nodes. Python is not rerun
+    on replay. Prefill may start host work only when capturing is false.
+    """
+
+    phase: Phase
+    capturing: bool
+    compute_stream: object
+    copy_stream: object
+
+    @abstractmethod
+    def retain(self, resource):
+        """Pin before submission, through failure drain and graph leases.
+
+        TransferTicket dependencies also join resources_idle. A partial submission
+        without a ticket is drained by the runtime's stream/worker failure path.
+        Capture-time tickets are not host proof of a subsequent replay finishing.
+        Eager implementations must support calls from the prefill submitter thread.
+        """
+
+    @abstractmethod
+    def record_compute_completion(self) -> TransferTicket:
+        """Record the current compute frontier, without host synchronization."""
 
 
 class ExpertFormat(ABC):
@@ -82,18 +110,41 @@ class ResidencyOps(ABC):
 
     @abstractmethod
     def resolve_execution(self, local_demand, context):
-        """Produce a bounded bank load plan; misses do not imply hot admission."""
+        """Return ExecutionReservation; misses do not imply hot admission.
+
+        Accept ExecutionRequest; include plan-ready, old target readers and source
+        readiness in copy_dependencies. Keep source readers pinned through copy.
+        """
+
+    @abstractmethod
+    def publish_execution(self, reservation, weights_ready, context) -> TransferTicket:
+        """Wait for the whole bundle, publish temporary bindings, return readiness.
+
+        Do not change the hot set. The returned ticket covers metadata publication
+        as well as all streams used to establish execution validity.
+        """
+
+    @abstractmethod
+    def finish_execution(self, reservation, read_done, context):
+        """Retire temporary/source leases after the final reader; never on return."""
 
     @abstractmethod
     def prepare_update(self, target_keys, context):
-        """Retain surviving slots; wait for readers before reserving victims."""
+        """Return UpdatePlan, retaining survivors and reserving protected victims.
+
+        Include plan-ready and all old reader dependencies. Honor the runtime's
+        device update_enabled guard during capture/warmup without reading it on CPU.
+        """
 
     @abstractmethod
-    def commit_update(self, update_plan, weights_ready, context):
-        """Publish key/slot/generation only after the complete bundle is ready."""
+    def commit_update(self, update_plan, weights_ready, context) -> TransferTicket:
+        """Wait, publish hot key/slot/generation, return publication completion."""
 
 
 class WholeMoEProgram(ABC):
+    def layer_start(self, layer_id, context):
+        """Optional eager prefill hook. Decode does not prefetch weights."""
+
     @abstractmethod
     def run(self, layer, hidden_states, routing, context):
         """Full routed-expert execution; shared experts stay outside this program."""
@@ -116,6 +167,16 @@ class MoEDispatcher(ABC):
     @abstractmethod
     def dispatch(self, hidden_states, routing, context):
         pass
+
+    def dispatch_completion(self, dispatched, context) -> Completion:
+        """Cover actual receive readiness, including communication streams.
+
+        Required by prefill feedback. Python dispatch returning is not completion.
+        Static schedules retain compatibility without implementing this method.
+        """
+        raise NotImplementedError(
+            "Dispatch completion is required for prefill feedback"
+        )
 
     @abstractmethod
     def combine(self, local_output, context):
@@ -199,6 +260,7 @@ class BoundMoERuntime(ABC):
     residency: ResidencyState
     prefill_program: WholeMoEProgram
     decode_program: WholeMoEProgram
+    cache_updates = None  # Optional bound CacheUpdateCoordinator.
 
     @abstractmethod
     def install_model_hooks(self, offloader, model_runner):
@@ -223,21 +285,37 @@ class BoundMoERuntime(ABC):
     def emit_step_begin(self, context):
         """Clear step accesses and establish fixed per-forward device state."""
 
-    @abstractmethod
     def emit_layer_start(self, layer_id, context):
-        """Prefill starts all-local-expert prefetch before the router."""
+        """Start eager prefill at layer entry; decode emits no weight prefetch.
+
+        Bind resident layers to a no-op program or skip this hook for those layers.
+        """
+        if context.phase is Phase.PREFILL:
+            if context.capturing:
+                raise RuntimeError("Prefill layer-start cannot run during capture")
+            self.prefill_program.layer_start(layer_id, context)
+        elif context.phase is not Phase.DECODE:
+            raise ValueError("Unsupported execution phase")
 
     @abstractmethod
     def emit_after_router(self, layer_id, routing, context):
         """Emit routing bookkeeping; complete local demand is known after D."""
 
-    @abstractmethod
     def emit_step_end(self, context):
         """Decode: policy update/select, materialize new hot set, then commit.
 
         Prefill: no hotness updates. Whole-model step counts must ignore padding.
         All background work must join the resources_idle completion.
         """
+        if context.phase is Phase.PREFILL:
+            if context.capturing:
+                raise RuntimeError("Prefill step-end cannot run during capture")
+            return None
+        if context.phase is not Phase.DECODE:
+            raise ValueError("Unsupported execution phase")
+        if self.cache_updates is None:
+            raise NotImplementedError("Bind cache_updates or implement emit_step_end")
+        return self.cache_updates.emit_step_end(context)
 
     @abstractmethod
     def snapshot_decode_state(self):
