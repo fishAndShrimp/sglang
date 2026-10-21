@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import Enum
 from functools import wraps
@@ -9,6 +10,8 @@ from threading import RLock
 
 from .config import Phase
 from .resources import AllocationLedger, ResourceKind, SlotLeaseManager
+
+logger = logging.getLogger(__name__)
 
 
 def _serialized(method):
@@ -153,6 +156,13 @@ class MoEOffloadOwner:
             raise ValueError("Unsupported offload phase")
         if phase is self.phase:
             return
+        logger.info(
+            "MoE offload phase.begin: rank=%s from=%s to=%s sequence=%s",
+            self.config.ep_rank,
+            self.phase.value,
+            phase.value,
+            self._sequence,
+        )
         self.wait_idle()
         try:
             if phase is Phase.PREFILL:
@@ -168,6 +178,11 @@ class MoEOffloadOwner:
                 self._snapshot_saved = False
             self.phase = phase
             self._transition_ticket = None
+            logger.info(
+                "MoE offload phase.ready: rank=%s phase=%s",
+                self.config.ep_rank,
+                phase.value,
+            )
         except BaseException:
             # A backend may already have enqueued work. Retain all resources until
             # explicit close() drains every stream, including unreported work.

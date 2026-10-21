@@ -67,6 +67,9 @@ assignment 命中率为 `hits / accesses`，无访问时应报告 N/A。重复�
 的百分比得到全局命中率。调用方需要在本次设备完成后读取或异步快照；下一批会复用这些标量。
 此接入提供设备计数，不在图内打印 Tensor 或为日志逐批增加全设备同步。
 
+原生后端默认异步输出每 batch 路由命中率，使用已有完成事件和有界 pinned host 快照池；
+配置、日志含义及缓冲饱和行为见 [维测日志](OBSERVABILITY.zh-CN.md)。
+
 `CacheRouteStats.allocations()` 纳入 metadata 账本。策略快照通过原有 `DecodeStateSnapshot`
 持有全部周期字段；原生后端没有额外建立一份 CacheMetadataAdapter 快照或另一组权重池。
 上游通用 residency 的 int64 count 不直接传给原生 MemFabric；原生计划保留 int32 count ABI。

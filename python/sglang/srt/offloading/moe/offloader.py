@@ -1,10 +1,14 @@
 """BaseOffloader facade. Backend injection is deliberate until M0 is validated."""
 
+import logging
+
 from ..base import BaseOffloader
 from .config import ExpertCatalog, ExpertLayerSpec
 from .owner import MoEOffloadOwner
 from .periodic_lfu import PeriodicLFUPolicy
 from .policy import TensorLFUPolicy
+
+logger = logging.getLogger(__name__)
 
 
 class DeepSeekV4Adapter:
@@ -78,6 +82,15 @@ class MoEOffloaderV2(BaseOffloader):
                 if any(existing.layer_id == spec.layer_id for existing in specs):
                     raise ValueError("Duplicate expert layer")
                 specs.append(spec)
+                logger.debug(
+                    "MoE offload layer.register: rank=%s layer=%s resident=%s "
+                    "local_experts=%s global_start=%s",
+                    spec.ep_rank,
+                    spec.layer_id,
+                    spec.resident,
+                    spec.local_experts,
+                    spec.global_start,
+                )
                 if not spec.resident:
                     self.backend.prepare_layer(module, spec)
                     offloaded.append((module, spec))
@@ -110,6 +123,18 @@ class MoEOffloaderV2(BaseOffloader):
             )
             self._runtime = runtime
             self.owner = MoEOffloadOwner(self.config, self._catalog, runtime)
+            logger.info(
+                "MoE offload ready: rank=%s offloaded_layers=%s experts=%s policy=%s "
+                "memory_bytes=%s",
+                self.config.ep_rank,
+                len(self._layers),
+                self._catalog.num_experts,
+                type(self.policy).__name__,
+                {
+                    kind.value: used
+                    for kind, used in self.owner.allocation_ledger.usage.items()
+                },
+            )
         except BaseException:
             self._failed = True
             if runtime is not None:
@@ -133,6 +158,7 @@ class MoEOffloaderV2(BaseOffloader):
                 )
             self.owner.runtime.install_model_hooks(self, model_runner)
             self._installed = True
+            logger.info("MoE offload model hooks bound: rank=%s", self.config.ep_rank)
         except BaseException:
             self._failed = True
             raise

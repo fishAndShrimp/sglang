@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, fields
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ from ...transfer import (
 )
 from ..cache_metadata import CacheRouteStats
 from ..config import ExpertLayerSpec, Phase, fixed_waves
+from ..diagnostics import BatchDiagnostics
 from ..execution import (
     CacheUpdateCoordinator,
     ExecutionRequest,
@@ -34,6 +36,8 @@ from .transfer import (
     MemFabricDeviceTransferOps,
     MemFabricTransferBindings,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _tensor_allocations(prefix, tensors, kind=ResourceKind.METADATA):
@@ -448,12 +452,46 @@ class NpuMoEBackend(MoEBackend):
         )
         resources.extend(_tensor_allocations("npu.", tensors))
         resources.extend(program_resources)
+        diagnostics = None
+        if self.device.type == "npu" and getattr(
+            self.settings, "batch_log_interval", 1
+        ):
+            try:
+                diagnostics = BatchDiagnostics(
+                    cache_stats,
+                    error,
+                    rank=config.ep_rank,
+                    device=self.device,
+                    interval=self.settings.batch_log_interval,
+                    capacity=self.settings.batch_log_capacity,
+                    device_scope=lambda: torch.npu.device(self.device),
+                )
+                resources.extend(diagnostics.allocations())
+            except Exception:
+                logger.warning("MoE offload batch logging unavailable", exc_info=True)
+        logger.info(
+            "MoE offload runtime bound: rank=%s device=%s layers=%s experts=%s "
+            "hot_slots=%s execution_slots=%s expert_bytes=%s "
+            "prefill_A=%s prefill_B=%s group=%s batch_log_interval=%s",
+            config.ep_rank,
+            self.device,
+            len(layers),
+            catalog.num_experts,
+            k,
+            config.execution_slots,
+            self.format.expert_nbytes,
+            a.capacity,
+            b.capacity,
+            group,
+            getattr(self.settings, "batch_log_interval", 1) if diagnostics else 0,
+        )
         self.runtime = NpuBoundMoERuntime(
             device_runtime=self.device_runtime,
             residency=state,
             residency_ops=ops,
             cache_updates=updates,
             cache_stats=cache_stats,
+            diagnostics=diagnostics,
             snapshot=snapshot,
             reload_weights=reload_weights,
             layer_programs=programs,

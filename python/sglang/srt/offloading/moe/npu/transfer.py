@@ -14,6 +14,7 @@ No adapter alone certifies torch_npu operator coverage or full decode graphs.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from ...transfer import (
@@ -34,6 +35,9 @@ _INT64_MAX = 2**63 - 1
 # The referenced kernel reserves 176 KiB for data, plus aligned metadata arrays.
 # 256 entries fit within both 192 KiB and 256 KiB UB configurations.
 _MAX_GROUP_ENTRIES = 256
+
+
+logger = logging.getLogger(__name__)
 
 
 def _range(address, nbytes):
@@ -258,6 +262,14 @@ class AclBatchHostTransferOps(HostTransferOps):
         if not isinstance(plan, HostCopyPlan):
             raise TypeError("ACL transfers require a HostCopyPlan")
         batches = self._lower(plan)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "MoE offload acl.submit: batches=%s regions=%s bytes=%s stream=%s",
+                len(batches),
+                len(plan.regions),
+                sum(region.nbytes for region in plan.regions),
+                getattr(stream, "stream_id", None),
+            )
         resources = (plan, bindings, batches, self)
         # This happens before the first native call, including a call that throws
         # after submitting a partial batch and never returns a completion ticket.
@@ -559,6 +571,14 @@ class MemFabricDeviceTransferOps(DeviceTransferOps):
                 "MemFabric copy stream must belong to the bound NPU device"
             )
         bindings.validate_plan(plan)
+        logger.debug(
+            "MoE offload memfabric.emit: binding=%s capacity=%s "
+            "components=%s stream=%s",
+            bindings.name,
+            plan.capacity,
+            len(bindings.components),
+            getattr(stream, "stream_id", None),
+        )
         resources = (plan, bindings, self)
         self.retain(resources)
         with self.stream_context(stream):

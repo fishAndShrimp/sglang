@@ -1,8 +1,11 @@
 """Opt-in graph backend ownership; serving completion stays in forward_scope."""
 
+import logging
 from contextlib import contextmanager
 
 from .config import Phase
+
+logger = logging.getLogger(__name__)
 
 
 class GraphLeaseBackend:
@@ -19,6 +22,7 @@ class GraphLeaseBackend:
     def __init__(self, backend, owner, graph_runner):
         self.backend = backend
         self.owner = owner
+        self._rank = getattr(getattr(owner, "config", None), "ep_rank", None)
         self.graph_runner = graph_runner
         self._identity = object()
         self._leases = {}
@@ -83,16 +87,30 @@ class GraphLeaseBackend:
             raise ValueError(
                 "Destroy an existing MoE graph before replacing its bucket"
             )
+        logger.info(
+            "MoE offload graph.capture.begin: rank=%s bucket=%s", self._rank, shape_key
+        )
         lease = self.owner.acquire_graph((self._identity, shape_key))
         self._leases[shape_key] = lease
         try:
-            return self.backend.capture_one(
+            result = self.backend.capture_one(
                 shape_key,
                 forward_fn,
                 capture_inputs=capture_inputs,
                 post_warmup_hook=post_warmup_hook,
             )
+            logger.info(
+                "MoE offload graph.capture.ready: rank=%s bucket=%s",
+                self._rank,
+                shape_key,
+            )
+            return result
         except BaseException:
+            logger.exception(
+                "MoE offload graph.capture.failed: rank=%s bucket=%s",
+                self._rank,
+                shape_key,
+            )
             self._failed = True
             # capture_session unwinds backend/runtime scope before cleanup; do
             # not destroy a graph while still inside the capture context.

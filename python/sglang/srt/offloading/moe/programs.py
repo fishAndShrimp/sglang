@@ -1,9 +1,13 @@
 """DFC schedules independent of weight transport and accelerator layouts."""
 
+import logging
+
 from ..transfer import Completion, TransferTicket
 from .config import Phase
 from .execution import LocalExecution, require_prefill
 from .interfaces import LocalExpertProgram, WholeMoEProgram
+
+logger = logging.getLogger(__name__)
 
 
 class ComposedDFCProgram(WholeMoEProgram):
@@ -73,13 +77,37 @@ class DispatchOnceProgram(WholeMoEProgram):
 
     def run(self, layer, hidden_states, routing, context):
         # Preserve original global IDs/weights and keep this D handle through C.
+        logger.debug(
+            "MoE offload dispatch.submit: phase=%s capture=%s layer=%s shape=%s",
+            context.phase.value,
+            context.capturing,
+            layer,
+            getattr(hidden_states, "shape", None),
+        )
         dispatched = self.dispatcher.dispatch(hidden_states, routing, context)
         layout = self.layout_adapter.bind(dispatched, context)
         # Unrolled at capture, including empty waves. Dynamic rows stay on device.
         for wave in self._wave_schedule(layer, dispatched, layout, context):
+            logger.debug(
+                "MoE offload wave.emit: phase=%s capture=%s layer=%s wave=%s "
+                "experts=[%s,%s) bank=%s",
+                context.phase.value,
+                context.capturing,
+                layer,
+                wave.index,
+                wave.local_start,
+                wave.local_end,
+                wave.bank,
+            )
             wave_input = self.layout_adapter.select_wave(layout, wave, context)
             local = self.local_program.run(layer, wave_input, wave, context)
             self.layout_adapter.write_wave(layout, wave, local, context)
+        logger.debug(
+            "MoE offload combine.submit: phase=%s capture=%s layer=%s",
+            context.phase.value,
+            context.capturing,
+            layer,
+        )
         combined = self.dispatcher.combine(
             self.layout_adapter.combine_input(layout, context), context
         )
@@ -137,6 +165,12 @@ class PrefillDispatchOnceProgram(DispatchOnceProgram):
 
 def _run_local(run_experts, access, layer, dispatch_output, lease, context):
     bindings = access.wait_ready(lease, context.compute_stream)
+    logger.debug(
+        "MoE offload ffn.submit: phase=%s capture=%s layer=%s",
+        context.phase.value,
+        context.capturing,
+        layer,
+    )
     result = run_experts(layer, dispatch_output, bindings, context)
     if not isinstance(result, LocalExecution):
         raise TypeError("Expert runner must return LocalExecution")

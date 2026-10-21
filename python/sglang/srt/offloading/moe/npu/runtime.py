@@ -7,6 +7,7 @@ The native extension, registered master and EP/FFN adapters are assembled by
 
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from functools import wraps
 
@@ -15,6 +16,8 @@ from ..config import Phase
 from ..interfaces import BoundMoERuntime, RuntimeCapabilities
 from ..resources import Allocation, AllocationLedger, ResourceKind
 from ..runtime import ManagedExecutionContext
+
+logger = logging.getLogger(__name__)
 
 
 class NpuDeviceRuntime:
@@ -96,6 +99,7 @@ class NpuBoundMoERuntime(BoundMoERuntime):
         expert_nbytes,
         storage,
         cache_stats=None,
+        diagnostics=None,
         pipelines=(),
         release=None,
     ):
@@ -104,6 +108,7 @@ class NpuBoundMoERuntime(BoundMoERuntime):
         self.ops = residency_ops
         self.cache_updates = cache_updates
         self.cache_stats = cache_stats
+        self.diagnostics = diagnostics
         self.snapshot = snapshot
         self.reload_weights = reload_weights
         self.layer_programs = dict(layer_programs)
@@ -168,6 +173,11 @@ class NpuBoundMoERuntime(BoundMoERuntime):
             )
         self._transition_contexts.clear()
         self._cache_initialized = True
+        logger.info(
+            "MoE offload initial cache ready: slots=%s layers=%s",
+            len(keys),
+            len(self.layer_programs),
+        )
 
     def _new_context(self, phase, *, stream=None, capturing=False):
         context = ManagedExecutionContext(
@@ -335,6 +345,13 @@ class NpuBoundMoERuntime(BoundMoERuntime):
         token = owner.begin_forward(phase, stream)
         context = self._new_context(phase, stream=stream)
         self._context, self._step_started = context, False
+        logger.debug(
+            "MoE offload forward.begin: seq=%s phase=%s bs=%s tokens=%s",
+            token.sequence,
+            phase.value,
+            getattr(forward_batch, "batch_size", 0),
+            getattr(getattr(forward_batch, "input_ids", None), "numel", lambda: 0)(),
+        )
         try:
             if phase is Phase.DECODE:
                 # Shared host metadata decides whether the whole batch is idle;
@@ -351,9 +368,45 @@ class NpuBoundMoERuntime(BoundMoERuntime):
             # Replay does not run Python hooks. Its tail was emitted in capture;
             # record fresh events only, without updating the policy twice.
             tail = self.emit_step_end(context) if self._step_started else None
+            record = None
+            if self.diagnostics is not None:
+                try:
+                    runner = getattr(
+                        getattr(self, "_runner", None), "decode_cuda_graph_runner", None
+                    )
+                    record = self.diagnostics.snapshot(
+                        phase,
+                        token.sequence,
+                        forward_batch,
+                        bucket=getattr(runner, "bs", None)
+                        if phase is Phase.DECODE
+                        else None,
+                    )
+                    context.retain(record)
+                except Exception:
+                    logger.warning(
+                        "MoE offload batch snapshot unavailable", exc_info=True
+                    )
             completion = context.finish(residency_ready=tail)
             owner.finish_forward(token, completion)
+            if self.diagnostics is not None:
+                try:
+                    self.diagnostics.publish(record, completion.output_ready.completion)
+                except Exception:
+                    logger.warning(
+                        "MoE offload batch log publication failed", exc_info=True
+                    )
+            logger.debug(
+                "MoE offload forward.submitted: seq=%s phase=%s",
+                token.sequence,
+                phase.value,
+            )
         except BaseException:
+            logger.exception(
+                "MoE offload forward.failed: seq=%s phase=%s",
+                token.sequence,
+                phase.value,
+            )
             self._failed_contexts.append(context)
             owner.fail_forward(token)
             # Stop workers before removing their active retention context. Any
@@ -517,6 +570,13 @@ class NpuBoundMoERuntime(BoundMoERuntime):
         if self._closed:
             return
         self.synchronize()
+        if self.diagnostics is not None:
+            try:
+                self.diagnostics.close()
+            except Exception:
+                logger.warning(
+                    "MoE offload batch logger teardown failed", exc_info=True
+                )
         self._remove_hooks()
         if self._release is not None:
             self._release()
@@ -525,6 +585,6 @@ class NpuBoundMoERuntime(BoundMoERuntime):
         self.layer_programs.clear()
         self.resources = self.storage = self.pipelines = ()
         self.snapshot = self.cache_updates = self.ops = self.residency = None
-        self.cache_stats = None
+        self.cache_stats = self.diagnostics = None
         self.reload_weights = self._release = None
         self._closed = True

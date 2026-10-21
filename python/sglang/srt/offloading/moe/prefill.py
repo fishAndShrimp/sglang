@@ -4,6 +4,7 @@ The worker and bank schedule are device-neutral; accelerator operations and
 physical bindings remain injected and require separate hardware validation.
 """
 
+import logging
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -12,6 +13,8 @@ from threading import Condition, RLock, Thread
 from ..transfer import Completion, ImmediateCompletion, JoinedCompletion, TransferTicket
 from .config import ExpertWave, Phase
 from .execution import ExecutionRequest, SourcePolicy, require_prefill
+
+logger = logging.getLogger(__name__)
 
 
 class PrefillWeightPipeline(ABC):
@@ -352,6 +355,15 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
         if not session.initial_leases or not session.loaded:
             raise RuntimeError("Prefill must submit at least one complete microbatch")
         config = self.config
+        logger.debug(
+            "MoE offload prefill.sealed: layer=%s initial_submitted=%s "
+            "microbatch=%s max_inflight=%s group=%s",
+            session.layer_id,
+            session.loaded,
+            config.microbatch_size,
+            config.max_inflight,
+            config.group_size,
+        )
         waves = [ExpertWave(0, 0, session.loaded, config.initial_bank)]
         for index, start in enumerate(
             range(session.loaded, config.local_experts, config.group_size), 1

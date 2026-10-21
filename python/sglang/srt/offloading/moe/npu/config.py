@@ -51,6 +51,8 @@ class NpuOffloadSettings:
     replacement_min_gain: float = 1.5
     max_swaps: int = 96
     usage_decay: float = 0.7
+    batch_log_interval: int = 1
+    batch_log_capacity: int = 64
     version: int = 1
 
     def __post_init__(self):
@@ -65,10 +67,13 @@ class NpuOffloadSettings:
             "prefill_group_size",
             "prefill_microbatch_size",
             "prefill_max_inflight",
+            "batch_log_capacity",
         ):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{name} must be an explicitly positive integer")
+        if type(self.batch_log_interval) is not int or self.batch_log_interval < 0:
+            raise ValueError("batch_log_interval must be a nonnegative integer")
         if type(self.cache_ratio) not in (float, int):
             raise ValueError("cache_ratio must be a finite number")
         if not 0 <= self.cache_ratio <= 1:
