@@ -1,8 +1,8 @@
 """Tensor LFU backend. No routing or popularity decisions are read by Python.
 
-The implementation runs on CPU for contract tests and on a torch device through
-the same operations. Its capture/operator support must be validated by the bound
-CUDA/NPU runtime. Supplying this policy alone does not assert graph support.
+The implementation uses the configured torch device. Its capture/operator support
+must be validated by the bound CUDA/NPU runtime. Supplying this policy alone does
+not assert graph support.
 """
 
 from dataclasses import dataclass

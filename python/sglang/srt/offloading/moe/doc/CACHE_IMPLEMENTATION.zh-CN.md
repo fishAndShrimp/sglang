@@ -40,25 +40,10 @@ MoE offload，也没有声明 A5 完整 graph、原生 FP4 或多卡 EP 已通�
 设备错误状态。reload 回调只恢复物理权重，不提前发布 live 映射。失败后由
 owner 的失败路径排空并关闭，不能清除错误后继续使用不完整权重。
 
-## 本地验证
+## 验收方式
 
-在仓库根目录运行（仅要求可用的 PyTorch 和 Python）：
-
-```bash
-PYTHONDONTWRITEBYTECODE=1 python test/registered/unit/offloading/run_cpu_contracts.py
-```
-
-这个入口只建立 `sglang` 包命名空间以跳过 serving 顶层可选依赖；测试加载
-真实 offloading 模块，没有替换实现。在完整开发环境中也可直接执行：
-
-```bash
-PYTHONPATH=python python -m unittest discover -s test/registered/unit/offloading -v
-```
-
-新增测试覆盖随机热集事务的 CPU 参考差分、原 slot 保持、零缓存、空需求、
-尾波、非法映射、copy 错误、跨 bank 保护、状态精确恢复、异步资源生命周期
-以及 graph 销毁顺序。固定 Tensor 地址检查与禁止 host 标量转换检查不等于
-实际 accelerator capture 成功。
+CPU 单测与 runner 已移除。缓存规划、原 slot 恢复、零缓存、空需求、尾波、非法
+映射及失败保活，应在目标 NPU 上结合真实搬运、EP/FFN 和 graph replay 验收。
 
 ## 仍需硬件适配和验收
 

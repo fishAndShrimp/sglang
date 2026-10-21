@@ -90,19 +90,14 @@ retain storage and the exact physical expert offset; unsupported slicing fails
 closed. Views report no new allocation, and a zero-capacity hot bank reports no
 storage. No pointer or bank tensor is rebound during execution.
 
-## Validation and remaining hardware checks
+## Target hardware checks
 
-CPU tests execute the actual storage/loader/bank code with fake native APIs and
-owned ctypes memory. They validate byte aliases, DVA offset mapping, physical
-padding, bounded conversion calls, load completeness, EP filtering, concurrent
-duplicates, partial initialization cleanup, partial-copy poison, close ordering,
-zero banks and workspace rejection. AST-based tests execute the real loader and
-quantization hook functions while excluding unrelated accelerator imports.
-These tests do not emulate NZ or establish native numerical correctness.
+CPU test implementations, fake native APIs and the injectable format adapter
+have been removed. The runtime uses the deployed torch_npu adapter and the
+installed MemFabric host allocator.
 
 On the target Ascend/CANN/torch_npu/MemFabric combination, qualify registration
 of the MemFabric allocation, compare a resident expert with host-serialized and
-reloaded fixed-bank weights/scales including padding, run the same GMM inputs
-through both paths, measure loader peak bytes, and exercise registration/copy
-failure plus teardown. Full graph and stream overlap acceptance belongs to the
-runtime tests. This change alone does not establish any hardware result.
+reloaded fixed-bank weights/scales including padding, and run the same GMM inputs
+through both paths. Measure loader peak bytes and exercise registration/copy
+failure plus teardown. Validate full graph replay and stream ordering separately.

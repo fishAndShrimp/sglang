@@ -44,15 +44,9 @@ routed scaling 仍由外层 DeepSeek MLP 执行；返回值包含原 `FusedMoE.f
 - Layout 的 AscendTP count 解析可独立测试，但生产 builder 暂不启用 AscendTP：其
   `-1` 路由与 finalize 端到端行为尚未在目标运行时验证。
 
-## 本地验证与剩余硬件验证
+## 目标机验收
 
-CPU 测试覆盖动态 counts、空 receive / wave、尾 wave、40 轮随机参考差分、量化位模式、
-固定地址复用、输入 routing 不变、padding / 错误门控、无设备值主机读取、所有 readers
-事件 join、native handle 保活与异常保活。另从实际 `ascend.py` 加载
-`AscendRunnerCore`，仅替换不可用的 NPU 算子和服务注册依赖，检查原生两次 GMM 与
-V4 clamp activation 接收正确 bank、counts、scale 和 config。
-
-这些测试没有执行真实 NPU 算子或 EP 通信。目标机仍需验证：全零 counts 的 grouped
-matmul 不读取无效 lane；byte gather / where / prefix-sum 的 torch_npu graph 支持；
-不同 batch padding 下的 native `-1` D/C；MXFP8 scale / NZ weight views；多 rank 单层
-参考一致性；整模型 graph replay、prefill/decode 切换及异常后的 stream drain。
+CPU 数值模拟、随机参考差分及 native operator 替代代码已移除。在目标机验证
+全零 counts 的 grouped matmul 不读取无效 lane；byte gather / where / prefix-sum
+的 torch_npu graph 支持；不同 padding 下 native `-1` D/C；MXFP8 scale / NZ
+weight views；多 rank 单层参考一致性；整模型 graph replay、模式切换和故障 drain。

@@ -10,7 +10,7 @@ still belong to the runtime's graph workspace budget.
 from __future__ import annotations
 
 import os
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack
 from dataclasses import dataclass, fields, replace
 
 import torch
@@ -29,9 +29,8 @@ from ..resources import Allocation, ResourceKind
 
 
 def _compute_scope(context, device):
-    if torch.device(device).type == "cpu":
-        # Numerical contract tests; the production builder imports native NPU.
-        return nullcontext()
+    if torch.device(device).type != "npu":
+        raise ValueError("Native expert execution requires an NPU device")
     scope = ExitStack()
     scope.enter_context(torch.npu.device(device))
     scope.enter_context(torch.npu.stream(context.compute_stream))

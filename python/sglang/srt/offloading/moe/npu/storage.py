@@ -61,8 +61,6 @@ class MemFabricHostPool:
         *,
         physical_bytes,
         native_acl=None,
-        offload=None,
-        platform_info=None,
     ):
         import torch
 
@@ -80,9 +78,7 @@ class MemFabricHostPool:
         self.nbytes = _align(total_bytes, self.page_size)
         if self.nbytes > physical_bytes:
             raise ValueError("Registered slab exceeds the physical host budget")
-        _check_host_registration_platform(
-            *(platform_info or (platform.system(), platform.release()))
-        )
+        _check_host_registration_platform(platform.system(), platform.release())
         hicache = sys.modules.get("sglang.srt.mem_cache.pool_host.npu_memfabric")
         hicache_active = getattr(hicache, "_memfabric_state", {}).get(
             "initialized", False
@@ -104,8 +100,8 @@ class MemFabricHostPool:
             from .native_acl import get_native_acl
 
             native_acl = get_native_acl()
-        if offload is None:
-            from memfabric_hybrid import offload
+        from memfabric_hybrid import offload
+
         self.native_acl, self.offload = native_acl, offload
         with self._lock:
             if MemFabricHostPool._active is not None:

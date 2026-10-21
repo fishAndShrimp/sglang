@@ -31,8 +31,8 @@ ACL 入口必须注入**与目标 CANN 头文件编译匹配**且经过 torch_np
 
 MemFabric 默认调用本地 Python 包的 `group_pack_copy`，在 caller 的 NPU copy
 stream 上执行，事件覆盖全部分量和 batch。库构建/首次加载、映射注册和指针
-表绑定必须在 capture 前完成。`allow_cpu=True` 仅用于注入测试 kernel，不能
-作为生产 fallback。适配器本身不设置 `full_decode_graph`。
+表绑定必须在 capture 前完成。搬运适配器只接受 NPU 存储，不提供 CPU 模拟模式。
+适配器本身不设置 `full_decode_graph`。
 
 `MemFabricTransferBindings` 显式登记持久地址表和 metadata；Tensor lowering
 的临时表达式仍使用 PyTorch allocator，其 capture 峰值必须由具体 runtime
@@ -42,18 +42,12 @@ Prefill 绑定必须提供 `make_request`、`combine_bindings`、`worker_scope` 
 `record_copy_completion`。它们分别负责 bank 偏移/物理格式、首批连续视图、
 worker device/stream 入口和真实队列完成事件；不允许新增未登记权重存储。
 
-## 本地验证范围
+## 目标机验收
 
-按 `CACHE_IMPLEMENTATION.zh-CN.md` 的命令执行全部 CPU 契约测试。
-新增测试校验全部 32 种五 lane 稀疏 mask、非连续目标、多分量字节尾部、空
-计划、HOT/HOST 来源、generation 错误、同池写覆盖、metadata 地址复用、
-partial failure 保活、动态 K、P/Q 上界和跨层 reader 保护。
+CPU 单测、字节复制模拟 kernel 与相关 runner 已移除。使用真实 NPU 环境验收
+稀疏 mask、非连续目标、多分量尾部、HOST/HOT 来源、generation 错误、同池覆盖、
+部分提交失败保活、动态 K、P/Q 上界和跨层 reader 保护。
 
-另有跨组件测试，把真实 TensorResidencyOps、LFU、搬运 lowering、字节复制
-模拟 kernel 和 DecodeStateSnapshot 连起来，连续改变两层路由并恢复原 slot。
-模拟器只替代 native DMA/kernel，未把它等同于真实 NPU、完整 graph、EP 或
-原生 FP4 数值验证。
-
-仍需 A5 验证共同 host 存储能力、ACL ABI/队列顺序、MemFabric 动态地址、真实
-FP4 格式/FFN、EP、完整 decode graph、显存峰值和 H2D/F 重叠时间线。上述
-硬件结果未在本机取得，M0–M5 的未验收状态保持不变。
+A5 验收还应覆盖共同 host 存储能力、ACL ABI/队列顺序、MemFabric 动态地址、
+FP4 格式/FFN、EP、完整 decode graph、显存峰值和 H2D/F 重叠时间线。
+这些硬件结果尚未在本机取得。

@@ -130,9 +130,8 @@ def _scale_view(raw):
 class NpuV4FP4Format:
     """One-expert native probe, fixed bank descriptors, bounded repacking.
 
-    ``adapter`` is an explicit dependency-injection seam for CPU contract tests;
-    the production default always imports torch_npu and fails on unsupported
-    layouts. Probed metadata, never probe weights, remain resident in this object.
+    Uses the deployed torch_npu format adapter and rejects unsupported layouts.
+    Probed metadata, never probe weights, remain resident in this object.
     """
 
     def __init__(
@@ -142,7 +141,6 @@ class NpuV4FP4Format:
         device,
         *,
         native_acl=None,
-        adapter=None,
         workspace_limit_bytes=None,
     ):
         import torch
@@ -156,7 +154,7 @@ class NpuV4FP4Format:
             )
         self.hidden_size, self.intermediate_size = hidden_size, intermediate_size
         self.device = device
-        self.adapter = adapter or _TorchNpuFormatAdapter(device, native_acl)
+        self.adapter = _TorchNpuFormatAdapter(device, native_acl)
         self.workspace_limit_bytes = workspace_limit_bytes
         raw_shapes = {
             _WEIGHTS[0]: (1, 2 * intermediate_size, hidden_size // 2),
@@ -174,7 +172,7 @@ class NpuV4FP4Format:
         self.layouts = {}
         self.workspace_nbytes = 0
         for weight_name, scale_name in zip(_WEIGHTS, _SCALES):
-            baseline = self._begin_workspace()
+            baseline = self.adapter.begin_workspace()
             raw_weight = torch.zeros(
                 raw_shapes[weight_name], dtype=torch.uint8, device="cpu"
             )
@@ -206,12 +204,8 @@ class NpuV4FP4Format:
         )
         self.expert_nbytes = sum(self.component_nbytes.values())
 
-    def _begin_workspace(self):
-        begin = getattr(self.adapter, "begin_workspace", None)
-        return begin() if begin is not None else None
-
     def _check_workspace(self, baseline, known_bytes):
-        measured = self.adapter.end_workspace(baseline) if baseline is not None else 0
+        measured = self.adapter.end_workspace(baseline)
         self.workspace_nbytes = max(self.workspace_nbytes, known_bytes, measured)
         if (
             self.workspace_limit_bytes is not None
@@ -266,7 +260,7 @@ class NpuV4FP4Format:
 
     def repack_into(self, raw_components, expert, destinations):
         for weight_name, scale_name in zip(_WEIGHTS, _SCALES):
-            baseline = self._begin_workspace()
+            baseline = self.adapter.begin_workspace()
             weight_input = self.adapter.to_device(
                 raw_components[weight_name][expert : expert + 1]
             )

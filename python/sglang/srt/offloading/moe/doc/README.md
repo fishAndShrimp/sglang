@@ -7,7 +7,7 @@
 > [weight storage](../npu/doc/V4_STORAGE.md), [EP/FFN](../npu/doc/EXPERTS_IMPLEMENTATION.zh-CN.md)
 > and [local validation](LOCAL_VALIDATION_1021.zh-CN.md).
 > Target A5/CANN compilation, numerical parity, full graph and performance acceptance
-> remain unverified; CPU contracts do not certify hardware execution.
+> remain unverified. CPU test sources and emulation paths have been removed.
 
 English | [中文](README.zh-CN.md)
 
@@ -21,8 +21,8 @@ Importing the NPU package does not initialize a device or load native libraries.
 This package provides the framework for DeepSeek V4 Flash routed-expert offload.
 It provides an opt-in experimental Ascend backend; CUDA remains an extension point.
 Full decode graph is required, with no eager decode fallback.
-The CPU contract suite validates the framework and tensor LFU, not accelerator
-graph capture, native FP4 repacking, HCCL/DeepEP, or performance.
+Validate graph capture, native FP4 repacking, HCCL/DeepEP and performance on the
+target NPU stack.
 
 ## Entry points and growth from V2
 
@@ -106,7 +106,7 @@ must implement these same obligations.
 | `AllocationLedger` | Accounts unique physical allocations and enforces byte budgets; it retains allocation keepalives. |
 | `SlotLeaseManager` | Reserves logical slot regions with lease generations; retiring leases remain unavailable until idle completion. Physical tensors are owned by the runtime. |
 | `ResidencyState` | Fixed-address public maps, validity/generation, execution keys, step counts and device update flag. |
-| `TensorLFUPolicy` | Device-tensor frequency accumulation, optional aging, deterministic selection and snapshot copies. CPU tested; device operator/capture support requires validation. |
+| `TensorLFUPolicy` | Device-tensor frequency accumulation, optional aging, deterministic selection and snapshot copies. Device operator/capture support requires target validation. |
 | `ComposedDFCProgram` | Fixed rounds of D/F/C, one dispatcher handle at a time, accumulation and one common tail. |
 | `DispatchOnceProgram` | One full D, fixed local F waves, one full C and common tail; validates complete local-expert coverage before communication. |
 | `MoEBackend` | **Backend contract:** bounded checkpoint preparation, native post-load binding and cleanup of partial initialization. |
@@ -153,10 +153,9 @@ their memory costs, and retains them through device completion even on failure.
 
 The Python wave loop is fixed at capture; adapters must express dynamic rows and
 counts using device operations with fixed-capacity buffers. No host `.item()`
-slicing is a decode-graph implementation. CPU numerical tests cover compact and
-padded synthetic layouts, empty ranks/waves, partial tails, reused F scratch,
-changing routes and failure propagation. Real DeepEP adapters and accelerator
-capture remain unimplemented; the tests make no graph or performance claim.
+slicing is a decode-graph implementation. Validate compact/padded receive layouts,
+empty ranks, partial tails, changing routes and failure propagation using the
+Ascend adapter and actual graph replay.
 
 ## Identity, memory and execution rules
 
@@ -239,5 +238,5 @@ has passed. Complete the milestones in order:
 | M4 | Exact restore across prefill/decode alternation and all graph buckets; no warmup popularity pollution. |
 | M5 | V4 Flash TP+EP end-to-end correctness, memory/traffic/performance report and CUDA contract validation. |
 
-CPU tests: `python -m unittest discover -s test/registered/unit/offloading -v`
-in a configured SGLang development environment.
+CPU test sources and their runner have been removed. Use target-NPU acceptance
+for runtime correctness and performance.

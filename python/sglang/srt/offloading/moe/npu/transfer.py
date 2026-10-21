@@ -14,7 +14,6 @@ No adapter alone certifies torch_npu operator coverage or full decode graphs.
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 from dataclasses import dataclass
 
 from ...transfer import (
@@ -164,7 +163,7 @@ class AclBatchHostTransferOps(HostTransferOps):
         self.native_submit = native_submit
         self.record_completion = record_completion
         self.retain = retain
-        self.stream_context = stream_context or (lambda stream: nullcontext())
+        self.stream_context = stream_context or _npu_stream_context
         self.max_batch_entries = max_batch_entries
 
     def _lower(self, plan):
@@ -328,7 +327,6 @@ class MemFabricTransferBindings:
         error_status,
         device,
         max_batch_entries=256,
-        allow_cpu=False,
         name=None,
     ):
         import torch
@@ -344,8 +342,8 @@ class MemFabricTransferBindings:
         ):
             raise ValueError("MemFabric batch capacity must be in [1, 256]")
         self.device = torch.device(device)
-        if self.device.type != "npu" and not (allow_cpu and self.device.type == "cpu"):
-            raise ValueError("MemFabric requires NPU storage (CPU is test-only)")
+        if self.device.type != "npu":
+            raise ValueError("MemFabric requires NPU storage")
         if self.device.type == "npu" and self.device.index is None:
             raise ValueError("Bind MemFabric to an explicit NPU device index")
         self.name = name if name is not None else f"memfabric.{id(self):x}"
@@ -500,7 +498,6 @@ class MemFabricDeviceTransferOps(DeviceTransferOps):
     Native statuses report submission only. Completion is recorded after all
     component/batch calls on the caller's copy stream. Generation/index/count
     errors poison shared error_status before any kernel is allowed to write.
-    CPU mode is solely for byte-level tests with an injected native emulator.
     """
 
     def __init__(
@@ -510,21 +507,13 @@ class MemFabricDeviceTransferOps(DeviceTransferOps):
         group_pack_copy=None,
         record_completion=None,
         stream_context=None,
-        allow_cpu=False,
     ):
         if not callable(retain):
             raise TypeError("A runtime resource-retention callback is required")
-        if allow_cpu and (group_pack_copy is None or record_completion is None):
-            raise ValueError(
-                "CPU tests require explicit kernel and completion callbacks"
-            )
         self.retain = retain
         self.group_pack_copy = group_pack_copy or _group_pack_copy
         self.record_completion = record_completion or _npu_completion
-        self.stream_context = stream_context or (
-            (lambda stream: nullcontext()) if allow_cpu else _npu_stream_context
-        )
-        self.allow_cpu = allow_cpu
+        self.stream_context = stream_context or _npu_stream_context
 
     @staticmethod
     def _mask(plan, bindings):
@@ -562,14 +551,13 @@ class MemFabricDeviceTransferOps(DeviceTransferOps):
 
         if not isinstance(bindings, MemFabricTransferBindings):
             raise TypeError("MemFabric requires preallocated MemFabricTransferBindings")
-        if bindings.device.type == "cpu" and not self.allow_cpu:
-            raise ValueError("CPU lowering requires explicit test mode")
-        if bindings.device.type == "npu":
-            stream_device = getattr(stream, "device", None)
-            if stream_device is None or torch.device(stream_device) != bindings.device:
-                raise ValueError(
-                    "MemFabric copy stream must belong to the bound NPU device"
-                )
+        if bindings.device.type != "npu":
+            raise ValueError("MemFabric lowering requires NPU storage")
+        stream_device = getattr(stream, "device", None)
+        if stream_device is None or torch.device(stream_device) != bindings.device:
+            raise ValueError(
+                "MemFabric copy stream must belong to the bound NPU device"
+            )
         bindings.validate_plan(plan)
         resources = (plan, bindings, self)
         self.retain(resources)

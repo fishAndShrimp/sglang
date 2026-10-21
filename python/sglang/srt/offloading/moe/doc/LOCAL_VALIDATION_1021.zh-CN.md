@@ -1,12 +1,14 @@
 # 2026-10-21 本地验证记录
 
+> 历史记录：对应的 CPU 单测、runner 和 smoke 代码已从当前分支移除；下文保留早期提交的验证记录，当前功能以目标 NPU 实机验收为准。
+
 环境：macOS / Apple Silicon，Python 3.9.6，PyTorch 2.8.0。
 本机无 CUDA，未安装 torch_npu；没有执行真实 ACL、MemFabric kernel、NPU graph、
 多卡 EP、原生 FP4 或端到端模型性能验收。
 
 ## 四项原生适配的组合验证
 
-当前完整套件 **223 项通过**。原有 132 项继续运行，新增部分如下：
+当时完整套件 **223 项通过**。原有 132 项当时继续运行，新增部分如下：
 
 | 适配 | 新增 CPU 测试 | 覆盖 |
 | --- | ---: | --- |
@@ -53,13 +55,10 @@ NPU 模块均可导入。四卡脚本的 dry-run 和模拟构建/启动流程通
 | 源码检查 | 修改的 Python 文件编译检查、Ruff 格式及静态检查通过 |
 | 提交检查 | 两块分别运行 `git diff --cached --check` |
 
-执行命令：
+以下为已删除测试实现的历史说明：
 
-```bash
-PYTHONDONTWRITEBYTECODE=1 python test/registered/unit/offloading/run_cpu_contracts.py
-```
 
-测试入口建立包命名空间以跳过 serving 顶层可选依赖，加载的 offloading 源码
+当时的测试入口建立包命名空间以跳过 serving 顶层可选依赖，加载的 offloading 源码
 是真实实现。硬件 API 在对应测试中用字节复制/完成事件模拟器替代，因此不能
 据此断言真实 NPU 的队列顺序、capture 算子支持或内存峰值。
 

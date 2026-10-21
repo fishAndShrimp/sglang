@@ -18,7 +18,7 @@
 
 本模块面向 **DeepSeek V4 Flash 原生 FP4 权重、A5 多卡 TP + EP**，为 CUDA / NPU 提供共同的专家身份、缓存策略、资源所有权和执行程序接口。
 
-当前包含公共框架及实验性 Ascend 具体后端，CUDA 仍是扩展点。完整 decode graph 是必须满足的验收条件，不能用 eager fallback 替代；本地 CPU 测试不代表硬件验收。
+当前包含公共框架及实验性 Ascend 具体后端，CUDA 仍是扩展点。完整 decode graph 是必须满足的验收条件，不能用 eager fallback 替代；CPU 测试代码已移除，硬件验收仍需在目标机完成。
 
 本文的架构图沿用框架提交 `65e5c53ebb` 及后续 DispatchOnce 扩展；接口标记描述可移植契约，具体 Ascend 实现以顶部链接的说明为准。下文保留之前讨论的三张 UML 的主题及 prefill/decode 切换状态图。
 
@@ -33,7 +33,6 @@
 | [interfaces.py](../interfaces.py) | `ExecutionContext` 的保活/完成契约；临时驻留发布与 reader 结束；Dispatch completion；runtime 层首/尾部默认委托 |
 | [prefill.py](../prefill.py) | `PrefillWeightPipeline` 契约及 `BoundedPrefillWeightPipeline` 有界 worker：start / validate_session / seal / acquire / finish / abort |
 | [programs.py](../programs.py) | `PrefillDispatchOnceProgram`、`PrefillLocalExpertProgram`、`DecodeLocalExpertProgram`；复用公共 D/F/C，不复制整套 forward |
-| [test_h2d_contracts.py](../../../../../../test/registered/unit/offloading/test_h2d_contracts.py) | CPU 契约测试：模式隔离、每趟 K、异步依赖、失败保活、LFU 尾部更新及无预取 decode |
 
 实际接入时，runtime 绑定 `ComposedTransferBackend(host_ops=..., device_ops=...)` 和 `ExpertWeightAccess`，并设置 `cache_updates = CacheUpdateCoordinator(...)`。prefill 另行注入具体 pipeline；local program 的 `run_experts` 返回 `LocalExecution(output, read_done)`。所有对象与物理分配仍由 bound runtime / owner 管理。
 
@@ -101,8 +100,6 @@ offloader = MoEOffloaderV2(config, backend, policy=TensorLFUPolicy())
 | [resources.py](../resources.py)、[storage.py](../storage.py) | 物理内存记账、host 侧 slot 预约、pinned 权重及注册句柄持有。 |
 | [state.py](../state.py)、[policy.py](../policy.py) | 公共缓存 tensor 状态、独立 LFU 状态及策略实现。 |
 | [interfaces.py](../interfaces.py)、[programs.py](../programs.py) | 后端扩展点、固定多轮 DFC 和一次 D / 分片 F / 一次 C 编排。 |
-| [test_dispatch_once.py](../../../../../../test/registered/unit/offloading/test_dispatch_once.py) | DispatchOnce 的 CPU 数值对照与边界测试；不验证真实 DeepEP 或 graph。 |
-| [test_moe_framework.py](../../../../../../test/registered/unit/offloading/test_moe_framework.py) | CPU 契约测试与测试用 fake runtime；fake runtime 不属于推理后端。 |
 
 ## 3. UML：从当前框架生长
 
@@ -573,17 +570,9 @@ EXECUTION_WEIGHTS = S * B
 
 ## 9. 验证方式
 
-在配置好 SGLang 开发依赖的环境中运行：
-
-```bash
-python -m unittest discover -s test/registered/unit/offloading -v
-```
-
-框架提交时已通过 **31 项 CPU 契约测试**，覆盖专家归属及容量、隐藏分配/超预算拒绝、slot retiring、transfer keepalive、forward 串行、失败保护、模式恢复调用、graph lease、LFU、wave 顺序与 hook 边界等。另完成 Python 语法、格式、静态检查及 `git diff --check`。
-
-DispatchOnce 扩展另增加 **6 项 CPU 测试**，合计 **37 项**，覆盖紧凑/padded 布局的数值对照、空 rank、零 token、连续调用路由变化、非法分片和异常中断。测试在本地通过包路径加载实际 offloading 模块，绕过 serving 顶层依赖初始化。
-
-这些测试使用 fake runtime 或 CPU tensor，未覆盖 A5 / CUDA 执行、原生 FP4 repack、真实 EP 通信、完整 graph 捕获及性能。
+CPU 单测、模拟搬运实现和 runner 已移除。使用匹配的 CANN / torch_npu / MemFabric
+及 DeepEP，在目标 NPU 上验证原生 FP4 权重、搬运时序、空/尾组、真实 EP、完整
+graph replay、prefill/decode 精确恢复及内存和性能。下方更新记录保留历史提交信息。
 
 ## 10. 更新记录
 

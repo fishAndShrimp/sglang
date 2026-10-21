@@ -96,30 +96,15 @@ native.memcpy_sync(dst, dst_capacity, src, nbytes, "device_to_host", device_inde
 torch_npu host queue 中的算子。调用方应先记录并等待对应算子真实完成事件。
 它不是运行时 prefill fallback，也不改变 NZ/ND 布局或量化 dtype。
 
-## 本地验证与剩余验收
+## 目标机验收
 
-`test_native_acl.py` 在 CPU 上分别构造九参数、十参数及不支持的 SDK 头文件，
-编译本目录真实 C++/pybind 源码，再运行原生字节复制、参数校验、队列先后顺序、
-部分失败诊断、null-stream 拒绝、GIL 释放、锁页/映射注册及 Python 保活测试。
-测试中的 ctypes 仅调用测试自己定义的 fake-runtime 控制函数，不用于真实 ACL。
+CPU fake-SDK 测试与独立 smoke 脚本已移除。ACL 构建入口保留：SDK 签名探测是
+匹配生产 CANN ABI 的必要步骤，不是测试后备路径。
 
-这些测试通过不代表真实 CANN 链接成功。目标 A5 仍须验证：实际构建，非默认流
-wait → batch → event，后台线程与主计算线程并行，HostRegisterV2 与 MemFabric
-同一 allocation 的兼容性、字节一致性，以及异常排空。prefill 明确不入图；
-此模块不会开启 `full_decode_graph`。
-
-目标机可运行已有真实 smoke 入口，初始化源由 `aclrtMallocHost` 分配，不涉及
-MemFabric 共享存储。它使用两个非默认复制流、另一个生产流上的排队写入、
-stream wait、分批 ACL 提交及 event 完成，再原始 D2H 逐字节核对，包括非对齐尾部：
-
-```bash
-python -m sglang.srt.offloading.moe.npu.native_smoke \
-  --build-directory /absolute/path/to/moe-acl-build \
-  --device 0 --bytes 4093 --repeats 8 --queued-ops 64
-```
-
-应分别在实际部署采用的 task queue 设置下执行。输出 `status=passed` 才表示
-该次真实烟测通过；开发机的 CPU 测试不会生成这个结论。
+在目标 A5 上验收实际编译/链接、非默认流 wait → batch → event、后台提交与
+计算并行、HostRegisterV2 与 MemFabric 同一 allocation 的兼容性、完整 bundle
+字节一致性和异常排空。prefill 明确不入图，此模块不会开启 `full_decode_graph`。
+这些硬件验收结果仍需由实际部署环境提供。
 
 ## 核对依据（2026-10-21）
 

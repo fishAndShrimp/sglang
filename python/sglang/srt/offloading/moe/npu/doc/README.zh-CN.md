@@ -7,7 +7,7 @@
 | `../config.py` / `../backend.py` / `../runtime.py` | 启动配置、资源装配与运行时生命周期 |
 | `../transfer.py` / `../experts.py` | ACL/MemFabric 搬运、DeepEP 与原生 FFN |
 | `../storage.py` / `../v4_format.py` | 共享 host master、FP4 有界加载与 bank |
-| `../native_acl.py` / `../native_smoke.py` / `../native/` | ACL 扩展构建、真实 smoke 与 C++ 源码 |
+| `../native_acl.py` / `../native/` | ACL 扩展构建与 C++ 源码 |
 | `../examples/v4.json` | 每 rank 的 offload 容量配置 |
 
 实现说明：[存储](V4_STORAGE.md)、[EP/FFN](EXPERTS_IMPLEMENTATION.zh-CN.md)、
@@ -60,8 +60,7 @@ MODEL_PATH=/path/to/DeepSeek-V4-Flash \
 
 脚本从自身位置定位当前源码并设置 `PYTHONPATH`，不依赖固定的 `/home/.../sglang`
 目录。默认先构建 ACL 扩展；`BUILD_NATIVE=0` 可复用与当前环境匹配的已构建扩展，
-`RUN_NATIVE_SMOKE=1` 可在加载模型前增加 ACL 字节/事件 smoke。扩展目录直接读取
-offload JSON 的 `native_extension_directory`，避免构建与运行使用不同目录。
+扩展目录直接读取 offload JSON 的 `native_extension_directory`，避免构建与运行使用不同目录。
 
 `MOE_OFFLOAD_CONFIG` 可指定自己的 JSON，默认使用
 `python/sglang/srt/offloading/moe/npu/examples/v4.json`。默认 host 保留量为
@@ -85,7 +84,6 @@ FP8/V4 量化配置入口，routed experts 由原生 FP4 method 接管；明确�
 
 ```bash
 python -m sglang.srt.offloading.moe.npu.native_acl --build-directory /tmp/sglang-moe-acl
-python -m sglang.srt.offloading.moe.npu.native_smoke --build-directory /tmp/sglang-moe-acl
 export MOE_ENABLE_TOPK_NEG_ONE=1
 export DEEP_USE_MODE=default
 export MOE_EXPERT_TOKEN_NUMS_TYPE=1
@@ -111,12 +109,11 @@ loader 一次只转换单专家并受 workspace_limit_bytes 限制。capture 从
 FuseEP、DeepEP ops/alltoall、AscendTP、EPLB、elastic EP、LoRA、speculation、torch.compile、并发
 forward、其他专家 pager 或在线权重更新；不满足条件在加载或绑定时拒绝。
 
-## 本地验证与目标机验收
+## 目标机验收
 
-CPU 测试验证 capture/warmup 开关、fresh replay 事件、精确恢复、图 lease
-销毁、错误保活和 JSON 参数；native/DMA 由显式模拟器替代。
+CPU 单测、runner 及 smoke 代码已移除。
 
-目标机仍需完成：真实扩展链接与 smoke，host 同份存储 ACL/MemFabric 双路径
+目标机仍需完成：真实扩展链接与 H2D 字节校验，host 同份存储 ACL/MemFabric 双路径
 字节对比，原生 NZ FP4 bank 与常驻 FFN 数值对比，EP padding/空 rank/尾组，
 多 bucket 连续 replay 与 prefill/decode 切换，workspace 峰值及 H2D/F 时间线。
 `RuntimeCapabilities` 表示实现提供完整捕图路径，不表示已获得这些硬件结果。

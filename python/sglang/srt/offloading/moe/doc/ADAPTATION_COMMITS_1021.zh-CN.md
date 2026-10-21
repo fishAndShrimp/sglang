@@ -1,5 +1,7 @@
 # MoE offload 适配提交说明（2026-10-21）
 
+> 历史记录：对应的 CPU 单测、runner 和 smoke 代码已从当前分支移除；下文保留早期提交的验证记录，当前功能以目标 NPU 实机验收为准。
+
 仓库：`sglang-moe-offload-npu/sglang`，分支：`feat/moe-offload-draft-1021`。
 基础提交：`59cbb5d226`。以下两个实现提交已分别落地：
 
@@ -19,4 +21,4 @@
 3. **Cache 运行时接入**：具体 backend/runtime、模型 hooks、每步统计、capture/warmup 控制、fresh replay 事件、精确恢复、销毁及启动配置。
 4. **EP / FFN 接入**：现有 dispatcher/runner 的完成事件与本地需求、wave 布局、原生 bank FFN、有效 lane/错误屏蔽、全部 reader 的完成保护。
 
-每项提交均附对应 CPU 可验证的测试；目标环境缺失的编译、算子、跨流 capture、EP 数值和性能验收必须单独标明。默认不开启未经配置的 offload；不以模拟完成事件或抽象接口替代硬件验收结论。
+早期提交所附的 CPU 测试源码现已移除；目标环境缺失的编译、算子、跨流 capture、EP 数值和性能验收必须单独标明。默认不开启未经配置的 offload；不以模拟完成事件或抽象接口替代硬件验收结论。

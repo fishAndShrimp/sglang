@@ -1,6 +1,6 @@
 """Ascend invocation, model-hook and full-graph lifecycle binding.
 
-Imports are lazy so configuration and lifecycle contracts remain CPU testable.
+Native dependencies are initialized explicitly by the backend.
 The native extension, registered master and EP/FFN adapters are assembled by
 ``NpuMoEBackend``; no capture-time ticket is used to certify a later replay.
 """
@@ -8,7 +8,6 @@ The native extension, registered master and EP/FFN adapters are assembled by
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
 from functools import wraps
 
 from ...transfer import EventCompletion, TransferTicket
@@ -56,12 +55,6 @@ class NpuDeviceRuntime:
 
     def peak(self):
         return self.torch.npu.max_memory_allocated(self.device)
-
-
-@dataclass(frozen=True)
-class LayerPrograms:
-    prefill: object
-    decode: object
 
 
 class _LayerProgramMap:
@@ -216,7 +209,7 @@ class NpuBoundMoERuntime(BoundMoERuntime):
         # NPU V4 calls this method directly, bypassing nn.Module.__call__ hooks.
         # Keep the signature and restore the original instance/class lookup at
         # teardown. The per-context set prevents duplicate starts if __call__
-        # delegates to the same method on another platform/test.
+        # delegates to the same method on another model path.
         name = "forward_hc_pre_from_prev"
         had_instance = name in module.__dict__
         previous = module.__dict__.get(name)

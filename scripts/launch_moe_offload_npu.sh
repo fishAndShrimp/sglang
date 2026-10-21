@@ -18,7 +18,7 @@ Overrides:
   MOE_OFFLOAD_CONFIG (defaults to the repository's npu/examples/v4.json)
   SERVER_HOST=127.0.0.1 SERVER_PORT=8818 SERVED_MODEL_NAME=deepseek-v4-moe-offload
   MAX_RUNNING_REQUESTS=8 CHUNKED_PREFILL_SIZE=1024 CONTEXT_LENGTH=8192
-  MEM_FRACTION_STATIC=0.8 BUILD_NATIVE=1 RUN_NATIVE_SMOKE=0
+  MEM_FRACTION_STATIC=0.8 BUILD_NATIVE=1
 
 --dry-run prints the environment, native build and server commands without
 building, loading weights or initializing NPU devices. Budgets in the JSON are
@@ -50,7 +50,6 @@ CHUNKED_PREFILL_SIZE=${CHUNKED_PREFILL_SIZE:-1024}
 CONTEXT_LENGTH=${CONTEXT_LENGTH:-8192}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.8}
 BUILD_NATIVE=${BUILD_NATIVE:-1}
-RUN_NATIVE_SMOKE=${RUN_NATIVE_SMOKE:-0}
 MOE_OFFLOAD_CONFIG=${MOE_OFFLOAD_CONFIG:-$SGLANG_ROOT/python/sglang/srt/offloading/moe/npu/examples/v4.json}
 
 [[ -n "$MODEL_PATH" ]] || die "Set MODEL_PATH to a DeepSeek V4 native-FP4 checkpoint; see --help."
@@ -60,7 +59,7 @@ for name in WORLD_SIZE SERVER_PORT MAX_RUNNING_REQUESTS CHUNKED_PREFILL_SIZE CON
 done
 (( SERVER_PORT <= 65535 )) || die "SERVER_PORT exceeds 65535."
 (( MAX_RUNNING_REQUESTS <= 128 )) || die "MAX_RUNNING_REQUESTS must not exceed the DeepEP dispatch limit (128)."
-[[ "$BUILD_NATIVE" =~ ^[01]$ && "$RUN_NATIVE_SMOKE" =~ ^[01]$ ]] || die "BUILD_NATIVE and RUN_NATIVE_SMOKE must be 0 or 1."
+[[ "$BUILD_NATIVE" =~ ^[01]$ ]] || die "BUILD_NATIVE must be 0 or 1."
 [[ -d "$SGLANG_ROOT/python/sglang" ]] || die "Invalid SGLANG_ROOT: $SGLANG_ROOT"
 [[ -f "$MOE_OFFLOAD_CONFIG" ]] || die "Missing offload JSON: $MOE_OFFLOAD_CONFIG"
 command -v "$PYTHON_BIN" >/dev/null || die "Python executable not found: $PYTHON_BIN"
@@ -142,7 +141,6 @@ GRAPH_BS=()
 for ((bs=1; bs<MAX_RUNNING_REQUESTS; bs*=2)); do GRAPH_BS+=("$bs"); done
 GRAPH_BS+=("$MAX_RUNNING_REQUESTS")
 BUILD_CMD=("$PYTHON_BIN" -m sglang.srt.offloading.moe.npu.native_acl --build-directory "$NATIVE_BUILD_DIR")
-SMOKE_CMD=("$PYTHON_BIN" -m sglang.srt.offloading.moe.npu.native_smoke --build-directory "$NATIVE_BUILD_DIR")
 SERVER_CMD=(
     "$PYTHON_BIN" -m sglang.launch_server
     --model-path "$MODEL_PATH" --served-model-name "$SERVED_MODEL_NAME"
@@ -165,7 +163,6 @@ SERVER_CMD=(
 printf 'WORLD_SIZE=%s TP=%s EP=%s DP=1 DEVICES=%s\n' "$WORLD_SIZE" "$WORLD_SIZE" "$WORLD_SIZE" "$ASCEND_RT_VISIBLE_DEVICES"
 printf 'Offload JSON: %s\nNative build: %s\n' "$MOE_OFFLOAD_CONFIG" "$NATIVE_BUILD_DIR"
 if [[ "$BUILD_NATIVE" == 1 ]]; then printf '%q ' "${BUILD_CMD[@]}"; printf '\n'; fi
-if [[ "$RUN_NATIVE_SMOKE" == 1 ]]; then printf '%q ' "${SMOKE_CMD[@]}"; printf '\n'; fi
 printf '%q ' "${SERVER_CMD[@]}"; printf '\n'
 [[ "$DRY_RUN" == 0 ]] || exit 0
 
@@ -186,5 +183,4 @@ if not any(model.glob("*.safetensors")):
 PY
 
 if [[ "$BUILD_NATIVE" == 1 ]]; then "${BUILD_CMD[@]}"; fi
-if [[ "$RUN_NATIVE_SMOKE" == 1 ]]; then "${SMOKE_CMD[@]}"; fi
 exec "${SERVER_CMD[@]}"
