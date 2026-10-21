@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from enum import Enum
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 class Phase(Enum):
@@ -23,6 +23,8 @@ class MoEOffloadConfig:
     moe_tp_size: int = 1
     workspace_limit_bytes: int = 0
     metadata_limit_bytes: int = 0
+    # External allocators may reserve page-rounded storage. It is still charged.
+    host_allocation_limit_bytes: Optional[int] = None
 
     def __post_init__(self):
         if not math.isfinite(self.cache_ratio) or not 0 <= self.cache_ratio <= 1:
@@ -37,6 +39,11 @@ class MoEOffloadConfig:
             raise ValueError("MoE TP is not supported")
         if min(self.workspace_limit_bytes, self.metadata_limit_bytes) < 0:
             raise ValueError("Memory limits must be nonnegative")
+        if (
+            self.host_allocation_limit_bytes is not None
+            and self.host_allocation_limit_bytes < 0
+        ):
+            raise ValueError("Host allocation limit must be nonnegative")
 
     def hot_slots(self, catalog: ExpertCatalog) -> int:
         return math.floor(self.cache_ratio * catalog.num_experts)

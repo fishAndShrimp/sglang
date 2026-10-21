@@ -82,9 +82,15 @@ class MoEOffloadOwner:
         self.catalog = catalog
         self.runtime = runtime
         hot_slots = config.hot_slots(catalog)
+        host_payload_bytes = catalog.num_experts * runtime.expert_nbytes
+        host_limit = config.host_allocation_limit_bytes
+        if host_limit is None:
+            host_limit = host_payload_bytes
+        if host_limit < host_payload_bytes:
+            raise ValueError("Host budget cannot hold the immutable expert master")
         self.allocation_ledger = AllocationLedger(
             {
-                ResourceKind.HOST_WEIGHTS: catalog.num_experts * runtime.expert_nbytes,
+                ResourceKind.HOST_WEIGHTS: host_limit,
                 ResourceKind.HOT_WEIGHTS: hot_slots * runtime.expert_nbytes,
                 ResourceKind.EXECUTION_WEIGHTS: config.execution_slots
                 * runtime.expert_nbytes,
@@ -93,8 +99,11 @@ class MoEOffloadOwner:
             },
             runtime.resources,
         )
+        if self.allocation_ledger.usage[ResourceKind.HOST_WEIGHTS] < host_payload_bytes:
+            raise ValueError(
+                "host_weights allocation does not hold the complete master"
+            )
         for kind in (
-            ResourceKind.HOST_WEIGHTS,
             ResourceKind.HOT_WEIGHTS,
             ResourceKind.EXECUTION_WEIGHTS,
         ):

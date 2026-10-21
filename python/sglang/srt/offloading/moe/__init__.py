@@ -15,7 +15,11 @@ from .interfaces import ExecutionContext
 from .offloader import MoEOffloaderV2
 from .owner import MoEOffloadOwner
 from .policy import TensorLFUPolicy
-from .prefill import PrefillWeightPipeline
+from .prefill import (
+    BoundedPrefillWeightPipeline,
+    PrefillPipelineConfig,
+    PrefillWeightPipeline,
+)
 from .programs import (
     ComposedDFCProgram,
     DecodeLocalExpertProgram,
@@ -25,15 +29,15 @@ from .programs import (
 )
 from .residency import BoundExecutionWave, TensorResidencyOps
 from .runtime import DecodeStateSnapshot, ManagedExecutionContext
+from .storage import HostMemoryCapability
 
 __all__ = [
     "BoundExecutionWave",
-    "TensorResidencyOps",
-    "DecodeStateSnapshot",
-    "ManagedExecutionContext",
+    "BoundedPrefillWeightPipeline",
     "CacheUpdateCoordinator",
     "ComposedDFCProgram",
     "DecodeLocalExpertProgram",
+    "DecodeStateSnapshot",
     "DispatchOnceProgram",
     "ExecutionContext",
     "ExecutionRequest",
@@ -42,15 +46,19 @@ __all__ = [
     "ExpertLayerSpec",
     "ExpertWeightAccess",
     "LocalExecution",
+    "ManagedExecutionContext",
     "MoEOffloadConfig",
     "MoEOffloaderV2",
     "MoEOffloadOwner",
     "Phase",
+    "HostMemoryCapability",
+    "PrefillPipelineConfig",
     "PrefillDispatchOnceProgram",
     "PrefillLocalExpertProgram",
     "PrefillWeightPipeline",
     "SourcePolicy",
     "TensorLFUPolicy",
+    "TensorResidencyOps",
     "UpdatePlan",
     "WeightLease",
 ]

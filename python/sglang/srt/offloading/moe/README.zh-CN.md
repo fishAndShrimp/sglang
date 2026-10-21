@@ -1,5 +1,10 @@
 # MoE 权重 Offload 框架
 
+> **2026-10-21 draft 更新**：新增可运行的 Tensor cache 规划、graph 资源生命周期、
+> 有界 prefill worker 和 ACL/MemFabric 搬运适配。实现与本地验收范围见
+> [cache 说明](CACHE_IMPLEMENTATION.zh-CN.md) 和 [H2D 说明](H2D_IMPLEMENTATION.zh-CN.md)。
+> 下文历史状态不代表这些新组件尚未实现；原生 loader/FP4/EP、目标 SDK 封装及 A5 完整图仍待装配与实机验证。
+
 [English](README.md) | 中文
 
 [三人开发分工与任务计划](DEVELOPMENT_PLAN.zh-CN.md)

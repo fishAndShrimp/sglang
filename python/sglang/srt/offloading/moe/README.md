@@ -1,5 +1,11 @@
 # MoE offload framework
 
+> **2026-10-21 draft update:** concrete tensor cache planning, graph ownership,
+> bounded prefill scheduling and ACL/MemFabric transfer adapters are now available.
+> See [cache implementation](CACHE_IMPLEMENTATION.zh-CN.md) and
+> [H2D implementation](H2D_IMPLEMENTATION.zh-CN.md) for binding contracts and test scope.
+> Native model/FP4/EP integration, the SDK-matched ACL shim and A5 graph acceptance remain outstanding.
+
 English | [中文](README.zh-CN.md)
 
 [Three-person development plan (Chinese)](DEVELOPMENT_PLAN.zh-CN.md)
