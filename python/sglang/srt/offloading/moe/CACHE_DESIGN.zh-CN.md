@@ -1,5 +1,10 @@
 # MoE Cache 与框架适配实现总结
 
+> 2026-10-22：本说明保留上游缓存提交的设计与验证记录。当前原生 NPU 入口复用其中的
+> `PeriodicLFUPolicy` 与 `CacheRouteStats`，通过现有 ACL/MemFabric 后端执行搬运；
+> 具体接入和当前测试方法见 [原生周期缓存](npu/doc/PERIODIC_CACHE_1022.zh-CN.md)。
+> 原生服务仍要求完整 decode graph，不使用本说明中通用缓存 runtime 的 eager decode 路径。
+
 本文总结本分支完成的 cache 算法与框架适配：实现了哪些功能、代码如何组织、prefill / decode 如何执行，以及如何验证这些改动。接口部分说明本次实现提供或调用的方法，验证部分区分已通过的测试与测试覆盖范围。
 
 本分支 `codex/moe-cache-integration` 基于 `59cbb5d`，从开发分支 `12382f2` 选取生产代码、CPU 测试和本文。生产代码对应 `a29b739` 的精简版本。本分支不包含开发阶段的三个 NPU 手工验证脚本及其辅助测试。

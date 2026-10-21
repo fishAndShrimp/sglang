@@ -32,7 +32,7 @@ v0.4 已实现公共接口和组合程序，设备后端仍需注入。代码包
 | Decode 搬运 | 使用 `group_pack_copy`；源码以指定的本地 `memfabric_hybrid-master` 为参考，通过 `DeviceTransferOps` 接入 |
 | Decode graph | 完整入图，动态命中、复制计划、热度及热集更新都不能依赖 replay 时执行 Python |
 | 权重存储 | 每 rank 保存自身专家的完整、不可变 host 主副本；临时执行与热缓存更新分离 |
-| 容量 | 热池按每 rank 可卸载专家总数乘 ratio 计量；允许跨层竞争；执行缓冲单独显式计量 |
+| 容量 | 热池按每 rank 可卸载专家总数乘 ratio 计量；离线跨层 Top-K 初始化，在线周期层内替换并保持每层配额（2026-10-22）；执行缓冲单独显式计量 |
 | 模型范围 | DeepSeek V4 Flash 原生格式；前三层 routed 权重及 shared 权重均保持常驻 |
 | Prefill 策略 | 遍历本层全部本地 routed 专家；不依据路由热度缩减 H2D，也不更新 LFU |
 | 模式切换 | 进入 prefill 前备份 slot 布局、映射及策略状态；切回 decode 时按原 slot 恢复权重与状态 |
@@ -155,7 +155,7 @@ prefill 在普通 forward 中执行这些调用；decode 在 capture 时发出�
 - `select_hot_set(...)`：产出固定容量的目标专家 key，未用位置填无效值。
 - `copy_state(...)`：精确保存、恢复计数及其他策略状态。
 
-策略不分配 slot、不启动 H2D、不操作 stream，也不因一次 miss 自动接纳专家。slot 分配和跨层抢占由 `ResidencyOps` 处理；热集变更在模型 forward 尾部统一执行。
+策略不分配 slot、不启动 H2D、不操作 stream，也不因一次 miss 自动接纳专家。slot 分配由 `ResidencyOps` 处理；本分支周期 LFU 仅同层替换，热集变更在模型 forward 尾部统一执行。
 
 ### Decode 尾部热集更新的调用链
 

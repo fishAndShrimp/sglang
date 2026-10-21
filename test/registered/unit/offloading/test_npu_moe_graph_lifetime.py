@@ -5,11 +5,13 @@ import sys
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import MethodType, ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from test_moe_graph_leases import Owner
 
+from sglang.srt.offloading.moe.graph import GraphLeaseBackend
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -57,8 +59,8 @@ class TestNPUMoEGraphLifetime(unittest.TestCase):
                 )
             backend = SimpleNamespace()
             namespace["__init__"](backend, runner)
-            self.assertIs(backend._moe_owner, owner)
-            self.assertEqual(backend._moe_graph_leases, {})
+            self.assertEqual(backend._pending_graphs, {})
+            self.assertFalse(hasattr(backend, "_moe_graph_leases"))
 
     def _graph_backend(self):
         source = (
@@ -77,13 +79,19 @@ class TestNPUMoEGraphLifetime(unittest.TestCase):
         graphs = {}
 
         class Graph:
+            def reset(self):
+                log.append("graph_reset")
+
             def __del__(self):
                 log.append("graph_destroy")
 
         class Lease:
             def close(self):
                 self_test.assertFalse(graphs)
-                self_test.assertIn("graph_destroy", log)
+                self_test.assertFalse(backend._pending_graphs)
+                # A failed capture's traceback may retain its Python object;
+                # explicit reset already destroys the device graph bindings.
+                self_test.assertIn("graph_reset", log)
                 log.append("lease_close")
 
         self_test = self
@@ -107,6 +115,7 @@ class TestNPUMoEGraphLifetime(unittest.TestCase):
         )
         backend = SimpleNamespace(
             _graphs=graphs,
+            _pending_graphs={},
             _outputs={},
             _pool=None,
             _capture_stream=None,
@@ -114,30 +123,49 @@ class TestNPUMoEGraphLifetime(unittest.TestCase):
             _tp_group=SimpleNamespace(barrier=lambda: None),
             _enable_torch_compile=False,
             _memory_saver_adapter=None,
-            _moe_owner=SimpleNamespace(
-                acquire_graph=lambda key: log.append(("acquire", key)) or Lease()
-            ),
-            _moe_graph_leases={},
             _update_executor=SimpleNamespace(
                 shutdown=lambda **kwargs: log.append("shutdown")
             ),
         )
-        return namespace, backend, log
+        for name, method in namespace.items():
+            if name in ("capture_one", "can_run", "cleanup"):
+                setattr(backend, name, MethodType(method, backend))
+        backend.capture_session = lambda stream: nullcontext()
+        owner = Owner(log)
+        owner.runtime.synchronize = lambda: log.append("owner_drain")
+        original_acquire = owner.acquire_graph
+
+        def acquire(key):
+            original = original_acquire(key)
+            lease = Lease()
+            close = lease.close
+
+            def release():
+                close()
+                original.close()
+
+            return SimpleNamespace(close=release)
+
+        owner.acquire_graph = acquire
+        wrapper = GraphLeaseBackend(backend, owner, object())
+        return wrapper, backend, owner, log
 
     def test_graph_lease_lives_until_cleanup_after_device_drain(self):
-        namespace, backend, log = self._graph_backend()
+        wrapper, backend, owner, log = self._graph_backend()
         # Only this key is patched; avoid reverting unrelated torch module imports.
         with patch.dict(sys.modules, {"torch_npu": ModuleType("torch_npu")}):
-            namespace["capture_one"](backend, "bucket", lambda: torch.ones(1))
-        self.assertEqual(len(backend._moe_graph_leases), 1)
+            with wrapper.capture_session("capture"):
+                wrapper.capture_one("bucket", lambda: torch.ones(1))
+        self.assertEqual(len(owner.graphs), 1)
         self.assertEqual(log.count("lease_close"), 0)
-        namespace["cleanup"](backend)
+        wrapper.cleanup()
         self.assertLess(log.index("shutdown"), log.index("graph_destroy"))
-        self.assertEqual(log[-3:], ["sync", "graph_destroy", "lease_close"])
-        self.assertFalse(backend._moe_graph_leases)
+        self.assertLess(log.index("owner_drain"), log.index("graph_reset"))
+        self.assertLess(log.index("graph_destroy"), log.index("lease_close"))
+        self.assertFalse(owner.graphs)
 
     def test_failed_capture_is_retained_but_not_replayable_until_cleanup(self):
-        namespace, backend, log = self._graph_backend()
+        wrapper, backend, owner, log = self._graph_backend()
         calls = []
 
         def forward():
@@ -147,32 +175,34 @@ class TestNPUMoEGraphLifetime(unittest.TestCase):
 
         with patch.dict(sys.modules, {"torch_npu": ModuleType("torch_npu")}):
             with self.assertRaisesRegex(RuntimeError, "capture failed"):
-                namespace["capture_one"](backend, "bucket", forward)
-        self.assertIn("bucket", backend._graphs)
-        self.assertFalse(namespace["can_run"](backend, None, "bucket"))
-        self.assertNotIn("lease_close", log)
-        namespace["cleanup"](backend)
-        self.assertEqual(log[-3:], ["sync", "graph_destroy", "lease_close"])
+                with wrapper.capture_session("capture"):
+                    try:
+                        wrapper.capture_one("bucket", forward)
+                    except RuntimeError:
+                        self.assertIn("bucket", backend._pending_graphs)
+                        self.assertFalse(backend.can_run(None, "bucket"))
+                        self.assertNotIn("lease_close", log)
+                        raise
+        self.assertTrue(owner.failed)
+        self.assertFalse(owner.graphs)
+        self.assertLess(log.index("graph_reset"), log.index("lease_close"))
 
     def test_duplicate_capture_is_rejected_before_warmup(self):
-        namespace, backend, log = self._graph_backend()
+        wrapper, backend, owner, log = self._graph_backend()
         with patch.dict(sys.modules, {"torch_npu": ModuleType("torch_npu")}):
-            namespace["capture_one"](backend, "bucket", lambda: None)
-            original_graph = backend._graphs["bucket"]
-            original_lease = backend._moe_graph_leases["bucket"]
-
-            def reject(key):
-                raise ValueError("Graph bucket already bound")
-
-            backend._moe_owner.acquire_graph = reject
-            with self.assertRaisesRegex(ValueError, "already bound"):
-                namespace["capture_one"](
-                    backend, "bucket", lambda: self.fail("Unexpected warmup")
-                )
-        self.assertIs(backend._graphs["bucket"], original_graph)
-        self.assertIs(backend._moe_graph_leases["bucket"], original_lease)
+            with wrapper.capture_session("capture"):
+                wrapper.capture_one("bucket", lambda: None)
+                original_graph = backend._graphs["bucket"]
+                original_lease = wrapper._leases["bucket"]
+                with self.assertRaisesRegex(ValueError, "existing MoE graph"):
+                    wrapper.capture_one(
+                        "bucket", lambda: self.fail("Unexpected warmup")
+                    )
+                self.assertIs(backend._graphs["bucket"], original_graph)
+                self.assertIs(wrapper._leases["bucket"], original_lease)
         del original_graph
-        namespace["cleanup"](backend)
+        wrapper.cleanup()
+        self.assertFalse(owner.graphs)
 
 
 if __name__ == "__main__":

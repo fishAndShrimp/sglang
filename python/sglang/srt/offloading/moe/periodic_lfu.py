@@ -8,6 +8,7 @@ must validate capture support and budget the sorting temporaries/workspace.
 import json
 import math
 from dataclasses import dataclass
+from typing import Optional
 
 from .config import ExpertCatalog
 from .interfaces import CachePolicy
@@ -15,7 +16,7 @@ from .interfaces import CachePolicy
 
 @dataclass(frozen=True)
 class PeriodicLFUConfig:
-    offline_stats_path: str
+    offline_stats_path: Optional[str]
     update_interval: int = 4
     min_usage: float = 2.0
     replacement_min_gain: float = 1.5
@@ -23,8 +24,10 @@ class PeriodicLFUConfig:
     usage_decay: float = 0.7
 
     def __post_init__(self):
-        if not self.offline_stats_path:
-            raise ValueError("offline_stats_path is required")
+        if self.offline_stats_path is not None and (
+            not isinstance(self.offline_stats_path, str) or not self.offline_stats_path
+        ):
+            raise ValueError("offline_stats_path must be a nonempty path")
         if type(self.update_interval) is not int or self.update_interval <= 0:
             raise ValueError("update_interval must be a positive integer")
         if type(self.max_swaps) is not int or self.max_swaps < 0:
@@ -64,6 +67,10 @@ class PeriodicLFUPolicy(CachePolicy):
         """
         if type(capacity) is not int or not 0 <= capacity <= self.catalog.num_experts:
             raise ValueError("Hot capacity must be within the eligible expert count")
+        if capacity == 0:
+            return ()
+        if self.config.offline_stats_path is None:
+            raise ValueError("A nonempty hot cache requires offline_stats_path")
         with open(self.config.offline_stats_path, encoding="utf-8") as stream:
             profile = json.load(stream)
         if not isinstance(profile, dict) or profile.get("model_id") != model_id:

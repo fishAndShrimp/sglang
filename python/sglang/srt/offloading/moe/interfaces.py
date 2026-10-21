@@ -101,6 +101,14 @@ class ExpertFormat(ABC):
 
 
 class CachePolicy(ABC):
+    def initial_keys(self, capacity, model_id):
+        """Host-only optional warm set; None keeps an explicitly cold start.
+
+        Return logical keys only. The physical backend must materialize complete
+        bundles and publish residency before serving or graph capture.
+        """
+        return None
+
     def finish_step(self, state):
         """Finish policy accounting after selection (e.g. periodic LFU decay)."""
 

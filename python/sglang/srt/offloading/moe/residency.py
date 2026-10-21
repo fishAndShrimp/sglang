@@ -65,10 +65,12 @@ class TensorResidencyOps(ResidencyOps):
         update_bindings,
         error_status=None,
         prepare_prefill=None,
+        cache_stats=None,
     ):
         self.state, self.catalog = state, catalog
         self.update_bindings = update_bindings
         self.prepare_prefill = prepare_prefill
+        self.cache_stats = cache_stats
         self._owned = {}
         self._token = object()
         self._readers = {}
@@ -281,6 +283,8 @@ class TensorResidencyOps(ResidencyOps):
             raise ValueError("Unsupported phase")
         context.retain(self)
         self.state.step_access_count.zero_()
+        if self.cache_stats is not None:
+            self.cache_stats.clear()
         # Cross-forward reuse is protected by the owner's resources_idle join.
         self._readers.clear()
 
@@ -381,6 +385,10 @@ class TensorResidencyOps(ResidencyOps):
             out=plan.expected_generation,
         )
         torch.sum(plan.valid, dim=0, dtype=torch.int32, out=plan.count)
+        if self.cache_stats is not None:
+            self.cache_stats.record_counts(
+                buf["counts"], buf["hit"], self.state.update_enabled & self._healthy
+            )
         key_start = self.catalog.key(request.layer_id, start)
         counts = self.state.step_access_count[key_start : key_start + plan.capacity]
         torch.add(counts, buf["counts"], out=buf["frequency"])

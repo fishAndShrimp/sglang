@@ -1,5 +1,9 @@
 # 10 月 21 日 cache draft 实现
 
+> 本文保留 10 月 21 日的实现记录。2026-10-22 原生默认策略已替换为离线 Top-K / 周期
+> 层内 LFU，相关 CPU 契约测试已恢复；当前接入及验证见
+> [周期缓存说明](../npu/doc/PERIODIC_CACHE_1022.zh-CN.md)。
+
 基线：`59cbb5d226`；目标设计：同目录 `moe-h2d-design.zh-CN.md` v0.4。
 本提交实现可组合、可本地验证的缓存规划与生命周期组件。没有自动启用
 MoE offload，也没有声明 A5 完整 graph、原生 FP4 或多卡 EP 已通过。

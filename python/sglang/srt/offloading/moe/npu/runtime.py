@@ -95,6 +95,7 @@ class NpuBoundMoERuntime(BoundMoERuntime):
         resources,
         expert_nbytes,
         storage,
+        cache_stats=None,
         pipelines=(),
         release=None,
     ):
@@ -102,6 +103,7 @@ class NpuBoundMoERuntime(BoundMoERuntime):
         self.residency = residency
         self.ops = residency_ops
         self.cache_updates = cache_updates
+        self.cache_stats = cache_stats
         self.snapshot = snapshot
         self.reload_weights = reload_weights
         self.layer_programs = dict(layer_programs)
@@ -127,7 +129,45 @@ class NpuBoundMoERuntime(BoundMoERuntime):
         self._owner = None
         self._static_allocated = None
         self._captured_workspace = 0
+        self._cache_initialized = False
         self.residency.update_enabled.fill_(True)
+
+    def initialize_hot_cache(self, keys):
+        """Materialize offline Top-K through the production transfer/publication.
+
+        No synthetic decode step runs here: online usage and the periodic clock
+        remain zero. The same fault latch and complete-bundle fence used during
+        serving protect initial publication before any graph can capture banks.
+        """
+        import torch
+
+        self._require_open()
+        if self._installed or self._cache_initialized:
+            raise RuntimeError("Initialize the hot cache exactly once before binding")
+        keys = tuple(keys)
+        if len(keys) != self.residency.slot_to_key.numel():
+            raise ValueError("Offline Top-K must fill the configured hot capacity")
+        if len(set(keys)) != len(keys) or any(
+            type(key) is not int or not 0 <= key < self.residency.key_to_slot.numel()
+            for key in keys
+        ):
+            raise ValueError("Offline Top-K must contain distinct catalog keys")
+
+        def initialize(context):
+            targets = self.cache_updates.target_keys
+            source = torch.tensor(keys, dtype=torch.int64, device=targets.device)
+            context.retain(source)
+            targets.copy_(source)
+            return self.cache_updates.access.apply_update(targets, context)
+
+        ticket = self._transition(initialize)
+        ticket.completion.synchronize()
+        if self.ops.error_status.item() != 0:
+            raise RuntimeError(
+                "Device residency/transfer fault during cache initialization"
+            )
+        self._transition_contexts.clear()
+        self._cache_initialized = True
 
     def _new_context(self, phase, *, stream=None, capturing=False):
         context = ManagedExecutionContext(
@@ -274,6 +314,17 @@ class NpuBoundMoERuntime(BoundMoERuntime):
             return Phase.PREFILL
         raise ValueError("MoE offload accepts decode/idle or ordinary extend only")
 
+    @staticmethod
+    def _has_global_work(forward_batch):
+        for name in ("original_global_num_tokens_cpu", "global_num_tokens_cpu"):
+            counts = getattr(forward_batch, name, None)
+            if counts is not None:
+                return any(count > 0 for count in counts)
+        count = getattr(forward_batch, "global_num_token_non_padded_cpu", None)
+        if count is not None:
+            return count > 0
+        return forward_batch.input_ids.numel() > 0
+
     @contextmanager
     def forward_scope(self, owner, forward_batch):
         self._require_open()
@@ -285,6 +336,14 @@ class NpuBoundMoERuntime(BoundMoERuntime):
         context = self._new_context(phase, stream=stream)
         self._context, self._step_started = context, False
         try:
+            if phase is Phase.DECODE:
+                # Shared host metadata decides whether the whole batch is idle;
+                # a rank receiving no routes still advances with active peers.
+                # The graph consumes the live fixed-address flag on replay.
+                with self.device_runtime.stream_scope(stream):
+                    self.residency.update_enabled.fill_(
+                        self._has_global_work(forward_batch)
+                    )
             context.forward_batch = forward_batch
             context.num_token_non_padded = None
             context.retain(forward_batch)
@@ -466,5 +525,6 @@ class NpuBoundMoERuntime(BoundMoERuntime):
         self.layer_programs.clear()
         self.resources = self.storage = self.pipelines = ()
         self.snapshot = self.cache_updates = self.ops = self.residency = None
+        self.cache_stats = None
         self.reload_weights = self._release = None
         self._closed = True

@@ -1,5 +1,9 @@
 # MoE 权重 Offload 框架
 
+> **2026-10-22 缓存更新**：原生 Ascend 启动入口已切换为离线 Top-K 预热、周期层内 LFU
+> 及设备端 assignment 命中统计；在线保持离线初始化确定的每层配额。配置、物理后端边界
+> 和当前验证方法见 [周期缓存接入](../npu/doc/PERIODIC_CACHE_1022.zh-CN.md)。
+
 > **2026-10-21 实现更新**：已接入 Tensor cache、有界 prefill、原生 ACL batch、
 > ACL/MemFabric 共用 host 存储、V4 FP4 loader、具体运行时和 DeepEP/Ascend FFN bank。
 > 启动入口和支持范围见 [运行时](../npu/doc/README.zh-CN.md)；实现见
@@ -18,7 +22,7 @@
 
 本模块面向 **DeepSeek V4 Flash 原生 FP4 权重、A5 多卡 TP + EP**，为 CUDA / NPU 提供共同的专家身份、缓存策略、资源所有权和执行程序接口。
 
-当前包含公共框架及实验性 Ascend 具体后端，CUDA 仍是扩展点。完整 decode graph 是必须满足的验收条件，不能用 eager fallback 替代；CPU 测试代码已移除，硬件验收仍需在目标机完成。
+当前包含公共框架及实验性 Ascend 具体后端，CUDA 仍是扩展点。完整 decode graph 是必须满足的验收条件，不能用 eager fallback 替代；缓存及原生装配的 CPU 契约测试已恢复，硬件验收仍需在目标机完成。
 
 本文的架构图沿用框架提交 `65e5c53ebb` 及后续 DispatchOnce 扩展；接口标记描述可移植契约，具体 Ascend 实现以顶部链接的说明为准。下文保留之前讨论的三张 UML 的主题及 prefill/decode 切换状态图。
 

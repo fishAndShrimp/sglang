@@ -1,6 +1,13 @@
 {
   "version": 1,
   "cache_ratio": 0.25,
+  "offline_stats_path": "/path/to/deepseek-v4-expert-profile.json",
+  "offline_model_id": "DeepSeek-V4-Flash",
+  "update_interval": 4,
+  "min_usage": 2.0,
+  "replacement_min_gain": 1.5,
+  "max_swaps": 96,
+  "usage_decay": 0.7,
   "execution_slots": 16,
   "prefill_group_size": 8,
   "prefill_microbatch_size": 1,

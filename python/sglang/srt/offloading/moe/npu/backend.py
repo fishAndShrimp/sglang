@@ -12,6 +12,7 @@ from ...transfer import (
     HostCopyPlan,
     HostCopyRegion,
 )
+from ..cache_metadata import CacheRouteStats
 from ..config import ExpertLayerSpec, Phase, fixed_waves
 from ..execution import (
     CacheUpdateCoordinator,
@@ -182,6 +183,9 @@ class NpuMoEBackend(MoEBackend):
         for storage in self.layers.values():
             storage.host_store.require_device_access()
         k = config.hot_slots(catalog)
+        initial_keys = policy.initial_keys(
+            k, getattr(self.settings, "offline_model_id", None)
+        )
         state = ResidencyState.allocate(
             catalog.num_experts, k, config.execution_slots, self.device
         )
@@ -334,6 +338,7 @@ class NpuMoEBackend(MoEBackend):
                 raise ValueError("Incomplete first prefill group")
             return prefill_binding(wave.bank, 0, offset)
 
+        cache_stats = CacheRouteStats.allocate(self.device)
         ops = TensorResidencyOps(
             state,
             catalog,
@@ -341,6 +346,7 @@ class NpuMoEBackend(MoEBackend):
             update_bindings=update,
             error_status=error,
             prepare_prefill=prepare_prefill,
+            cache_stats=cache_stats,
         )
 
         # Native operations retain into the current context, including worker
@@ -423,6 +429,7 @@ class NpuMoEBackend(MoEBackend):
             list(state.allocations())
             + list(ops.allocations())
             + list(snapshot.allocations())
+            + list(cache_stats.allocations())
         )
         for binding in bindings:
             resources.extend(binding.allocations())
@@ -446,6 +453,7 @@ class NpuMoEBackend(MoEBackend):
             residency=state,
             residency_ops=ops,
             cache_updates=updates,
+            cache_stats=cache_stats,
             snapshot=snapshot,
             reload_weights=reload_weights,
             layer_programs=programs,
@@ -455,6 +463,14 @@ class NpuMoEBackend(MoEBackend):
             pipelines=pipelines,
             release=self._release,
         )
+        if initial_keys is not None:
+            try:
+                self.runtime.initialize_hot_cache(initial_keys)
+            except BaseException:
+                self.runtime.synchronize()
+                self.runtime.close()
+                self.runtime = None
+                raise
         return self.runtime
 
     def _release(self):
@@ -467,6 +483,11 @@ class NpuMoEBackend(MoEBackend):
 
     def close_unbound(self):
         if self._closed:
+            return
+        if self.runtime is not None:
+            self.runtime.synchronize()
+            self.runtime.close()
+            self.runtime = None
             return
         if self.device_runtime is not None:
             self.device_runtime.synchronize()

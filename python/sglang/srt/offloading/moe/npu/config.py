@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 from ..config import MoEOffloadConfig
+from ..periodic_lfu import PeriodicLFUConfig
 
 
 def validate_native_environment():
@@ -43,6 +44,13 @@ class NpuOffloadSettings:
     prefill_microbatch_size: int = 1
     prefill_max_inflight: int = 1
     native_extension_directory: str | None = None
+    offline_stats_path: str | None = None
+    offline_model_id: str | None = None
+    update_interval: int = 4
+    min_usage: float = 2.0
+    replacement_min_gain: float = 1.5
+    max_swaps: int = 96
+    usage_decay: float = 0.7
     version: int = 1
 
     def __post_init__(self):
@@ -65,6 +73,18 @@ class NpuOffloadSettings:
             raise ValueError("cache_ratio must be a finite number")
         if not 0 <= self.cache_ratio <= 1:
             raise ValueError("cache_ratio must be in [0, 1]")
+        self.policy_config()
+        if self.offline_model_id is not None and (
+            not isinstance(self.offline_model_id, str) or not self.offline_model_id
+        ):
+            raise ValueError("offline_model_id must be a nonempty model identifier")
+        if self.cache_ratio > 0 and (
+            self.offline_stats_path is None or self.offline_model_id is None
+        ):
+            raise ValueError(
+                "Periodic MoE cache requires offline_stats_path and offline_model_id; "
+                "cache_ratio=0 can run without an offline profile"
+            )
         if self.native_extension_directory is not None and (
             not isinstance(self.native_extension_directory, str)
             or not self.native_extension_directory
@@ -93,7 +113,22 @@ class NpuOffloadSettings:
             raise ValueError(
                 "Unknown MoE offload settings: " + ", ".join(sorted(unknown))
             )
+        profile = data.get("offline_stats_path")
+        if isinstance(profile, str) and profile and not Path(profile).is_absolute():
+            data["offline_stats_path"] = str(
+                (Path(path).resolve().parent / profile).resolve()
+            )
         return cls(**data)
+
+    def policy_config(self):
+        return PeriodicLFUConfig(
+            offline_stats_path=self.offline_stats_path,
+            update_interval=self.update_interval,
+            min_usage=self.min_usage,
+            replacement_min_gain=self.replacement_min_gain,
+            max_swaps=self.max_swaps,
+            usage_decay=self.usage_decay,
+        )
 
     def owner_config(self, *, ep_size, ep_rank, tp_size, moe_tp_size):
         return MoEOffloadConfig(
@@ -126,4 +161,8 @@ def create_npu_offloader(path, *, hf_config, parallel, device):
     )
     if parallel.pp_size != 1 or parallel.moe_dp_size != 1:
         raise ValueError("V4 offload currently requires PP=1 and MoE DP=1")
-    return MoEOffloaderV2(config, NpuMoEBackend(settings, config, hf_config, device))
+    return MoEOffloaderV2(
+        config,
+        NpuMoEBackend(settings, config, hf_config, device),
+        periodic_lfu_config=settings.policy_config(),
+    )
