@@ -19,10 +19,24 @@ Overrides:
   SERVER_HOST=127.0.0.1 SERVER_PORT=8818 SERVED_MODEL_NAME=deepseek-v4-moe-offload
   MAX_RUNNING_REQUESTS=8 CHUNKED_PREFILL_SIZE=1024 CONTEXT_LENGTH=8192
   MEM_FRACTION_STATIC=0.8 BUILD_NATIVE=1
+  LOG_DIR (defaults to a new directory under /tmp/sglang-moe-offload)
+  LOG_LEVEL=info MOE_LOG_LEVEL=info LOG_LEVEL_HTTP=warning DECODE_LOG_INTERVAL=40
+  LOG_REQUESTS=1 LOG_REQUESTS_LEVEL=0 (metadata only) LOG_REQUESTS_FORMAT=json
+  ENABLE_TRACE=0 OTLP_TRACES_ENDPOINT=localhost:4317 OTLP_SERVICE_NAME
+  PROFILE_CAPTURE=0 (NPU graph capture profiling; explicit opt-in)
+
+Set MOE_LOG_LEVEL=debug for MoE layer/wave/copy submission logs. Each batch's
+assignment hit rate is already enabled by the offload JSON (batch_log_interval=1).
+Logs, the config snapshot and the generated logging config are saved in LOG_DIR.
+An existing SGLANG_LOGGING_CONFIG_PATH takes precedence over the generated config.
+Trace requires an OTLP collector and installed OpenTelemetry exporters. It covers
+request spans; PROFILE_CAPTURE records the NPU warmup/capture timeline instead.
 
 --dry-run prints the environment, native build and server commands without
 building, loading weights or initializing NPU devices. Budgets in the JSON are
 per rank: the default host reservation is 128 GiB/rank, 512 GiB for four ranks.
+No log directory or config snapshots are created by --dry-run. With cache_ratio>0,
+replace offline_stats_path/offline_model_id in the JSON before a real launch.
 EOF
 }
 
@@ -51,15 +65,36 @@ CONTEXT_LENGTH=${CONTEXT_LENGTH:-8192}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.8}
 BUILD_NATIVE=${BUILD_NATIVE:-1}
 MOE_OFFLOAD_CONFIG=${MOE_OFFLOAD_CONFIG:-$SGLANG_ROOT/python/sglang/srt/offloading/moe/npu/examples/v4.json}
+LOG_DIR=${LOG_DIR:-${TMPDIR:-/tmp}/sglang-moe-offload/$(date +%Y%m%d-%H%M%S)-$$}
+[[ "$LOG_DIR" == /* ]] || LOG_DIR="$PWD/$LOG_DIR"
+LOG_LEVEL=${LOG_LEVEL:-info}
+MOE_LOG_LEVEL=${MOE_LOG_LEVEL:-$LOG_LEVEL}
+LOG_LEVEL_HTTP=${LOG_LEVEL_HTTP:-warning}
+DECODE_LOG_INTERVAL=${DECODE_LOG_INTERVAL:-40}
+LOG_REQUESTS=${LOG_REQUESTS:-1}
+LOG_REQUESTS_LEVEL=${LOG_REQUESTS_LEVEL:-0}
+LOG_REQUESTS_FORMAT=${LOG_REQUESTS_FORMAT:-json}
+ENABLE_TRACE=${ENABLE_TRACE:-0}
+OTLP_TRACES_ENDPOINT=${OTLP_TRACES_ENDPOINT:-localhost:4317}
+OTLP_SERVICE_NAME=${OTLP_SERVICE_NAME:-$SERVED_MODEL_NAME}
+PROFILE_CAPTURE=${PROFILE_CAPTURE:-0}
 
 [[ -n "$MODEL_PATH" ]] || die "Set MODEL_PATH to a DeepSeek V4 native-FP4 checkpoint; see --help."
-for name in WORLD_SIZE SERVER_PORT MAX_RUNNING_REQUESTS CHUNKED_PREFILL_SIZE CONTEXT_LENGTH; do
+for name in WORLD_SIZE SERVER_PORT MAX_RUNNING_REQUESTS CHUNKED_PREFILL_SIZE CONTEXT_LENGTH DECODE_LOG_INTERVAL; do
     value=${!name}
     [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "$name must be a positive integer."
 done
 (( SERVER_PORT <= 65535 )) || die "SERVER_PORT exceeds 65535."
 (( MAX_RUNNING_REQUESTS <= 128 )) || die "MAX_RUNNING_REQUESTS must not exceed the DeepEP dispatch limit (128)."
 [[ "$BUILD_NATIVE" =~ ^[01]$ ]] || die "BUILD_NATIVE must be 0 or 1."
+for name in LOG_REQUESTS ENABLE_TRACE PROFILE_CAPTURE; do
+    [[ "${!name}" =~ ^[01]$ ]] || die "$name must be 0 or 1."
+done
+for name in LOG_LEVEL MOE_LOG_LEVEL LOG_LEVEL_HTTP; do
+    case "${!name}" in debug|info|warning|error|critical) ;; *) die "$name must be debug, info, warning, error or critical." ;; esac
+done
+[[ "$LOG_REQUESTS_LEVEL" =~ ^[0-3]$ ]] || die "LOG_REQUESTS_LEVEL must be 0, 1, 2 or 3."
+case "$LOG_REQUESTS_FORMAT" in text|json) ;; *) die "LOG_REQUESTS_FORMAT must be text or json." ;; esac
 [[ -d "$SGLANG_ROOT/python/sglang" ]] || die "Invalid SGLANG_ROOT: $SGLANG_ROOT"
 [[ -f "$MOE_OFFLOAD_CONFIG" ]] || die "Missing offload JSON: $MOE_OFFLOAD_CONFIG"
 command -v "$PYTHON_BIN" >/dev/null || die "Python executable not found: $PYTHON_BIN"
@@ -78,6 +113,30 @@ for ((i=0; i<WORLD_SIZE; i++)); do
 done
 export ASCEND_RT_VISIBLE_DEVICES
 export PYTHONPATH="$SGLANG_ROOT/python${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONUNBUFFERED=1
+export SGLANG_LOG_MS=${SGLANG_LOG_MS:-1}
+
+GENERATE_LOGGING_CONFIG=0
+if [[ -n "${SGLANG_LOGGING_CONFIG_PATH:-}" ]]; then
+    [[ -f "$SGLANG_LOGGING_CONFIG_PATH" ]] || die "Missing logging config: $SGLANG_LOGGING_CONFIG_PATH"
+else
+    export SGLANG_LOGGING_CONFIG_PATH="$LOG_DIR/logging.json"
+    GENERATE_LOGGING_CONFIG=1
+fi
+if [[ "$ENABLE_TRACE" == 1 ]]; then
+    export SGLANG_TRACE_ASYNC=${SGLANG_TRACE_ASYNC:-1}
+fi
+if [[ "$PROFILE_CAPTURE" == 1 ]]; then
+    export SGLANG_TORCH_PROFILER_DIR=${SGLANG_TORCH_PROFILER_DIR:-$LOG_DIR/profiler}
+fi
+
+if [[ "$DRY_RUN" == 0 ]]; then
+    command -v tee >/dev/null || die "tee is required for terminal and file logging."
+    mkdir -p -- "$LOG_DIR"
+    # Redirect the shell's descriptors, retaining exec, signals and server exit
+    # status. The inference process is not wrapped in a shell pipeline.
+    exec > >(tee -a "$LOG_DIR/server.log") 2>&1
+fi
 
 unset https_proxy http_proxy HTTPS_PROXY HTTP_PROXY ASCEND_LAUNCH_BLOCKING
 unset HCCL_IF_IP HCCL_SOCKET_FAMILY RANK_TABLE_FILE
@@ -124,15 +183,109 @@ export SGLANG_OPT_DEEPGEMM_HC_PRENORM=False
 export SGLANG_OPT_USE_TILELANG_MHC_POST=False
 export SGLANG_OPT_FP8_WO_A_GEMM=False
 
-NATIVE_BUILD_DIR=$("$PYTHON_BIN" - "$MOE_OFFLOAD_CONFIG" <<'PY'
+NATIVE_BUILD_DIR=$("$PYTHON_BIN" - "$MOE_OFFLOAD_CONFIG" "$DRY_RUN" "$LOG_DIR" "$LOG_LEVEL" "$MOE_LOG_LEVEL" "$GENERATE_LOGGING_CONFIG" <<'PY'
 import json
+import math
 import sys
 from pathlib import Path
 
-config = json.loads(Path(sys.argv[1]).read_text())
+source = Path(sys.argv[1]).resolve()
+dry_run = sys.argv[2] == "1"
+log_dir = Path(sys.argv[3])
+
+
+def unique(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise SystemExit("Duplicate offload configuration key: " + key)
+        result[key] = value
+    return result
+
+
+config = json.loads(source.read_text(), object_pairs_hook=unique)
+if not isinstance(config, dict):
+    raise SystemExit("Offload configuration must be a JSON object")
 directory = config.get("native_extension_directory")
 if not isinstance(directory, str) or not Path(directory).is_absolute():
     raise SystemExit("Offload JSON requires an absolute native_extension_directory")
+interval = config.get("batch_log_interval", 1)
+capacity = config.get("batch_log_capacity", 64)
+if type(interval) is not int or interval < 0:
+    raise SystemExit("batch_log_interval must be a nonnegative integer")
+if type(capacity) is not int or capacity <= 0:
+    raise SystemExit("batch_log_capacity must be a positive integer")
+ratio = config.get("cache_ratio")
+if type(ratio) not in (int, float) or not math.isfinite(ratio) or not 0 <= ratio <= 1:
+    raise SystemExit("cache_ratio must be a finite number in [0, 1]")
+profile = config.get("offline_stats_path")
+model_id = config.get("offline_model_id")
+if ratio > 0:
+    if (
+        not isinstance(profile, str)
+        or not profile
+        or not isinstance(model_id, str)
+        or not model_id
+    ):
+        raise SystemExit(
+            "cache_ratio>0 requires offline_stats_path and offline_model_id in MOE_OFFLOAD_CONFIG"
+        )
+if isinstance(profile, str) and profile:
+    profile = Path(profile)
+    profile = profile if profile.is_absolute() else source.parent / profile
+    config["offline_stats_path"] = str(profile.resolve())
+    if ratio > 0 and not dry_run and not profile.is_file():
+        raise SystemExit(
+            "Missing offline expert profile: "
+            + str(profile)
+            + "; update MOE_OFFLOAD_CONFIG before building"
+        )
+    if ratio > 0 and not dry_run:
+        statistics = json.loads(profile.read_text())
+        if not isinstance(statistics, dict) or statistics.get("model_id") != model_id:
+            raise SystemExit("Offline profile model_id must match offline_model_id")
+        if not isinstance(statistics.get("layers"), dict):
+            raise SystemExit("Offline profile must contain a layers object")
+config["batch_log_interval"] = interval
+config["batch_log_capacity"] = capacity
+print(
+    f"MoE batch logging: interval={interval} capacity={capacity}; offline profile={config.get('offline_stats_path', 'N/A')}",
+    file=sys.stderr,
+)
+if not dry_run:
+    (log_dir / "offload-config.snapshot.json").write_text(
+        json.dumps(config, indent=2) + "\n"
+    )
+    if sys.argv[6] == "1":
+        logging_config = {
+            "version": 1,
+            "disable_existing_loggers": False,
+            "formatters": {
+                "runtime": {
+                    "format": "[%(asctime)s.%(msecs)03d %(levelname)s pid=%(process)d %(name)s] %(message)s",
+                    "datefmt": "%Y-%m-%d %H:%M:%S",
+                }
+            },
+            "handlers": {
+                "console": {
+                    "class": "logging.StreamHandler",
+                    "stream": "ext://sys.stderr",
+                    "formatter": "runtime",
+                }
+            },
+            "root": {"level": sys.argv[4].upper(), "handlers": ["console"]},
+            "loggers": {
+                "sglang.srt.offloading.moe": {
+                    "level": sys.argv[5].upper(),
+                    "propagate": True,
+                },
+                "httpx": {"level": "WARNING"},
+                "httpcore": {"level": "WARNING"},
+            },
+        }
+        (log_dir / "logging.json").write_text(
+            json.dumps(logging_config, indent=2) + "\n"
+        )
 print(directory)
 PY
 )
@@ -158,10 +311,30 @@ SERVER_CMD=(
     --context-length "$CONTEXT_LENGTH" --mem-fraction-static "$MEM_FRACTION_STATIC"
     --watchdog-timeout 9000 --enable-metrics --load-balance-method round_robin
     --moe-offload-config "$MOE_OFFLOAD_CONFIG"
+    --log-level "$LOG_LEVEL" --log-level-http "$LOG_LEVEL_HTTP"
+    --decode-log-interval "$DECODE_LOG_INTERVAL"
 )
+if [[ "$LOG_REQUESTS" == 1 ]]; then
+    SERVER_CMD+=(--log-requests --log-requests-level "$LOG_REQUESTS_LEVEL" --log-requests-format "$LOG_REQUESTS_FORMAT" --log-requests-target stdout)
+fi
+if [[ "$ENABLE_TRACE" == 1 ]]; then
+    SERVER_CMD+=(--enable-trace --trace-modules request --otlp-traces-endpoint "$OTLP_TRACES_ENDPOINT" --otlp-service-name "$OTLP_SERVICE_NAME")
+fi
+if [[ "$PROFILE_CAPTURE" == 1 ]]; then
+    SERVER_CMD+=(--enable-profile-cuda-graph)
+fi
 
 printf 'WORLD_SIZE=%s TP=%s EP=%s DP=1 DEVICES=%s\n' "$WORLD_SIZE" "$WORLD_SIZE" "$WORLD_SIZE" "$ASCEND_RT_VISIBLE_DEVICES"
 printf 'Offload JSON: %s\nNative build: %s\n' "$MOE_OFFLOAD_CONFIG" "$NATIVE_BUILD_DIR"
+printf 'Log directory: %s\nLogging config: %s\n' "$LOG_DIR" "$SGLANG_LOGGING_CONFIG_PATH"
+printf 'Logging: root=%s MoE=%s requests=%s request_level=%s decode_interval=%s\n' "$LOG_LEVEL" "$MOE_LOG_LEVEL" "$LOG_REQUESTS" "$LOG_REQUESTS_LEVEL" "$DECODE_LOG_INTERVAL"
+printf 'Request trace=%s endpoint=%s; graph capture profile=%s\n' "$ENABLE_TRACE" "$OTLP_TRACES_ENDPOINT" "$PROFILE_CAPTURE"
+if [[ "$PROFILE_CAPTURE" == 1 ]]; then
+    printf 'Capture profile directory: %s\n' "$SGLANG_TORCH_PROFILER_DIR"
+fi
+if [[ "$GENERATE_LOGGING_CONFIG" == 0 ]]; then
+    printf 'Custom SGLANG_LOGGING_CONFIG_PATH controls logger levels.\n'
+fi
 if [[ "$BUILD_NATIVE" == 1 ]]; then printf '%q ' "${BUILD_CMD[@]}"; printf '\n'; fi
 printf '%q ' "${SERVER_CMD[@]}"; printf '\n'
 [[ "$DRY_RUN" == 0 ]] || exit 0
@@ -174,7 +347,9 @@ from pathlib import Path
 model = Path(sys.argv[1])
 config = json.loads((model / "config.json").read_text())
 if config.get("model_type") != "deepseek_v4":
-    raise SystemExit("MODEL_PATH must be DeepSeek V4 native FP4; GLM/modelslim is unsupported")
+    raise SystemExit(
+        "MODEL_PATH must be DeepSeek V4 native FP4; GLM/modelslim is unsupported"
+    )
 experts = config.get("n_routed_experts", 0)
 if not isinstance(experts, int) or experts <= 0 or experts % int(sys.argv[2]):
     raise SystemExit("n_routed_experts must divide evenly across WORLD_SIZE")
@@ -182,5 +357,9 @@ if not any(model.glob("*.safetensors")):
     raise SystemExit("MODEL_PATH contains no local safetensors checkpoint")
 PY
 
+if [[ "$ENABLE_TRACE" == 1 ]]; then
+    "$PYTHON_BIN" -c 'import opentelemetry.sdk.trace; import opentelemetry.exporter.otlp.proto.grpc.trace_exporter; import opentelemetry.exporter.otlp.proto.http.trace_exporter' \
+        || die "ENABLE_TRACE=1 requires the OpenTelemetry SDK and OTLP gRPC/HTTP exporters in PYTHON_BIN."
+fi
 if [[ "$BUILD_NATIVE" == 1 ]]; then "${BUILD_CMD[@]}"; fi
 exec "${SERVER_CMD[@]}"

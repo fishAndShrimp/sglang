@@ -16,5 +16,7 @@
   "workspace_limit_bytes": 8589934592,
   "metadata_limit_bytes": 1073741824,
   "max_dispatch_rows": 32768,
+  "batch_log_interval": 1,
+  "batch_log_capacity": 64,
   "native_extension_directory": "/tmp/sglang-moe-acl"
 }

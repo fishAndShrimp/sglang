@@ -52,3 +52,7 @@ decode wave 的 Python DEBUG 日志发生于 warmup/capture，不会每次 repla
 
 `submit/emit` 表示工作已提交或图节点已发出，不表示设备已完成。日志不打印 Tensor、
 不读取逐层设备 counts；跨流性能与设备时间仍应通过目标机 NPU trace 验证。
+
+启动脚本已显式配置 batch 日志默认值，默认保存控制台日志与配置快照。可用
+`MOE_LOG_LEVEL=debug` 单独打开本包 DEBUG；全局级别仍由 `LOG_LEVEL` 控制。
+请求 trace、NPU capture profile 与目录参数参见 [启动脚本说明](README.zh-CN.md)。

@@ -86,6 +86,41 @@ FP8/V4 量化配置入口，routed experts 由原生 FP4 method 接管；明确�
 它不带 EAGLE、DP attention 或 HiCache 参数，关闭 overlap；GLM-5.2/modelslim 权重
 不适用于当前后端，实际启动时会在构建扩展前检查 `model_type` 和 EP 可整除性。
 
+默认 JSON 的 `offline_stats_path` 是占位符。非零 cache_ratio 必须提供真实 profile，
+`offline_model_id` 与 profile 的 `model_id` 一致；相对路径以 JSON 所在目录解析。
+脚本在构建扩展前检查文件和 ID，格式参见 [周期缓存配置](PERIODIC_CACHE_1022.zh-CN.md)。
+
+日志默认落盘到新建的 `${TMPDIR:-/tmp}/sglang-moe-offload/<时间>-<PID>/server.log`，同时输出到终端。
+同目录保存 offload 配置快照和 logging.json；可用 `LOG_DIR` 指定持久目录。脚本保留
+server 的 exec、信号和退出码，不将 server 放入 shell pipeline。
+默认 root/MoE 日志为 INFO，HTTP 为 WARNING，每 batch MoE 命中率已开启；
+普通 SGLang decode 汇总保持原有 40 步间隔，`DECODE_LOG_INTERVAL=1` 可逐步打印。
+
+首轮调通可只打开 MoE DEBUG，不增加其他模块的 DEBUG 输出：
+
+```bash
+MODEL_PATH=/models/DeepSeek-V4-Flash \
+MOE_OFFLOAD_CONFIG=/configs/moe-offload.json \
+MOE_LOG_LEVEL=debug LOG_DIR=/tmp/moe-offload-debug \
+  bash scripts/launch_moe_offload_npu.sh
+```
+
+默认 `LOG_REQUESTS=1`、`LOG_REQUESTS_LEVEL=0`、`LOG_REQUESTS_FORMAT=json`，记录请求
+元数据；`LOG_REQUESTS=0` 可关闭。`SGLANG_LOGGING_CONFIG_PATH` 如已设置则优先使用，
+脚本不会覆盖它，此时 logger 级别由该文件控制。
+
+需要请求链路追踪时，另设置 `ENABLE_TRACE=1 OTLP_TRACES_ENDPOINT=localhost:4317`；
+须已有对应协议的 OTLP collector 和 OpenTelemetry SDK/exporters。trace 默认采用
+异步 exporter（尊重已有 `SGLANG_TRACE_ASYNC`），不隐式安装依赖或启动 collector。
+需要 NPU Graph warmup/capture 时间线时单独设置 `PROFILE_CAPTURE=1`，结果写入
+`SGLANG_TORCH_PROFILER_DIR/graph_capture_profile`，默认位于本次 LOG_DIR/profiler 下。
+请求 trace 与 capture profiling 默认关闭；capture profile 不代表稳定态 replay 的时间线。
+日志与采集均有开销，性能测量时关闭 DEBUG/trace/profiling 并按需调低 batch 日志频率。
+`ASCEND_LAUNCH_BLOCKING` 继续清除，`TASK_QUEUE_ENABLE=1` 保持不变。
+
+`--dry-run` 打印计划路径、开关和命令，不创建日志目录，不加载 profile/权重或 NPU；
+真实启动才检查 profile 文件及其 model ID，并在启用 trace 时检查 exporter 依赖。
+
 ### 手动构建与启动
 
 ```bash
