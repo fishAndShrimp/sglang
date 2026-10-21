@@ -127,6 +127,13 @@ class MoEOffloaderV2(BaseOffloader):
             self._failed = True
             raise
 
+    def bind_graph_backend(self, backend, graph_runner):
+        if not self._installed or self._failed or self._closed:
+            raise RuntimeError("Bind MoE model hooks before graph capture")
+        from .graph import GraphLeaseBackend
+
+        return GraphLeaseBackend(backend, self.owner, graph_runner)
+
     def forward_scope(self, forward_batch):
         if not self._installed or self._failed or self._closed:
             raise RuntimeError("MoE runtime/model hooks have not been bound")

@@ -500,6 +500,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # --- backend ---------------------------------------------------
         self.backend = resolve_decode_backend(self)
+        if not model_runner.is_draft_worker:
+            self.backend = model_runner.offloader.bind_graph_backend(self.backend, self)
 
         # --- capture --------------------------------------------------
         try:

@@ -1,0 +1,637 @@
+"""Fixed-capacity tensor residency planning, independent of weight transport.
+
+All persistent plans and arithmetic scratch are allocated at binding time. The
+operations below never read device values in Python. Capture/operator support is
+still a hardware-runtime obligation; this class alone does not certify a graph.
+The runtime must execute these operations on ``context.compute_stream``, serialize
+forwards and call ``begin_step`` once at the beginning of the complete graph.
+"""
+
+from dataclasses import dataclass
+
+import torch
+
+from ..transfer import CopySourceKind, DeviceCopyPlan, HostCopyPlan, TransferTicket
+from .config import ExpertWave, Phase
+from .execution import ExecutionReservation, SourcePolicy, UpdatePlan, require_prefill
+from .interfaces import ResidencyOps
+from .resources import Allocation, ResourceKind
+
+
+@dataclass(frozen=True)
+class BoundExecutionWave:
+    """Static wave-to-bank binding; multiple waves may reuse an execution range.
+
+    ``bindings`` is the transport/FFN's caller-owned bank binding. Its shared
+    error_status must be the same scalar passed to TensorResidencyOps. Consumers
+    must honor state.execution_valid (and the sticky device error status).
+    """
+
+    layer_id: int
+    wave: ExpertWave
+    execution_start: int
+    bindings: object
+
+
+@dataclass
+class _Reservation:
+    owner: object
+    context: object
+    buffers: object
+    prefill: bool = False
+    published: bool = False
+    retired: bool = False
+
+
+class TensorResidencyOps(ResidencyOps):
+    """Canonical hit/miss plans and transactional, survivor-preserving hot updates.
+
+    local_demand is a rank-local int32/int64 vector of post-dispatch token-expert
+    counts, one entry per local expert. Each fixed wave contributes its slice
+    exactly once. Temporary execution never admits experts into the hot pool.
+
+    prepare_prefill(request, context), when supplied, returns an eager
+    ExecutionReservation with a HostCopyPlan and protected bank bindings. It owns
+    dynamic A/B/a offsets and old-reader dependencies. Prefill never changes the
+    decode residency metadata or statistics.
+    """
+
+    def __init__(
+        self,
+        state,
+        catalog,
+        *,
+        execution_waves,
+        update_bindings,
+        error_status=None,
+        prepare_prefill=None,
+    ):
+        self.state, self.catalog = state, catalog
+        self.update_bindings = update_bindings
+        self.prepare_prefill = prepare_prefill
+        self._owned = {}
+        self._token = object()
+        self._readers = {}
+        self._pending_update = None
+        self.device = state.key_to_slot.device
+        self.num_experts = catalog.num_experts
+        self.hot_slots = state.slot_to_key.numel()
+        self.execution_slots = state.execution_key.numel()
+        self._validate_state()
+        self.error_status = (
+            self._tensor("error_status", (), torch.int32)
+            if error_status is None
+            else error_status
+        )
+        self._validate_tensor(self.error_status, (), torch.int32, "error_status")
+        self._healthy = self._tensor("healthy", (), torch.bool)
+        self._error_code = self._tensor("error_code", (), torch.int32)
+        self._bad = self._tensor("bad", (), torch.bool)
+        self._invalid = self._tensor("constant.invalid", (), fill=-1)
+        self._zero = self._tensor("constant.none", (), fill=int(CopySourceKind.NONE))
+        self._host = self._tensor("constant.host", (), fill=int(CopySourceKind.HOST))
+        self._hot = self._tensor("constant.hot", (), fill=int(CopySourceKind.HOT_SLOT))
+        self._key_sentinel = self._tensor(
+            "constant.key_sentinel", (), fill=self.num_experts
+        )
+        self._slot_sentinel = self._tensor(
+            "constant.slot_sentinel", (), fill=self.hot_slots
+        )
+        self._waves = {}
+        self._banks = {}
+        self._layers = {layer.layer_id: layer for layer in catalog.offloaded_layers}
+        self._check_bindings(update_bindings)
+        for bound in execution_waves:
+            self._bind_wave(bound)
+        banks = tuple(self._banks.values())
+        for index, (start, size) in enumerate(banks):
+            for other_start, other_size in banks[index + 1 :]:
+                if max(start, other_start) < min(
+                    start + size, other_start + other_size
+                ):
+                    raise ValueError("Distinct execution banks cannot overlap")
+        self._tail = self._allocate_tail()
+
+    def _tensor(self, name, shape, dtype=torch.int64, fill=0):
+        if name in self._owned:
+            raise ValueError("Duplicate residency metadata binding: " + name)
+        tensor = torch.full(shape, fill, dtype=dtype, device=self.device)
+        self._owned[name] = tensor
+        return tensor
+
+    def _validate_tensor(self, tensor, shape, dtype, name):
+        if (
+            not isinstance(tensor, torch.Tensor)
+            or tuple(tensor.shape) != tuple(shape)
+            or tensor.dtype != dtype
+            or tensor.device != self.device
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError(f"Invalid fixed tensor binding: {name}")
+
+    def _validate_state(self):
+        if self.num_experts <= 0 or self.hot_slots > self.num_experts:
+            raise ValueError("Invalid residency capacities")
+        for name, shape, dtype in (
+            ("key_to_slot", (self.num_experts,), torch.int64),
+            ("slot_to_key", (self.hot_slots,), torch.int64),
+            ("slot_valid", (self.hot_slots,), torch.bool),
+            ("slot_generation", (self.hot_slots,), torch.int64),
+            ("execution_key", (self.execution_slots,), torch.int64),
+            ("execution_valid", (self.execution_slots,), torch.bool),
+            ("step_access_count", (self.num_experts,), torch.int64),
+            ("update_enabled", (), torch.bool),
+        ):
+            self._validate_tensor(getattr(self.state, name), shape, dtype, name)
+
+    def _check_bindings(self, bindings):
+        status = getattr(bindings, "error_status", self.error_status)
+        if status is not self.error_status:
+            raise ValueError("Transport and residency must share error_status")
+        generations = getattr(bindings, "hot_generations", self.state.slot_generation)
+        if generations is not self.state.slot_generation:
+            raise ValueError("Transport must read canonical slot generations")
+
+    def _plan(self, prefix, capacity):
+        return DeviceCopyPlan(
+            self._tensor(prefix + ".source_kind", (capacity,)),
+            self._tensor(prefix + ".source_index", (capacity,), fill=-1),
+            self._tensor(prefix + ".destination_slot", (capacity,)),
+            self._tensor(prefix + ".valid", (capacity,), torch.bool),
+            self._tensor(prefix + ".expected_generation", (capacity,), fill=-1),
+            self._tensor(prefix + ".count", (), torch.int32),
+            capacity,
+        )
+
+    def _bind_wave(self, bound):
+        if not isinstance(bound, BoundExecutionWave):
+            raise TypeError("execution_waves requires BoundExecutionWave records")
+        layer = self._layers.get(bound.layer_id)
+        wave = bound.wave
+        if (
+            layer is None
+            or not isinstance(wave, ExpertWave)
+            or not 0 <= wave.local_start < wave.local_end <= layer.local_experts
+            or wave.bank < 0
+            or wave.index < 0
+        ):
+            raise ValueError("Invalid bound execution wave")
+        size = wave.local_end - wave.local_start
+        if not 0 <= bound.execution_start <= self.execution_slots - size:
+            raise ValueError("Execution wave exceeds its explicitly allocated bank")
+        old_bank = self._banks.get(wave.bank)
+        if old_bank is not None and old_bank[0] != bound.execution_start:
+            raise ValueError("One execution bank must keep its physical offset")
+        self._banks[wave.bank] = (
+            bound.execution_start,
+            max(size, old_bank[1] if old_bank else 0),
+        )
+        key = (bound.layer_id, wave)
+        if key in self._waves:
+            raise ValueError("Duplicate execution wave binding")
+        self._check_bindings(bound.bindings)
+        prefix = f"wave.{bound.layer_id}.{wave.index}.{wave.bank}"
+        buf = {"bound": bound, "layer": layer, "plan": self._plan(prefix, size)}
+        for name in ("keys", "slots", "safe_slots", "slot_keys", "counts", "frequency"):
+            buf[name] = self._tensor(prefix + "." + name, (size,))
+        for name in ("needed", "hit", "flag", "flag2", "published_valid"):
+            buf[name] = self._tensor(prefix + "." + name, (size,), torch.bool)
+        first = self.catalog.key(bound.layer_id, wave.local_start)
+        torch.arange(first, first + size, out=buf["keys"])
+        torch.arange(
+            bound.execution_start,
+            bound.execution_start + size,
+            out=buf["plan"].destination_slot,
+        )
+        self._waves[key] = buf
+
+    def _allocate_tail(self):
+        h = self.hot_slots
+        buf = {"plan": self._plan("tail.plan", h)}
+        for name in (
+            "target",
+            "safe_target",
+            "marks",
+            "slots",
+            "safe_slots",
+            "slot_keys",
+            "old_keys",
+            "new_rank",
+            "rank_index",
+            "new_values",
+            "free_rank",
+            "safe_rank",
+            "proposed",
+            "generation",
+            "inverse_keys",
+            "inverse_values",
+        ):
+            buf[name] = self._tensor("tail." + name, (h,))
+        for name in (
+            "valid",
+            "flag",
+            "flag2",
+            "survivor_target",
+            "new",
+            "survivor_slot",
+            "free",
+            "changed",
+            "proposed_valid",
+        ):
+            buf[name] = self._tensor("tail." + name, (h,), torch.bool)
+        buf["membership"] = self._tensor("tail.membership", (self.num_experts + 1,))
+        buf["duplicate"] = self._tensor(
+            "tail.duplicate", (self.num_experts,), torch.bool
+        )
+        buf["inverse"] = self._tensor("tail.inverse", (self.num_experts + 1,))
+        buf["new_keys"] = self._tensor("tail.new_keys", (h + 1,))
+        buf["new_count"] = self._tensor("tail.new_count", ())
+        buf["enabled"] = self._tensor("tail.enabled", (), torch.bool)
+        torch.arange(h, out=buf["plan"].destination_slot)
+        return buf
+
+    def allocations(self):
+        """All owned metadata/scratch; external state/bindings are reported separately."""
+        return tuple(
+            Allocation(
+                "tensor_residency." + name,
+                ResourceKind.METADATA,
+                tensor.untyped_storage().nbytes(),
+                (str(tensor.device), tensor.untyped_storage().data_ptr()),
+                tensor,
+            )
+            for name, tensor in self._owned.items()
+            if tensor.numel()
+        )
+
+    @property
+    def metadata_nbytes(self):
+        return sum(item.nbytes for item in self.allocations())
+
+    def _latch(self, bad):
+        self._error_code.copy_(bad)
+        self.error_status.bitwise_or_(self._error_code)
+        torch.eq(self.error_status, 0, out=self._healthy)
+
+    def begin_step(self, context):
+        if context.phase is Phase.PREFILL:
+            require_prefill(context)
+            return
+        if context.phase is not Phase.DECODE:
+            raise ValueError("Unsupported phase")
+        context.retain(self)
+        self.state.step_access_count.zero_()
+        # Cross-forward reuse is protected by the owner's resources_idle join.
+        self._readers.clear()
+
+    def resolve_execution(self, request, context):
+        if request.phase is not context.phase:
+            raise ValueError("Execution request phase does not match context")
+        context.retain((self, request))
+        if request.phase is Phase.PREFILL:
+            require_prefill(context)
+            if self.prepare_prefill is None:
+                raise NotImplementedError(
+                    "Bind the eager host-bank planner for prefill"
+                )
+            reservation = self.prepare_prefill(request, context)
+            if not isinstance(reservation, ExecutionReservation) or not isinstance(
+                reservation.copy_plan, HostCopyPlan
+            ):
+                raise TypeError(
+                    "Prefill planner must return a host ExecutionReservation"
+                )
+            context.retain(reservation)
+            token = _Reservation(self._token, context, reservation, prefill=True)
+            return ExecutionReservation(
+                reservation.copy_plan,
+                reservation.bindings,
+                reservation.copy_dependencies,
+                (reservation,),
+                token,
+            )
+        if (
+            request.phase is not Phase.DECODE
+            or request.source_policy is not SourcePolicy.PREFER_RESIDENT
+        ):
+            raise ValueError("Decode requires resident-preferred device planning")
+        buf = self._waves.get((request.layer_id, request.wave))
+        if buf is None:
+            raise ValueError("Bind every decode wave before capture")
+        demand = request.local_demand
+        if (
+            not isinstance(demand, torch.Tensor)
+            or demand.shape != (buf["layer"].local_experts,)
+            or demand.dtype not in (torch.int32, torch.int64)
+            or demand.device != self.device
+        ):
+            raise ValueError(
+                "Post-dispatch demand must contain one count per local expert"
+            )
+        bound, plan = buf["bound"], buf["plan"]
+        reader = self._readers.get(bound.wave.bank)
+        if reader is not None:
+            reader.completion.wait_on(context.compute_stream)
+        start, end = request.wave.local_start, request.wave.local_end
+        buf["counts"].copy_(demand[start:end])
+        buf["counts"].clamp_(min=0, max=torch.iinfo(torch.int64).max // 4)
+        torch.gt(buf["counts"], 0, out=buf["needed"])
+        torch.index_select(self.state.key_to_slot, 0, buf["keys"], out=buf["slots"])
+        torch.ge(buf["slots"], 0, out=buf["hit"])
+        if self.hot_slots:
+            torch.ge(buf["slots"], self.hot_slots, out=buf["flag"])
+            torch.lt(buf["slots"], -1, out=buf["flag2"])
+            torch.logical_or(buf["flag"], buf["flag2"], out=buf["flag"])
+            torch.any(buf["flag"], out=self._bad)
+            self._latch(self._bad)
+            torch.clamp(buf["slots"], 0, self.hot_slots - 1, out=buf["safe_slots"])
+            torch.index_select(
+                self.state.slot_valid, 0, buf["safe_slots"], out=buf["flag"]
+            )
+            torch.index_select(
+                self.state.slot_to_key, 0, buf["safe_slots"], out=buf["slot_keys"]
+            )
+            torch.eq(buf["slot_keys"], buf["keys"], out=buf["flag2"])
+            torch.logical_and(buf["flag"], buf["flag2"], out=buf["flag"])
+            torch.logical_not(buf["flag"], out=buf["flag2"])
+            torch.logical_and(buf["hit"], buf["flag2"], out=buf["flag2"])
+            torch.any(buf["flag2"], out=self._bad)
+            self._latch(self._bad)
+            torch.logical_and(buf["hit"], buf["flag"], out=buf["hit"])
+            torch.index_select(
+                self.state.slot_generation,
+                0,
+                buf["safe_slots"],
+                out=plan.expected_generation,
+            )
+        else:
+            torch.ne(buf["slots"], -1, out=buf["flag"])
+            torch.any(buf["flag"], out=self._bad)
+            self._latch(self._bad)
+            buf["hit"].zero_()
+            plan.expected_generation.fill_(-1)
+        torch.logical_and(buf["needed"], self._healthy, out=plan.valid)
+        torch.where(buf["hit"], buf["slots"], buf["keys"], out=plan.source_index)
+        torch.where(buf["hit"], self._hot, self._host, out=plan.source_kind)
+        torch.where(plan.valid, plan.source_kind, self._zero, out=plan.source_kind)
+        torch.where(
+            buf["hit"],
+            plan.expected_generation,
+            self._invalid,
+            out=plan.expected_generation,
+        )
+        torch.sum(plan.valid, dim=0, dtype=torch.int32, out=plan.count)
+        key_start = self.catalog.key(request.layer_id, start)
+        counts = self.state.step_access_count[key_start : key_start + plan.capacity]
+        torch.add(counts, buf["counts"], out=buf["frequency"])
+        torch.clamp(buf["frequency"], max=torch.iinfo(torch.int64).max // 4, out=counts)
+        self.state.execution_valid[
+            bound.execution_start : bound.execution_start + plan.capacity
+        ].zero_()
+        ready = context.record_compute_completion()
+        context.retain(ready)
+        return ExecutionReservation(
+            plan,
+            bound.bindings,
+            (ready.completion,),
+            (self, buf, ready),
+            _Reservation(self._token, context, buf),
+        )
+
+    def _check(self, reservation, context):
+        token = reservation.state
+        if (
+            not isinstance(token, _Reservation)
+            or token.owner is not self._token
+            or token.context is not context
+        ):
+            raise ValueError("Foreign residency reservation or invocation")
+        return token
+
+    def publish_execution(self, reservation, weights_ready, context):
+        token = self._check(reservation, context)
+        if token.published or token.retired:
+            raise RuntimeError("Execution reservation already published or retired")
+        if not isinstance(weights_ready, TransferTicket):
+            raise TypeError("Publication requires a complete bundle ticket")
+        context.retain((reservation, weights_ready))
+        if token.prefill:
+            # The worker publishes only host-static bindings. Waiting on compute
+            # here would serialize Attention/Router behind the prefetch. The
+            # local program joins this ticket immediately before its FFN.
+            token.published = True
+            ticket = TransferTicket(
+                weights_ready.completion, (weights_ready, reservation)
+            )
+            context.retain(ticket)
+            return ticket
+        weights_ready.completion.wait_on(context.compute_stream)
+        if not token.prefill:
+            buf, plan = token.buffers, reservation.copy_plan
+            torch.eq(self.error_status, 0, out=self._healthy)
+            torch.logical_and(plan.valid, self._healthy, out=buf["published_valid"])
+            first = buf["bound"].execution_start
+            torch.where(
+                buf["published_valid"],
+                buf["keys"],
+                self._invalid,
+                out=self.state.execution_key[first : first + plan.capacity],
+            )
+            self.state.execution_valid[first : first + plan.capacity].copy_(
+                buf["published_valid"]
+            )
+        token.published = True
+        ticket = context.record_compute_completion()
+        context.retain(ticket)
+        return ticket
+
+    def finish_execution(self, reservation, read_done, context):
+        token = self._check(reservation, context)
+        if not token.published or token.retired:
+            raise RuntimeError("Execution must be published and retired exactly once")
+        if not isinstance(read_done, TransferTicket):
+            raise TypeError("Reader completion must be a TransferTicket")
+        context.retain((reservation, read_done))
+        if not token.prefill:
+            self._readers[token.buffers["bound"].wave.bank] = read_done
+        token.retired = True
+
+    def _inverse(self, keys, valid, buf):
+        torch.where(valid, keys, self._key_sentinel, out=buf["inverse_keys"])
+        buf["inverse_keys"].clamp_(0, self.num_experts)
+        torch.add(buf["plan"].destination_slot, 1, out=buf["inverse_values"])
+        torch.where(valid, buf["inverse_values"], self._zero, out=buf["inverse_values"])
+        buf["inverse"].zero_()
+        buf["inverse"].scatter_add_(0, buf["inverse_keys"], buf["inverse_values"])
+        buf["inverse"].sub_(1)
+
+    def prepare_update(self, target_keys, context):
+        if context.phase is not Phase.DECODE:
+            raise RuntimeError("Hot updates are decode-only")
+        self._validate_tensor(
+            target_keys, (self.hot_slots,), torch.int64, "target_keys"
+        )
+        if self._pending_update is not None:
+            raise RuntimeError("Finish the previous update before reserving another")
+        context.retain((self, target_keys))
+        b, s, h = self._tail, self.state, self.hot_slots
+        p = b["plan"]
+        b["enabled"].copy_(s.update_enabled)
+        b["target"].copy_(target_keys)
+        if h:
+            # A stale invalid slot may keep its old key, but every valid slot
+            # must have exactly one consistent inverse mapping.
+            torch.ge(s.slot_to_key, 0, out=b["valid"])
+            torch.lt(s.slot_to_key, self.num_experts, out=b["flag"])
+            torch.logical_and(b["valid"], b["flag"], out=b["valid"])
+            torch.logical_not(b["valid"], out=b["flag"])
+            torch.logical_and(b["flag"], s.slot_valid, out=b["flag"])
+            torch.any(b["flag"], out=self._bad)
+            self._latch(self._bad)
+            torch.logical_and(b["valid"], s.slot_valid, out=b["valid"])
+            torch.where(
+                b["valid"], s.slot_to_key, self._key_sentinel, out=b["inverse_keys"]
+            )
+            b["marks"].copy_(b["valid"])
+            b["membership"].zero_()
+            b["membership"].scatter_add_(0, b["inverse_keys"], b["marks"])
+            torch.gt(b["membership"][: self.num_experts], 1, out=b["duplicate"])
+            torch.any(b["duplicate"], out=self._bad)
+            self._latch(self._bad)
+            self._inverse(s.slot_to_key, b["valid"], b)
+            torch.ne(
+                b["inverse"][: self.num_experts], s.key_to_slot, out=b["duplicate"]
+            )
+            torch.any(b["duplicate"], out=self._bad)
+            self._latch(self._bad)
+            torch.ge(target_keys, 0, out=b["valid"])
+            torch.lt(target_keys, self.num_experts, out=b["flag"])
+            torch.logical_and(b["valid"], b["flag"], out=b["valid"])
+            torch.lt(target_keys, -1, out=b["flag"])
+            torch.ge(target_keys, self.num_experts, out=b["flag2"])
+            torch.logical_or(b["flag"], b["flag2"], out=b["flag"])
+            torch.any(b["flag"], out=self._bad)
+            torch.logical_and(self._bad, b["enabled"], out=self._bad)
+            self._latch(self._bad)
+            torch.where(
+                b["valid"], target_keys, self._key_sentinel, out=b["safe_target"]
+            )
+            b["marks"].copy_(b["valid"])
+            b["membership"].zero_()
+            b["membership"].scatter_add_(0, b["safe_target"], b["marks"])
+            torch.gt(b["membership"][: self.num_experts], 1, out=b["duplicate"])
+            torch.any(b["duplicate"], out=self._bad)
+            torch.logical_and(self._bad, b["enabled"], out=self._bad)
+            self._latch(self._bad)
+            torch.logical_and(b["enabled"], self._healthy, out=b["enabled"])
+            torch.clamp(target_keys, 0, self.num_experts - 1, out=b["safe_target"])
+            torch.index_select(s.key_to_slot, 0, b["safe_target"], out=b["slots"])
+            torch.clamp(b["slots"], 0, h - 1, out=b["safe_slots"])
+            torch.index_select(
+                s.slot_valid, 0, b["safe_slots"], out=b["survivor_target"]
+            )
+            torch.ge(b["slots"], 0, out=b["flag"])
+            torch.logical_and(b["survivor_target"], b["flag"], out=b["survivor_target"])
+            torch.index_select(s.slot_to_key, 0, b["safe_slots"], out=b["slot_keys"])
+            torch.eq(b["slot_keys"], target_keys, out=b["flag"])
+            torch.logical_and(b["survivor_target"], b["flag"], out=b["survivor_target"])
+            torch.logical_not(b["survivor_target"], out=b["new"])
+            torch.logical_and(b["new"], b["valid"], out=b["new"])
+            b["marks"].copy_(b["new"])
+            torch.cumsum(b["marks"], 0, out=b["new_rank"])
+            b["new_rank"].sub_(1)
+            torch.sum(b["marks"], dim=0, out=b["new_count"])
+            torch.where(
+                b["new"], b["new_rank"], self._slot_sentinel, out=b["rank_index"]
+            )
+            torch.add(target_keys, 1, out=b["new_values"])
+            torch.where(b["new"], b["new_values"], self._zero, out=b["new_values"])
+            b["new_keys"].zero_()
+            b["new_keys"].scatter_add_(0, b["rank_index"], b["new_values"])
+            b["new_keys"].sub_(1)
+            torch.clamp(s.slot_to_key, 0, self.num_experts, out=b["old_keys"])
+            torch.index_select(b["membership"], 0, b["old_keys"], out=b["marks"])
+            torch.gt(b["marks"], 0, out=b["survivor_slot"])
+            torch.logical_and(b["survivor_slot"], s.slot_valid, out=b["survivor_slot"])
+            torch.ge(s.slot_to_key, 0, out=b["flag"])
+            torch.logical_and(b["survivor_slot"], b["flag"], out=b["survivor_slot"])
+            torch.logical_not(b["survivor_slot"], out=b["free"])
+            b["marks"].copy_(b["free"])
+            torch.cumsum(b["marks"], 0, out=b["free_rank"])
+            b["free_rank"].sub_(1)
+            torch.clamp(b["free_rank"], 0, h, out=b["safe_rank"])
+            torch.index_select(b["new_keys"], 0, b["safe_rank"], out=b["proposed"])
+            torch.lt(b["free_rank"], b["new_count"], out=b["flag"])
+            torch.where(b["flag"], b["proposed"], self._invalid, out=b["proposed"])
+            torch.where(
+                b["survivor_slot"], s.slot_to_key, b["proposed"], out=b["proposed"]
+            )
+            torch.where(b["enabled"], b["proposed"], s.slot_to_key, out=b["proposed"])
+            torch.ge(b["proposed"], 0, out=b["proposed_valid"])
+            torch.logical_not(s.slot_valid, out=b["flag"])
+            torch.logical_and(b["flag"], b["proposed_valid"], out=b["flag"])
+            torch.ne(b["proposed"], s.slot_to_key, out=b["changed"])
+            torch.logical_or(b["changed"], b["flag"], out=b["changed"])
+            torch.logical_and(b["changed"], b["enabled"], out=b["changed"])
+            b["marks"].copy_(b["changed"])
+            torch.add(s.slot_generation, b["marks"], out=b["generation"])
+            torch.ge(b["proposed"], 0, out=b["proposed_valid"])
+            torch.logical_and(b["changed"], b["proposed_valid"], out=p.valid)
+            p.source_index.copy_(b["proposed"])
+            torch.where(p.valid, self._host, self._zero, out=p.source_kind)
+            p.expected_generation.copy_(b["generation"])
+            torch.sum(p.valid, dim=0, dtype=torch.int32, out=p.count)
+            # Victims cease being sources before writes begin. New keys are only
+            # visible after complete-bundle copy AND metadata publication.
+            torch.logical_not(b["changed"], out=b["flag"])
+            torch.logical_and(s.slot_valid, b["flag"], out=b["survivor_slot"])
+            self._inverse(s.slot_to_key, b["survivor_slot"], b)
+            torch.where(
+                b["enabled"],
+                b["inverse"][: self.num_experts],
+                s.key_to_slot,
+                out=s.key_to_slot,
+            )
+            s.slot_valid.copy_(b["survivor_slot"])
+            s.slot_generation.copy_(b["generation"])
+        else:
+            p.count.zero_()
+        ready = context.record_compute_completion()
+        context.retain(ready)
+        token = _Reservation(self._token, context, b)
+        self._pending_update = token
+        return UpdatePlan(
+            p, self.update_bindings, (ready.completion,), (self, ready), token
+        )
+
+    def commit_update(self, update_plan, weights_ready, context):
+        token = self._check(update_plan, context)
+        if token is not self._pending_update or token.published:
+            raise RuntimeError("Hot update must commit exactly once")
+        if not isinstance(weights_ready, TransferTicket):
+            raise TypeError("Hot publication requires a complete bundle ticket")
+        context.retain((update_plan, weights_ready))
+        weights_ready.completion.wait_on(context.compute_stream)
+        b, s = self._tail, self.state
+        if self.hot_slots:
+            torch.ne(s.slot_generation, b["generation"], out=b["flag"])
+            torch.logical_and(b["flag"], b["enabled"], out=b["flag"])
+            torch.any(b["flag"], out=self._bad)
+            self._latch(self._bad)
+            torch.logical_and(b["enabled"], self._healthy, out=b["enabled"])
+            self._inverse(b["proposed"], b["proposed_valid"], b)
+            torch.where(b["enabled"], b["proposed"], s.slot_to_key, out=s.slot_to_key)
+            torch.where(
+                b["enabled"], b["proposed_valid"], s.slot_valid, out=s.slot_valid
+            )
+            torch.where(
+                b["enabled"],
+                b["inverse"][: self.num_experts],
+                s.key_to_slot,
+                out=s.key_to_slot,
+            )
+        token.published = True
+        self._pending_update = None
+        ticket = context.record_compute_completion()
+        context.retain(ticket)
+        return ticket

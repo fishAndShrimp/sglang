@@ -51,6 +51,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         enable_memory_saver: bool = False,
     ) -> None:
         self._graphs: Dict[Any, Any] = {}
+        self._pending_graphs: Dict[Any, Any] = {}
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
@@ -105,6 +106,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                 post_warmup_hook()
 
         graph = torch.npu.NPUGraph()
+        # Keep partial captures reachable for cleanup without exposing them to replay.
+        self._pending_graphs[shape_key] = graph
 
         if self._enable_torch_compile:
             skip_guard_context = torch.compiler.set_stance(skip_guard_eval_unsafe=True)
@@ -134,7 +137,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         ):
             out = forward_fn()
 
-        self._graphs[shape_key] = graph
+        self._graphs[shape_key] = self._pending_graphs.pop(shape_key)
         self._outputs[shape_key] = out
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
@@ -193,8 +196,26 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._rebind_fence = fence
         return self._outputs[shape_key]
 
+    def cleanup_failed_capture(self) -> None:
+        # A failed graph may still be referenced by the exception traceback.
+        # Refcount-based destruction is not sufficient to release offload leases.
+        if any(
+            not callable(getattr(graph, "reset", None))
+            for graph in (*self._graphs.values(), *self._pending_graphs.values())
+        ):
+            raise RuntimeError(
+                "This torch_npu NPUGraph cannot explicitly reset a failed capture; "
+                "MoE graph leases remain pinned until runtime shutdown"
+            )
+        self.cleanup()
+
     def cleanup(self) -> None:
         self._update_executor.shutdown(wait=True, cancel_futures=True)
+        for graph in (*self._graphs.values(), *self._pending_graphs.values()):
+            reset = getattr(graph, "reset", None)
+            if callable(reset):
+                reset()
         self._graphs.clear()
+        self._pending_graphs.clear()
         self._outputs.clear()
         self._pool = None

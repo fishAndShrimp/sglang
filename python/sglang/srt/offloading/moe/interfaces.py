@@ -272,6 +272,20 @@ class BoundMoERuntime(ABC):
         Warmup/capture use a device update_enabled=0; real replay sets it to 1.
         """
 
+    def capture_scope(self, owner, graph_runner, stream):
+        """Host scope for the complete decode graph capture session and warmups.
+
+        Disable the fixed-address update_enabled outside capture, bind contexts
+        for capture_head_hooks/capture_tail_hooks, and yield capture keepalive
+        state. Those hooks emit step begin/end exactly once per model invocation.
+        Restore updates only outside the captured graph. Keep partially submitted
+        resources retained on failure; synchronize drains all involved streams.
+        This default fails closed until a concrete runtime binds that protocol.
+        """
+        raise NotImplementedError(
+            "Bind MoE warmup/capture scope before creating graphs"
+        )
+
     @abstractmethod
     def forward_scope(self, owner, forward_batch):
         """Host context around eager forward OR replay; serialize with idle fence.

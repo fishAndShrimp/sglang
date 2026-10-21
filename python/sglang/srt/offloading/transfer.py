@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import Any, Tuple
 
 
@@ -97,13 +98,16 @@ class HostCopyRegion:
     destination_capacity: int
 
     def __post_init__(self):
-        if min(
-            self.source_offset,
-            self.destination_offset,
-            self.nbytes,
-            self.source_capacity,
-            self.destination_capacity,
-        ) < 0:
+        if (
+            min(
+                self.source_offset,
+                self.destination_offset,
+                self.nbytes,
+                self.source_capacity,
+                self.destination_capacity,
+            )
+            < 0
+        ):
             raise ValueError("Copy byte ranges must be nonnegative")
         if self.source_offset + self.nbytes > self.source_capacity:
             raise ValueError("Copy exceeds source allocation")
@@ -123,12 +127,21 @@ class HostCopyPlan:
         object.__setattr__(self, "keepalive", tuple(self.keepalive))
 
 
+class CopySourceKind(IntEnum):
+    """Device-plan ABI shared by residency planners and transfer lowerings."""
+
+    NONE = 0
+    HOST = 1
+    HOT_SLOT = 2
+
+
 @dataclass(frozen=True)
 class DeviceCopyPlan:
     """Fixed-capacity tensors; active entries/count are device values.
 
     source_kind distinguishes HOST, HOT_SLOT and NONE. expected_generation guards
-    reused slots. An expert entry includes all weights and quantization metadata.
+    reused slots. count is the number of valid entries (not a scan-prefix length).
+    An expert entry includes all weights and quantization metadata.
     The backend validates shapes/dtypes once when binding, outside capture.
     """
 

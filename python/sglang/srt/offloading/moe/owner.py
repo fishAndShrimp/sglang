@@ -211,6 +211,13 @@ class MoEOffloadOwner:
         # a completion ticket. No new forward is allowed after partial execution.
 
     @_serialized
+    def fail_graph_capture(self):
+        """Poison a partial warmup/capture; keep graph/storage leases for cleanup."""
+        self._require_no_forward()
+        if self.state is not OwnerState.CLOSED:
+            self.state = OwnerState.FAILED
+
+    @_serialized
     def acquire_graph(self, key):
         self._require_ready()
         self._require_no_forward()

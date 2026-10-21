@@ -19,6 +19,10 @@ class BaseOffloader(ABC):
     def bind_model_runner(self, model_runner):
         """Optional model/graph integration after post-load finalization."""
 
+    def bind_graph_backend(self, backend, graph_runner):
+        """Optionally wrap a decode graph backend before warmup/capture."""
+        return backend
+
     def forward_scope(self, forward_batch):
         """Host lifecycle around eager execution or graph replay."""
         return nullcontext()

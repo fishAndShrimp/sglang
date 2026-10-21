@@ -109,6 +109,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         reuse_output_buffer: bool = False,
     ) -> None:
         self._graphs: Dict[Any, torch.cuda.CUDAGraph] = {}
+        self._pending_graphs: Dict[Any, Any] = {}
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
         self._cuda_graph_runner = cuda_graph_runner
@@ -180,6 +181,8 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         del warmup_output
 
         graph = torch.cuda.CUDAGraph()
+        # Keep partial captures reachable for cleanup without exposing them to replay.
+        self._pending_graphs[shape_key] = graph
 
         graph_ctx: Callable[..., AbstractContextManager]
         if (
@@ -212,7 +215,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         if profiler is not None:
             profiler.step()
 
-        self._graphs[shape_key] = graph
+        self._graphs[shape_key] = self._pending_graphs.pop(shape_key)
         self._outputs[shape_key] = out
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
@@ -233,9 +236,10 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
-        for graph in self._graphs.values():
+        for graph in (*self._graphs.values(), *self._pending_graphs.values()):
             graph.reset()
         self._graphs.clear()
+        self._pending_graphs.clear()
         self._outputs.clear()
         self._output_buffer = None
         self._pool = None

@@ -23,8 +23,14 @@ from .programs import (
     PrefillDispatchOnceProgram,
     PrefillLocalExpertProgram,
 )
+from .residency import BoundExecutionWave, TensorResidencyOps
+from .runtime import DecodeStateSnapshot, ManagedExecutionContext
 
 __all__ = [
+    "BoundExecutionWave",
+    "TensorResidencyOps",
+    "DecodeStateSnapshot",
+    "ManagedExecutionContext",
     "CacheUpdateCoordinator",
     "ComposedDFCProgram",
     "DecodeLocalExpertProgram",
