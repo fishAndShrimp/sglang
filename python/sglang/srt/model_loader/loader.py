@@ -152,6 +152,11 @@ logger = logging.getLogger(__name__)
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
+    # The native MoE storage owner converts one expert at a time. Staging this
+    # module here would first copy its entire host master to accelerator memory.
+    if getattr(module, "_moe_offload_storage", None) is not None:
+        yield module
+        return
     if target_device.type == "cpu":
         yield module
         return
