@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "cache_ratio": 0.25,
+  "execution_slots": 16,
+  "prefill_group_size": 8,
+  "prefill_microbatch_size": 1,
+  "prefill_max_inflight": 2,
+  "host_pool_gib": 128,
+  "workspace_limit_bytes": 8589934592,
+  "metadata_limit_bytes": 1073741824,
+  "max_dispatch_rows": 32768,
+  "native_extension_directory": "/tmp/sglang-moe-acl"
+}

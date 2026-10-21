@@ -543,6 +543,16 @@ class FusedMoE(torch.nn.Module):
                 f"quant_method={type(self.quant_method).__name__})."
             )
 
+        # Resolve the native offload format before a fallback quantization
+        # method can allocate the full routed-expert set on the accelerator.
+        from sglang.srt.utils.offloader import get_offloader
+
+        validate_offload_quant_method = getattr(
+            getattr(get_offloader(), "backend", None), "validate_quant_method", None
+        )
+        if validate_offload_quant_method is not None:
+            validate_offload_quant_method(self, self.quant_method)
+
         self.quant_method.create_weights(
             layer=self,
             num_experts=self.num_local_experts,
@@ -1573,6 +1583,14 @@ class FusedMoE(torch.nn.Module):
         topk_output: TopKOutput,
         pre_quant_input: Optional[Tuple] = None,
     ):
+        offload_runtime = getattr(self, "_moe_offload_runtime", None)
+        if offload_runtime is not None:
+            return offload_runtime.run_layer(
+                self.layer_id,
+                hidden_states,
+                topk_output,
+                pre_quant_input=pre_quant_input,
+            )
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 

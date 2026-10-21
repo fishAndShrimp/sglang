@@ -2183,6 +2183,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 def enable_num_token_non_padded():
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
+    # Offloaded decode needs the live replay count even for EP=1. The bucket
+    # width is fixed, while padded rows must never become expert demand.
+    if get_exec().offload.moe_offload_config:
+        return True
+
     # Elastic joiners also need graph padding masked after joining WORLD; a
     # customized A2A backend consumes the count whatever the EP size.
     if (
@@ -2190,6 +2195,13 @@ def enable_num_token_non_padded():
         or world_dp_gather_enabled()
         or get_moe_a2a_backend().is_customized()
     ):
+        return True
+    # Explicit runtime injection has no JSON path. Import lazily after startup
+    # has selected the offloader; do not cache this process-owned binding.
+    from sglang.srt.offloading.moe.offloader import MoEOffloaderV2
+    from sglang.srt.utils.offloader import get_offloader
+
+    if isinstance(get_offloader(), MoEOffloaderV2):
         return True
     # DP attention + TP MoE gathers each rank's whole padded chunk into the MoE,
     # so the model needs the real count to zero the pad rows (see

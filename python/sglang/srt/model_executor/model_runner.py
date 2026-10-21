@@ -388,7 +388,14 @@ class ModelRunner:
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
         )
-        if moe_offloader is not None:
+        moe_offload_path = get_exec().offload.moe_offload_config
+        if moe_offload_path and moe_offloader is not None:
+            raise ValueError("Configure MoE offload by JSON or injection, not both")
+        if moe_offload_path or moe_offloader is not None:
+            if get_exec().moe.elastic_ep_backend is not None:
+                raise ValueError("MoE offload requires fixed expert-parallel ownership")
+            if get_lora().enable_lora:
+                raise ValueError("MoE offload does not support LoRA expert replacement")
             if is_draft_worker or not self.spec_algorithm.is_none():
                 raise ValueError("MoE offload does not support speculative decoding")
             if (
@@ -401,6 +408,32 @@ class ModelRunner:
                 raise ValueError(
                     "MoE offload requires non-overlapping forwards without EPLB "
                     "or another expert pager"
+                )
+        if moe_offload_path:
+            if get_model().load_format not in ("auto", "safetensors"):
+                raise ValueError(
+                    "Native MoE offload requires the CPU safetensors checkpoint loader"
+                )
+            graph = get_exec().graph.cuda_graph_config
+            if (
+                graph is None
+                or graph.decode.backend != "full"
+                or graph.prefill.backend != "disabled"
+            ):
+                raise ValueError(
+                    "Native MoE offload requires full decode graphs and eager prefill"
+                )
+            if get_exec().graph.enable_torch_compile:
+                raise ValueError("Native MoE offload does not support torch.compile")
+            if get_exec().moe.moe_a2a_backend != "deepep":
+                raise ValueError("Native MoE offload requires the DeepEP dispatcher")
+            if get_exec().moe.deepep_mode == "normal":
+                raise ValueError(
+                    "Decode offload requires device-count low-latency dispatch"
+                )
+            if not get_exec().moe.disable_shared_experts_fusion:
+                raise ValueError(
+                    "Native MoE offload requires --disable-shared-experts-fusion"
                 )
         self.capture_head_hooks = []
         self.capture_tail_hooks = []
@@ -483,6 +516,17 @@ class ModelRunner:
         # the target prefill graph publishes the read-done event.
         self.prefill_shared_read_stager: Optional[Callable[[ForwardBatch], bool]] = None
 
+        # Native MoE loading is installed before model construction, so routed
+        # weights are never first materialized as a full device-resident layer.
+        if moe_offload_path:
+            from sglang.srt.offloading.moe.npu_config import create_npu_offloader
+
+            moe_offloader = create_npu_offloader(
+                moe_offload_path,
+                hf_config=self.model_config.hf_config,
+                parallel=get_parallel(),
+                device=f"{self.device}:{self.gpu_id}",
+            )
         # CPU offload
         self.offloader = create_offloader(moe_offloader=moe_offloader)
         set_offloader(self.offloader)

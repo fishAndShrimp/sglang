@@ -1026,6 +1026,11 @@ class ExecOffload(msgspec.Struct):
     # -------------------------------------------------------------------------
     # Offloading
     # -------------------------------------------------------------------------
+    moe_offload_config: A[
+        Optional[str],
+        "Path to the native Ascend V4 MoE offload JSON configuration. "
+        "Requires full decode graphs and non-overlapping scheduling.",
+    ] = None
     cpu_offload_gb: A[
         int,
         "How many GBs of RAM to reserve for CPU offloading.",

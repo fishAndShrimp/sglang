@@ -405,6 +405,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_two_batch_overlap",
     "enable_single_batch_overlap",
     "tbo_token_distribution_threshold",
+    "moe_offload_config",
     "cpu_offload_gb",
     "offload_group_size",
     "offload_num_in_group",
