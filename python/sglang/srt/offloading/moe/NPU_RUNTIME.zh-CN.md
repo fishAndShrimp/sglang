@@ -23,6 +23,53 @@ prefill 借池，decode 按原 slot 从 host 重载后检查错误标记再恢�
 仅在匹配的 Ascend A5 / CANN / torch_npu 环境执行。需要已安装当前仓库和用户
 提供版本的 MemFabric、sgl-kernel-npu DeepEP。此 macOS 开发机不能完成硬件验收。
 
+### 单机四卡启动脚本
+
+从仓库根目录执行，先加载目标机匹配的 CANN 环境，再设置实际的 **DeepSeek V4
+原生 FP4 safetensors** 权重目录：
+
+```bash
+MODEL_PATH=/path/to/DeepSeek-V4-Flash \
+  bash scripts/launch_moe_offload_npu.sh --dry-run
+
+MODEL_PATH=/path/to/DeepSeek-V4-Flash \
+  bash scripts/launch_moe_offload_npu.sh
+```
+
+默认 `WORLD_SIZE=4`，可见设备 `0,1,2,3`，TP=4、EP=4、DP=1，MoE TP=1；
+服务地址 `127.0.0.1:8818`。换用卡 4–7：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=4,5,6,7 \
+MODEL_PATH=/path/to/DeepSeek-V4-Flash \
+  bash scripts/launch_moe_offload_npu.sh
+```
+
+脚本从自身位置定位当前源码并设置 `PYTHONPATH`，不依赖固定的 `/home/.../sglang`
+目录。默认先构建 ACL 扩展；`BUILD_NATIVE=0` 可复用与当前环境匹配的已构建扩展，
+`RUN_NATIVE_SMOKE=1` 可在加载模型前增加 ACL 字节/事件 smoke。扩展目录直接读取
+offload JSON 的 `native_extension_directory`，避免构建与运行使用不同目录。
+
+`MOE_OFFLOAD_CONFIG` 可指定自己的 JSON，默认使用
+`python/sglang/srt/offloading/moe/examples/npu_v4.json`。默认 host 保留量为
+**每 rank 128 GiB，四 rank 合计 512 GiB**，workspace/metadata 限额也是每 rank 的；
+启动前应按机器和模型调整 JSON 中的预算。
+
+首启默认最大并发 8、decode buckets 为 `1 2 4 8`、chunked prefill 和最大 prefill
+token 数均为 1024、context length 为 8192，`mem_fraction_static=0.8`。
+`MAX_RUNNING_REQUESTS`、`CHUNKED_PREFILL_SIZE`、`CONTEXT_LENGTH`、
+`MEM_FRACTION_STATIC` 可通过环境变量修改；并发变化时脚本同步生成捕图 buckets。
+增大 prefill/concurrency 时还需检查 JSON 的 `max_dispatch_rows` 和 workspace 上界，
+容量不足会拒绝运行。`--dry-run` 仅打印命令，不验证真实权重和设备。
+
+此脚本使用 V4 的 `dsv4` attention、DeepEP default、full decode graph 和 eager prefill，
+启用本后端要求的 `-1` 路由与逐专家计数。`--quantization fp8` 选择当前仓库的
+FP8/V4 量化配置入口，routed experts 由原生 FP4 method 接管；明确关闭 FP4→FP8 解量化。
+它不带 EAGLE、DP attention 或 HiCache 参数，关闭 overlap；GLM-5.2/modelslim 权重
+不适用于当前后端，实际启动时会在构建扩展前检查 `model_type` 和 EP 可整除性。
+
+### 手动构建与启动
+
 ```bash
 python -m sglang.srt.offloading.moe.native_acl --build-directory /tmp/sglang-moe-acl
 python -m sglang.srt.offloading.moe.native_smoke --build-directory /tmp/sglang-moe-acl
@@ -31,7 +78,7 @@ export DEEP_USE_MODE=default
 export MOE_EXPERT_TOKEN_NUMS_TYPE=1
 python -m sglang.launch_server \
   --model-path /path/to/DeepSeek-V4-Flash \
-  --device npu --tp-size 8 --ep-size 8 \
+  --device npu --tp-size 4 --ep-size 4 \
   --moe-a2a-backend deepep --deepep-mode auto --moe-runner-backend ascend \
   --disable-overlap-schedule --disable-shared-experts-fusion \
   --cuda-graph-backend-decode full --cuda-graph-backend-prefill disabled \
