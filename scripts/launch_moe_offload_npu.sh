@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Single-node Ascend A5, native DeepSeek V4 FP4 experts, TP=EP=WORLD_SIZE.
+# Single-node Ascend A5, DeepSeek V4 FP4 or ModelSlim W8A8, TP=EP=WORLD_SIZE.
 # Source the matching CANN/torch_npu environment before running this script.
 set -euo pipefail
 
@@ -10,11 +10,12 @@ Usage:
   MODEL_PATH=/path/to/DeepSeek-V4-Flash bash scripts/launch_moe_offload_npu.sh --dry-run
 
 Defaults: WORLD_SIZE=4, ASCEND_RT_VISIBLE_DEVICES=0,1,2,3, TP=4, EP=4, DP=1.
-MODEL_PATH must point to a local DeepSeek V4 native-FP4 safetensors checkpoint.
-GLM/modelslim, converted FP8 experts and speculative decoding are not supported.
+MODEL_PATH must point to local DeepSeek V4 FP4 or ModelSlim W8A8 safetensors.
+GLM, converted FP8 experts and speculative decoding are not supported.
 
 Overrides:
   SGLANG_ROOT, PYTHON_BIN, WORLD_SIZE, ASCEND_RT_VISIBLE_DEVICES
+  MOE_EXPERT_FORMAT=auto (fp4 or w8a8; auto reads quant_model_description.json)
   MOE_OFFLOAD_CONFIG (defaults to the repository's npu/examples/v4.json)
   SERVER_HOST=127.0.0.1 SERVER_PORT=8818 SERVED_MODEL_NAME=deepseek-v4-moe-offload
   MAX_RUNNING_REQUESTS=8 CHUNKED_PREFILL_SIZE=1024 CONTEXT_LENGTH=8192
@@ -79,7 +80,7 @@ OTLP_TRACES_ENDPOINT=${OTLP_TRACES_ENDPOINT:-localhost:4317}
 OTLP_SERVICE_NAME=${OTLP_SERVICE_NAME:-$SERVED_MODEL_NAME}
 PROFILE_CAPTURE=${PROFILE_CAPTURE:-0}
 
-[[ -n "$MODEL_PATH" ]] || die "Set MODEL_PATH to a DeepSeek V4 native-FP4 checkpoint; see --help."
+[[ -n "$MODEL_PATH" ]] || die "Set MODEL_PATH to a DeepSeek V4 FP4 or W8A8 checkpoint; see --help."
 for name in WORLD_SIZE SERVER_PORT MAX_RUNNING_REQUESTS CHUNKED_PREFILL_SIZE CONTEXT_LENGTH DECODE_LOG_INTERVAL; do
     value=${!name}
     [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "$name must be a positive integer."
@@ -171,7 +172,31 @@ export SGLANG_ENABLE_SPEC_V2=0
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
 export SGLANG_NPU_USE_MULTI_STREAM=0
 export IS_DEEPSEEK_V4=1
-export SGLANG_DSV4_FP4_EXPERTS=True
+MOE_EXPERT_FORMAT=$("$PYTHON_BIN" - "$MODEL_PATH" "${MOE_EXPERT_FORMAT:-auto}" <<'PYFORMAT'
+import json
+import sys
+from pathlib import Path
+
+requested = sys.argv[2]
+if requested not in ("auto", "fp4", "w8a8"):
+    raise SystemExit("MOE_EXPERT_FORMAT must be auto, fp4 or w8a8")
+description = Path(sys.argv[1], "quant_model_description.json")
+quant = json.loads(description.read_text()) if description.is_file() else None
+if quant is not None and quant.get("model_quant_type") != "W8A8_DYNAMIC":
+    raise SystemExit("This launcher supports ModelSlim W8A8_DYNAMIC only")
+detected = "w8a8" if quant is not None else "fp4"
+if requested != "auto" and requested != detected:
+    raise SystemExit("MOE_EXPERT_FORMAT disagrees with the checkpoint quantization metadata")
+print(detected)
+PYFORMAT
+)
+if [[ "$MOE_EXPERT_FORMAT" == w8a8 ]]; then
+    MODEL_QUANTIZATION=modelslim
+    export SGLANG_DSV4_FP4_EXPERTS=False
+else
+    MODEL_QUANTIZATION=fp8
+    export SGLANG_DSV4_FP4_EXPERTS=True
+fi
 export SGLANG_DSV4_FP4_DEQUANT=0
 export USE_FUSED_HC_PRE_ASCENDC=1
 export SGLANG_OPT_USE_OVERLAP_STORE_CACHE=False
@@ -300,7 +325,7 @@ SERVER_CMD=(
     --host "$SERVER_HOST" --port "$SERVER_PORT"
     --tp-size "$WORLD_SIZE" --ep-size "$WORLD_SIZE" --dp-size 1
     --device npu --attention-backend dsv4 --page-size 128 --trust-remote-code
-    --load-format safetensors --quantization fp8 --kv-cache-dtype bfloat16
+    --load-format safetensors --quantization "$MODEL_QUANTIZATION" --kv-cache-dtype bfloat16
     --moe-a2a-backend deepep --deepep-mode auto --moe-runner-backend ascend
     --disable-overlap-schedule --disable-shared-experts-fusion
     --cuda-graph-backend-decode full --cuda-graph-backend-prefill disabled
@@ -325,6 +350,7 @@ if [[ "$PROFILE_CAPTURE" == 1 ]]; then
 fi
 
 printf 'WORLD_SIZE=%s TP=%s EP=%s DP=1 DEVICES=%s\n' "$WORLD_SIZE" "$WORLD_SIZE" "$WORLD_SIZE" "$ASCEND_RT_VISIBLE_DEVICES"
+printf 'Expert format: %s; quantization: %s\n' "$MOE_EXPERT_FORMAT" "$MODEL_QUANTIZATION"
 printf 'Offload JSON: %s\nNative build: %s\n' "$MOE_OFFLOAD_CONFIG" "$NATIVE_BUILD_DIR"
 printf 'Log directory: %s\nLogging config: %s\n' "$LOG_DIR" "$SGLANG_LOGGING_CONFIG_PATH"
 printf 'Logging: root=%s MoE=%s requests=%s request_level=%s decode_interval=%s\n' "$LOG_LEVEL" "$MOE_LOG_LEVEL" "$LOG_REQUESTS" "$LOG_REQUESTS_LEVEL" "$DECODE_LOG_INTERVAL"
@@ -348,7 +374,7 @@ model = Path(sys.argv[1])
 config = json.loads((model / "config.json").read_text())
 if config.get("model_type") != "deepseek_v4":
     raise SystemExit(
-        "MODEL_PATH must be DeepSeek V4 native FP4; GLM/modelslim is unsupported"
+        "MODEL_PATH must be DeepSeek V4; GLM is unsupported"
     )
 experts = config.get("n_routed_experts", 0)
 if not isinstance(experts, int) or experts <= 0 or experts % int(sys.argv[2]):

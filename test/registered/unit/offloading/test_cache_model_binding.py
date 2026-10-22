@@ -90,6 +90,7 @@ def native_types():
     )
     for name in (
         "NPUSwigluDeepEPKernel",
+        "NPUSwigluInt8Quant",
         "NPUSitu",
         "NPUSituMXFP8Quant",
         "NPUSwigluMxfp8Quant",

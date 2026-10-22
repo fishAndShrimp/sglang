@@ -666,6 +666,8 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
             layer, f"{weight_prefix}_weight_offset", None
         )
         if offset is not None:
+            if bool(offset.data.ne(0).any()):
+                raise ValueError("W8A8 INT8 MoE requires symmetric zero weight offsets")
             processed_offset = torch.nn.Parameter(
                 offset.data.squeeze(-1), requires_grad=False
             )
@@ -677,7 +679,14 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
 
         # Set dispatcher output dtype
         if weight_prefix == "w13":
-            self._set_dispatcher_output_dtype(layer, "int8")
+            self._set_dispatcher_output_dtype(
+                layer,
+                (
+                    "bf16"
+                    if getattr(layer, "_moe_offload_bf16_dispatch", False)
+                    else "int8"
+                ),
+            )
 
     def apply(
         self,

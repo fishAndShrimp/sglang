@@ -20,6 +20,7 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
     NPUSwigluQuant,
     NPUSwigluStepAndMul,
 )
+from sglang.srt.hardware_backend.npu.moe.w8a8 import NPUSwigluInt8Quant
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUMXFP8MoEMethod,
     NPUW4A8Int8MoEMethod,
@@ -138,6 +139,12 @@ class AscendRunnerCore(MoeRunnerCore):
             and config.swiglu_limit > 0
         ):
             self.activation = NPUSwigluMxfp8Quant(config.swiglu_limit)
+        elif (
+            isinstance(kernel, NPUW8A8Int8MoEMethod)
+            and config.swiglu_limit is not None
+            and config.swiglu_limit > 0
+        ):
+            self.activation = NPUSwigluInt8Quant(config.swiglu_limit)
         elif get_moe_a2a_backend().is_deepep():
             # DeepEP path: use a unified kernel that decides quantisation
             is_quant_kernel = isinstance(
@@ -250,6 +257,7 @@ class AscendRunnerCore(MoeRunnerCore):
                 self.activation,
                 (
                     NPUSwigluDeepEPKernel,
+                    NPUSwigluInt8Quant,
                     NPUSitu,
                     NPUSituMXFP8Quant,
                     NPUSwigluMxfp8Quant,

@@ -6,7 +6,7 @@
 | --- | --- |
 | `../config.py` / `../backend.py` / `../runtime.py` | 启动配置、资源装配与运行时生命周期 |
 | `../transfer.py` / `../experts.py` | ACL/MemFabric 搬运、DeepEP 与原生 FFN |
-| `../storage.py` / `../v4_format.py` | 共享 host master、FP4 有界加载与 bank |
+| `../storage.py` / `../v4_format.py` / `../w8a8_format.py` | 共享 host master、FP4/W8A8 有界加载与 bank |
 | `../native_acl.py` / `../native/` | ACL 扩展构建与 C++ 源码 |
 | `../examples/v4.json` | 每 rank 的 offload 容量配置 |
 
@@ -15,7 +15,7 @@
 
 每 batch 命中率、生命周期日志及无额外设备同步的约束见 [维测日志](OBSERVABILITY.zh-CN.md)。
 
-`NpuMoEBackend` 在模型构造前安装，由 V4 FP4 quant method 的 create_weights 接管
+`NpuMoEBackend` 在模型构造前安装，由 FusedMoE 的统一权重创建入口接管
 host 参数分配；post-load 后装配共享 host master、hot/execution bank、固定 Tensor
 residency、离线 Top-K / 周期层内 LFU、ACL eager prefill、MemFabric decode 和现有 Ascend EP/FFN。
 本项依赖 native ACL、真实存储和 EP/FFN 三项适配一起使用。
@@ -45,7 +45,7 @@ prefill 借池，decode 按原 slot 从 host 重载后检查错误标记再恢�
 ### 单机四卡启动脚本
 
 从仓库根目录执行，先加载目标机匹配的 CANN 环境，再设置实际的 **DeepSeek V4
-原生 FP4 safetensors** 权重目录：
+FP4 或 ModelSlim W8A8 safetensors** 权重目录：
 
 ```bash
 MODEL_PATH=/path/to/DeepSeek-V4-Flash \
@@ -81,9 +81,10 @@ token 数均为 1024、context length 为 8192，`mem_fraction_static=0.8`。
 容量不足会拒绝运行。`--dry-run` 仅打印命令，不验证真实权重和设备。
 
 此脚本使用 V4 的 `dsv4` attention、DeepEP default、full decode graph 和 eager prefill，
-启用本后端要求的 `-1` 路由与逐专家计数。`--quantization fp8` 选择当前仓库的
-FP8/V4 量化配置入口，routed experts 由原生 FP4 method 接管；明确关闭 FP4→FP8 解量化。
-它不带 EAGLE、DP attention 或 HiCache 参数，关闭 overlap；GLM-5.2/modelslim 权重
+启用本后端要求的 `-1` 路由与逐专家计数。脚本默认根据量化描述选择 `fp8`
+（原生 FP4 experts）或 `modelslim`（W8A8_DYNAMIC），也可用 `MOE_EXPERT_FORMAT`
+显式指定并校验；两条路径均关闭 FP4→FP8 解量化。
+它不带 EAGLE、DP attention 或 HiCache 参数，关闭 overlap；GLM-5.2 权重
 不适用于当前后端，实际启动时会在构建扩展前检查 `model_type` 和 EP 可整除性。
 
 默认 JSON 的 `offline_stats_path` 是占位符。非零 cache_ratio 必须提供真实 profile，
@@ -160,3 +161,6 @@ forward、其他专家 pager 或在线权重更新；不满足条件在加载或
 字节对比，原生 NZ FP4 bank 与常驻 FFN 数值对比，EP padding/空 rank/尾组，
 多 bucket 连续 replay 与 prefill/decode 切换，workspace 峰值及 H2D/F 时间线。
 `RuntimeCapabilities` 表示实现提供完整捕图路径，不表示已获得这些硬件结果。
+
+W8A8 主模型适配的格式、预算、零 offset 限制、INT8 clamp 激活及实机验收见
+[W8A8 设计与验证](W8A8_ADAPTATION.zh-CN.md)。DSpark 仍关闭。

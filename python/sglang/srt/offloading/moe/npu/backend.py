@@ -86,23 +86,38 @@ class NpuMoEBackend(MoEBackend):
 
     def validate_quant_method(self, layer, method):
         """Reject unhandled expert formats before their first weight allocation."""
-        if layer.layer_id < self.resident_layers:
-            return
-        if layer.layer_id not in self.layer_ids:
+        resident = layer.layer_id < self.resident_layers
+        if not resident and layer.layer_id not in self.layer_ids:
             raise ValueError("Offloaded expert layer is outside the fixed catalog")
         from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
             NPUW4A8MXFP4FusedMoEMethod,
         )
 
-        if not isinstance(method, NPUW4A8MXFP4FusedMoEMethod):
-            raise ValueError(
-                "Native V4 MoE offload requires NPUW4A8MXFP4FusedMoEMethod "
-                f"before allocating layer {layer.layer_id}, but resolved "
-                f"{type(method).__name__}. Disable FP4 dequantization and "
-                "expert quantization overrides; Ascend arch35 is required."
-            )
+        if isinstance(method, NPUW4A8MXFP4FusedMoEMethod):
+            return "fp4"
+        from sglang.srt.layers.quantization.modelslim.modelslim import (
+            ModelSlimFusedMoEMethod,
+        )
+        from sglang.srt.layers.quantization.modelslim.schemes import (
+            ModelSlimW8A8Int8MoE,
+        )
 
-    def prepare_npu_fp4_weights(
+        if isinstance(method, ModelSlimFusedMoEMethod) and all(
+            isinstance(getattr(layer, name, None), ModelSlimW8A8Int8MoE)
+            for name in ("w13_scheme", "w2_scheme")
+        ):
+            # The A5 offload binding uses BF16 EP payloads for resident hash
+            # layers too; INT8 quantization belongs to each W8A8 GMM input.
+            layer._moe_offload_bf16_dispatch = True
+            return "w8a8"
+        if resident:
+            return None
+        raise ValueError(
+            "V4 offload supports native MXFP4 or ModelSlim W8A8_DYNAMIC experts; "
+            f"layer {layer.layer_id} resolved {type(method).__name__}"
+        )
+
+    def prepare_expert_weights(
         self,
         layer,
         *,
@@ -111,10 +126,11 @@ class NpuMoEBackend(MoEBackend):
         hidden_size,
         intermediate_size_per_partition,
         params_dtype,
-        extra_weight_attrs,
+        **extra_weight_attrs,
     ):
         from .storage import MemFabricHostPool
         from .v4_format import NpuV4FP4Format, V4LayerStorage
+        from .w8a8_format import NpuV4W8A8Format, W8A8LayerStorage
 
         layer_id = layer.layer_id
         if layer_id < self.resident_layers:
@@ -133,6 +149,12 @@ class NpuMoEBackend(MoEBackend):
             raise ValueError(
                 "Native V4 storage requires unchanged local routed expert ownership"
             )
+        format_kind = self.validate_quant_method(layer, method)
+        format_type, storage_type = (
+            (NpuV4FP4Format, V4LayerStorage)
+            if format_kind == "fp4"
+            else (NpuV4W8A8Format, W8A8LayerStorage)
+        )
         dimensions = (hidden_size, intermediate_size_per_partition)
         if self.format is None:
             from .native_acl import get_native_acl
@@ -140,13 +162,14 @@ class NpuMoEBackend(MoEBackend):
             self.native_acl = get_native_acl(self.settings.native_extension_directory)
             self.device_runtime = NpuDeviceRuntime(self.device)
             # One-expert NZ format probe and conversion workspace, never E experts.
-            self.format = NpuV4FP4Format(
+            self.format = format_type(
                 *dimensions,
                 self.device,
                 native_acl=self.native_acl,
                 workspace_limit_bytes=self.settings.workspace_limit_bytes,
             )
             self._dimensions = dimensions
+            self._format_kind = format_kind
             required = len(self.layer_ids) * self.format.host_nbytes(spec.local_experts)
             self.host_pool = MemFabricHostPool(
                 required,
@@ -154,11 +177,11 @@ class NpuMoEBackend(MoEBackend):
                 physical_bytes=self.settings.host_pool_gib * 1024**3,
                 native_acl=self.native_acl,
             )
-        elif dimensions != self._dimensions:
+        elif dimensions != self._dimensions or format_kind != self._format_kind:
             raise ValueError(
                 "Offloaded V4 layers must share one physical expert format"
             )
-        storage = V4LayerStorage(
+        storage = storage_type(
             layer, spec, self.format, self.host_pool, extra_weight_attrs
         )
         self.layers[layer_id] = storage

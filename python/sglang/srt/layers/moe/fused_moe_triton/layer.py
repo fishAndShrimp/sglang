@@ -553,8 +553,7 @@ class FusedMoE(torch.nn.Module):
         if validate_offload_quant_method is not None:
             validate_offload_quant_method(self, self.quant_method)
 
-        self.quant_method.create_weights(
-            layer=self,
+        weight_args = dict(
             num_experts=self.num_local_experts,
             hidden_size=hidden_size,
             intermediate_size_per_partition=self.intermediate_size_per_partition,
@@ -567,6 +566,14 @@ class FusedMoE(torch.nn.Module):
             with_bias=with_bias,
             moe_intermediate_size=intermediate_size,
         )
+
+        prepare = getattr(
+            getattr(get_offloader(), "backend", None), "prepare_expert_weights", None
+        )
+        if prepare is None or not prepare(
+            self, method=self.quant_method, **weight_args
+        ):
+            self.quant_method.create_weights(layer=self, **weight_args)
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(

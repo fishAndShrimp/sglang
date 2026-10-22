@@ -63,24 +63,6 @@ class NPUW4A8MXFP4FusedMoEMethod(FusedMoEMethodBase):
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
-        # Intercept before the first default-device allocation: an offloaded
-        # layer must never transiently own its complete expert set on the NPU.
-        from sglang.srt.utils.offloader import get_offloader
-
-        prepare = getattr(
-            getattr(get_offloader(), "backend", None), "prepare_npu_fp4_weights", None
-        )
-        if prepare is not None and prepare(
-            layer,
-            method=self,
-            num_experts=num_experts,
-            hidden_size=hidden_size,
-            intermediate_size_per_partition=intermediate_size_per_partition,
-            params_dtype=params_dtype,
-            extra_weight_attrs=extra_weight_attrs,
-        ):
-            return
-
         # Two FP4 values per stored byte, hence the // 2 on the K dimension.
         w13_weight = torch.nn.Parameter(
             torch.empty(

@@ -556,6 +556,15 @@ class DefaultModelLoader(BaseModelLoader):
                 break
 
         if use_safetensors:
+            # ModelSlim exports use their own index name. Use it for shard
+            # completeness/filtering instead of silently ignoring the manifest.
+            modelslim_index = "quant_model_weights.safetensors.index.json"
+            if (
+                index_file == SAFE_WEIGHTS_INDEX_NAME
+                and not os.path.isfile(os.path.join(hf_folder, index_file))
+                and os.path.isfile(os.path.join(hf_folder, modelslim_index))
+            ):
+                index_file = modelslim_index
             # For models like Mistral-7B-Instruct-v0.3
             # there are both sharded safetensors files and a consolidated
             # safetensors file. Using both breaks.

@@ -1,6 +1,8 @@
+import json
 import logging
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional
 
 from transformers import PretrainedConfig
@@ -26,6 +28,15 @@ def try_detect_fp4_experts(model_path: str) -> Optional[bool]:
         local_path = find_local_repo_dir(model_path)
         if not local_path or not os.path.isdir(local_path):
             return None
+
+    # ModelSlim can store symmetric W8A8 weights as I8 too; expert_dtype in
+    # config.json may still say fp4 after conversion. Resolve the quant scheme
+    # before interpreting a one-byte carrier as packed FP4.
+    description = Path(local_path, "quant_model_description.json")
+    if description.is_file():
+        quant = json.loads(description.read_text())
+        if quant.get("model_quant_type") == "W8A8_DYNAMIC":
+            return False
 
     try:
         dtype = probe_routed_expert_weight_dtype(local_path)

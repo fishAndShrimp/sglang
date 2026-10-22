@@ -174,6 +174,26 @@ os.execv(REAL_PYTHON, [REAL_PYTHON] + sys.argv[1:])
         self.assertIn("fake server stderr", log)
         self.assertTrue((self.log_dir / "offload-config.snapshot.json").is_file())
 
+    def test_w8a8_metadata_selects_modelslim_and_disables_fp4(self):
+        (self.model / "quant_model_description.json").write_text(
+            json.dumps({"model_quant_type": "W8A8_DYNAMIC"})
+        )
+        code, output = self.run_script()
+        self.assertEqual(code, 0, output)
+        arguments = self.server_result()["args"]
+        self.assertEqual(arguments[arguments.index("--quantization") + 1], "modelslim")
+        self.assertNotIn("--speculative-algorithm", arguments)
+        self.assertIn("Expert format: w8a8", output)
+
+    def test_explicit_fp4_rejects_w8a8_metadata_before_build(self):
+        (self.model / "quant_model_description.json").write_text(
+            json.dumps({"model_quant_type": "W8A8_DYNAMIC"})
+        )
+        code, output = self.run_script("--dry-run", MOE_EXPERT_FORMAT="fp4")
+        self.assertNotEqual(code, 0)
+        self.assertIn("disagrees", output)
+        self.assertFalse(self.build_marker.exists())
+
     def test_moe_debug_does_not_enable_other_debug_loggers(self):
         code, output = self.run_script(MOE_LOG_LEVEL="debug")
         self.assertEqual(code, 0, output)

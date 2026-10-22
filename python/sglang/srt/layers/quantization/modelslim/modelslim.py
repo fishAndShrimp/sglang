@@ -536,6 +536,10 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         self.quantization_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        storage = getattr(layer, "_moe_offload_storage", None)
+        if storage is not None:
+            storage.finalize()
+            return
         layer.w13_scheme.process_weights_after_loading(layer)
         layer.w2_scheme.process_weights_after_loading(layer)
 

@@ -127,7 +127,58 @@ def _scale_view(raw):
     return raw.view(e, n, k32 // 2, 2).transpose(1, 2)
 
 
-class NpuV4FP4Format:
+class NpuExpertFormat:
+    """Fixed bank allocation and byte budgets shared by FP4 and INT8 formats."""
+
+    host_component_nbytes = {}
+
+    def _check_workspace(self, baseline, known_bytes):
+        measured = self.adapter.end_workspace(baseline)
+        self.workspace_nbytes = max(self.workspace_nbytes, known_bytes, measured)
+        if (
+            self.workspace_limit_bytes is not None
+            and self.workspace_nbytes > self.workspace_limit_bytes
+        ):
+            raise ValueError("Native V4 conversion exceeds the loader workspace budget")
+
+    def host_nbytes(self, experts):
+        if type(experts) is not int or experts <= 0:
+            raise ValueError("Local expert count must be positive")
+        return sum(
+            _align(self.host_component_nbytes.get(name, layout.nbytes) * experts, 64)
+            for name, layout in self.layouts.items()
+        )
+
+    def allocations(self):
+        # Transient loader peak, accounted separately from persistent graph HBM.
+        return ()
+
+    def allocate_bank(self, capacity, kind, name):
+        if type(capacity) is not int or capacity < 0:
+            raise ValueError("Bank capacity must be a nonnegative integer")
+        if kind not in (ResourceKind.HOT_WEIGHTS, ResourceKind.EXECUTION_WEIGHTS):
+            raise ValueError("Expert banks must have a weight resource kind")
+        tensors = {}
+        for component, layout in self.layouts.items():
+            tensor = self.adapter.empty_component(component, layout, capacity)
+            if (
+                capacity
+                and self.adapter.physical_nbytes(tensor) != capacity * layout.nbytes
+            ):
+                raise RuntimeError(
+                    "Native bank does not have independent fixed expert extents"
+                )
+            if tuple(tensor.shape) != (capacity,) + layout.runtime_shape[1:]:
+                raise RuntimeError(
+                    "Native bank shape differs from the selected expert format"
+                )
+            if capacity and tuple(tensor.stride()[1:]) != layout.runtime_stride[1:]:
+                raise RuntimeError("Native bank strides differ from the probed format")
+            tensors[component] = tensor
+        return V4ExpertBank(self, tensors, capacity, kind, name)
+
+
+class NpuV4FP4Format(NpuExpertFormat):
     """One-expert native probe, fixed bank descriptors, bounded repacking.
 
     Uses the deployed torch_npu format adapter and rejects unsupported layouts.
@@ -204,15 +255,6 @@ class NpuV4FP4Format:
         )
         self.expert_nbytes = sum(self.component_nbytes.values())
 
-    def _check_workspace(self, baseline, known_bytes):
-        measured = self.adapter.end_workspace(baseline)
-        self.workspace_nbytes = max(self.workspace_nbytes, known_bytes, measured)
-        if (
-            self.workspace_limit_bytes is not None
-            and self.workspace_nbytes > self.workspace_limit_bytes
-        ):
-            raise ValueError("Native V4 conversion exceeds the loader workspace budget")
-
     def _record_layout(self, name, raw_shape, tensor):
         nbytes = self.adapter.physical_nbytes(tensor)
         if nbytes < math.prod(raw_shape) or nbytes % 64:
@@ -222,41 +264,6 @@ class NpuV4FP4Format:
         self.layouts[name] = _Layout(
             raw_shape, tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype, nbytes
         )
-
-    def host_nbytes(self, experts):
-        if type(experts) is not int or experts <= 0:
-            raise ValueError("Local expert count must be positive")
-        return sum(
-            _align(layout.nbytes * experts, 64) for layout in self.layouts.values()
-        )
-
-    def allocations(self):
-        # Transient loader peak, accounted separately from persistent graph HBM.
-        return ()
-
-    def allocate_bank(self, capacity, kind, name):
-        if type(capacity) is not int or capacity < 0:
-            raise ValueError("Bank capacity must be a nonnegative integer")
-        if kind not in (ResourceKind.HOT_WEIGHTS, ResourceKind.EXECUTION_WEIGHTS):
-            raise ValueError("Expert banks must have a weight resource kind")
-        tensors = {}
-        for component, layout in self.layouts.items():
-            tensor = self.adapter.empty_component(component, layout, capacity)
-            if (
-                capacity
-                and self.adapter.physical_nbytes(tensor) != capacity * layout.nbytes
-            ):
-                raise RuntimeError(
-                    "Native bank does not have independent fixed expert extents"
-                )
-            if tuple(tensor.shape) != (capacity,) + layout.runtime_shape[1:]:
-                raise RuntimeError(
-                    "Native bank shape differs from the resident FP4 format"
-                )
-            if capacity and tuple(tensor.stride()[1:]) != layout.runtime_stride[1:]:
-                raise RuntimeError("Native bank strides differ from the probed format")
-            tensors[component] = tensor
-        return V4ExpertBank(self, tensors, capacity, kind, name)
 
     def repack_into(self, raw_components, expert, destinations):
         for weight_name, scale_name in zip(_WEIGHTS, _SCALES):
@@ -293,6 +300,28 @@ class NpuV4FP4Format:
                     destination.host_address, tensor, destination.nbytes
                 )
             del weight, scale, weight_input, scale_input
+
+    def checkpoint_view(self, allocation, name, experts):
+        import torch
+
+        layout = self.layouts[name]
+        shape = (experts,) + layout.raw_shape[1:]
+        return torch.as_strided(allocation, shape, (layout.nbytes, shape[-1], 1))
+
+    def checkpoint_attributes(self, name):
+        return (
+            {"quant_method": "block", "format_ue8m0": False} if name in _SCALES else {}
+        )
+
+    def quant_info(self, tensors):
+        from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
+
+        return AscendQuantInfo(
+            w13_weight=tensors["w13_weight"],
+            w2_weight=tensors["w2_weight"],
+            w13_weight_scale=tensors["w13_weight_scale_inv"],
+            w2_weight_scale=tensors["w2_weight_scale_inv"],
+        )
 
 
 class V4ExpertBank:
@@ -341,14 +370,7 @@ class V4ExpertBank:
         return self.view(start, end - start)
 
     def quant_info(self):
-        from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
-
-        return AscendQuantInfo(
-            w13_weight=self.w13_weight,
-            w2_weight=self.w2_weight,
-            w13_weight_scale=self.w13_weight_scale_inv,
-            w2_weight_scale=self.w2_weight_scale_inv,
-        )
+        return self.format.quant_info(self.tensors)
 
     def allocations(self):
         if self._owner is not None:
@@ -390,22 +412,19 @@ class V4LayerStorage:
             raise ValueError("Expert parameters already exist before host interception")
         try:
             for name, layout in format.layouts.items():
-                allocation = host_pool.allocate(layout.nbytes * spec.local_experts)
+                host_extent = format.host_component_nbytes.get(name, layout.nbytes)
+                allocation = host_pool.allocate(host_extent * spec.local_experts)
                 allocation.tensor.zero_()
-                raw_shape = (spec.local_experts,) + layout.raw_shape[1:]
-                inner_stride = (raw_shape[-1], 1)
-                raw = torch.as_strided(
-                    allocation.tensor, raw_shape, (layout.nbytes,) + inner_stride
+                raw = format.checkpoint_view(
+                    allocation.tensor, name, spec.local_experts
                 )
                 parameter = torch.nn.Parameter(raw, requires_grad=False)
                 for key, value in extra_weight_attrs.items():
                     if key != "weight_loader":
                         setattr(parameter, key, value)
                 parameter.weight_loader = self._loader(name)
-                if name in _SCALES:
-                    # FusedMoeWeightScaleSupported.BLOCK.value; no heavy runner import.
-                    parameter.quant_method = "block"
-                    parameter.format_ue8m0 = False
+                for key, value in format.checkpoint_attributes(name).items():
+                    setattr(parameter, key, value)
                 layer.register_parameter(name, parameter)
                 self.raw_components[name] = raw
                 self.host_store.add(
@@ -416,11 +435,11 @@ class V4LayerStorage:
                 )
                 self.component_capabilities[name] = tuple(
                     HostMemoryCapability(
-                        raw.data_ptr() + index * layout.nbytes,
+                        raw.data_ptr() + index * host_extent,
                         layout.nbytes,
                         True,
                         allocation.capability.device_pointer(
-                            raw.data_ptr() + index * layout.nbytes, layout.nbytes
+                            raw.data_ptr() + index * host_extent, layout.nbytes
                         ),
                         host_pool,
                     )
@@ -563,7 +582,7 @@ class V4LayerStorage:
             return
         for name in self.raw_components:
             parameter = getattr(self.layer, name)
-            parameter.data = torch.empty(0, dtype=torch.uint8, device="cpu")
+            parameter.data = torch.empty(0, dtype=parameter.dtype, device="cpu")
             if hasattr(parameter, "weight_loader"):
                 del parameter.weight_loader
         self.raw_components.clear()
