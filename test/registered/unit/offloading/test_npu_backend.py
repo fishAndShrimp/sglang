@@ -587,5 +587,70 @@ class NpuBackendAssemblyTests(unittest.TestCase):
         )
 
 
+class TestNPUDispatchBytePacking(unittest.TestCase):
+    def layout(self):
+        return npu_experts.NPUDispatchLayout(
+            2, 256, 8, "cpu", torch.zeros((), dtype=torch.int32)
+        )
+
+    def test_padding_fill_accepts_npu_dtypes_and_reuses_workspace(self):
+        layout = self.layout()
+        source = torch.arange(256, dtype=torch.int64).to(torch.uint8).reshape(8, 32)
+        indices = torch.tensor([7, 0, 6, 1, 5, 2, 4, 3])
+        original_fill = torch.Tensor.masked_fill_
+
+        def npu_fill(tensor, mask, value):
+            if tensor.dtype == torch.uint8:
+                raise RuntimeError("selfRef not implemented for DT_UINT8")
+            return original_fill(tensor, mask, value)
+
+        with mock.patch.object(torch.Tensor, "masked_fill_", npu_fill):
+            result = layout._gather_bytes(
+                source, indices, torch.tensor(3), "scale_bytes"
+            )
+
+        expected = source.index_select(0, indices)
+        expected[3:].zero_()
+        self.assertTrue(torch.equal(result, expected))
+        self.assertEqual(result.data_ptr(), layout._owned["scale_bytes"].data_ptr())
+
+    def test_activation_and_scale_payload_bits_and_padding(self):
+        layout = self.layout()
+        indices = torch.tensor([7, 0, 6, 1, 5, 2, 4, 3])
+        dtypes = [
+            torch.uint8,
+            torch.int8,
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ]
+        if hasattr(torch, "float8_e8m0fnu"):
+            dtypes.append(torch.float8_e8m0fnu)
+        for name, width in (("input_bytes", 256), ("scale_bytes", 32)):
+            payload = (
+                torch.arange(8 * width).reshape(8, width) * 17
+                + torch.arange(8).unsqueeze(1) * 31
+            ).to(torch.uint8)
+            for dtype in dtypes:
+                source = payload.view(dtype)
+                for count in (0, 3, 8):
+                    with self.subTest(workspace=name, dtype=dtype, count=count):
+                        storage = layout._owned[name]
+                        storage.fill_(171)
+                        result = layout._gather_bytes(
+                            source, indices, torch.tensor(count), name
+                        )
+                        expected = payload.index_select(0, indices)
+                        expected[count:].zero_()
+                        self.assertEqual(result.dtype, dtype)
+                        self.assertEqual(result.shape, source.shape)
+                        self.assertEqual(result.data_ptr(), storage.data_ptr())
+                        self.assertTrue(torch.equal(result.view(torch.uint8), expected))
+                        self.assertTrue(torch.equal(source.view(torch.uint8), payload))
+                        self.assertTrue(bool((storage[payload.numel() :] == 171).all()))
+
+
 if __name__ == "__main__":
     unittest.main()

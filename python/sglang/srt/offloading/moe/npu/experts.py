@@ -420,7 +420,10 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
             raise ValueError("Activation scale workspace capacity exceeded")
         out = storage[:nbytes].view(byte_rows.shape)
         torch.index_select(byte_rows, 0, indices, out=out)
-        out.masked_fill_((self._owned["rows"][:rows] >= count).unsqueeze(1), 0)
+        # ACLNN masked_fill_ supports INT8, not UINT8. Alias the same byte storage.
+        out.view(torch.int8).masked_fill_(
+            (self._owned["rows"][:rows] >= count).unsqueeze(1), 0
+        )
         return out.view(source.dtype).view(source.shape)
 
     def select_wave(self, layout, wave, context):
