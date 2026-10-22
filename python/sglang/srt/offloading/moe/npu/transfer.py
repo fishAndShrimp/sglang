@@ -499,9 +499,9 @@ def _npu_completion(stream):
 
 
 def _group_pack_copy(*args):
-    from memfabric_hybrid.mf_acc_offload import group_pack_copy
+    from memfabric_hybrid import offload
 
-    return group_pack_copy(*args)
+    return offload.group_pack_copy(*args)
 
 
 class MemFabricDeviceTransferOps(DeviceTransferOps):
