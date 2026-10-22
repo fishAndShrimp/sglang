@@ -125,7 +125,11 @@ class ManagedExecutionContext(ExecutionContext):
                 if not isinstance(ticket, TransferTicket):
                     raise TypeError("Forward completion requires TransferTicket")
                 self.retain(ticket)
-            self._record_on(self.copy_stream)
+            copy_done = self._record_on(self.copy_stream)
+            if self.capturing:
+                # CaptureEnd requires every auxiliary stream's final task to
+                # rejoin the origin stream, including this completion record.
+                copy_done.completion.wait_on(self.compute_stream)
             idle = TransferTicket(
                 JoinedCompletion(tuple(self._dependencies)),
                 tuple(self._resources),
