@@ -99,9 +99,13 @@ class DispatchOnceProgram(WholeMoEProgram):
                 wave.local_end,
                 wave.bank,
             )
-            wave_input = self.layout_adapter.select_wave(layout, wave, context)
-            local = self.local_program.run(layer, wave_input, wave, context)
-            self.layout_adapter.write_wave(layout, wave, local, context)
+            with context.temporary_scope():
+                wave_input = self.layout_adapter.select_wave(layout, wave, context)
+                local = self.local_program.run(layer, wave_input, wave, context)
+                self.layout_adapter.write_wave(layout, wave, local, context)
+                # Do not keep the previous wave's output in loop locals while
+                # materializing/running the next wave over the same workspaces.
+                del local, wave_input
         logger.debug(
             "MoE offload combine.submit: phase=%s capture=%s layer=%s",
             context.phase.value,

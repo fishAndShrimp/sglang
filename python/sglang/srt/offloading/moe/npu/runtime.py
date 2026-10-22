@@ -313,7 +313,12 @@ class NpuBoundMoERuntime(BoundMoERuntime):
             if context.phase is Phase.PREFILL
             else self.decode_program
         )
-        return program.run(layer_id, hidden_states, routing, context)
+        # Dispatch/combine join native communication onto compute_stream. This
+        # matches resident inference: release receive tensors/handles after C so
+        # the graph allocator can reuse them for the next layer. Events and copy
+        # descriptors remain pinned by the invocation; failed scopes keep tensors.
+        with context.temporary_scope():
+            return program.run(layer_id, hidden_states, routing, context)
 
     @staticmethod
     def _phase(forward_batch):
@@ -468,6 +473,17 @@ class NpuBoundMoERuntime(BoundMoERuntime):
             # Outside the captured graph: replay observes the live device flag.
             self.residency.update_enabled.fill_(True)
             self.synchronize()
+
+    def after_graph_warmup(self):
+        self._require_open()
+        if self._capture is None or self._context is not None or not self._capture:
+            raise RuntimeError("Warmup retirement requires a finished invocation")
+        # capture_one invokes its reset hook after one eager forward, before the
+        # next warmup/capture. Older entries may belong to captured graph buckets.
+        context = self._capture[-1]
+        self.synchronize()  # Includes native EP streams and partially queued work.
+        context.release_completed()
+        self._capture.pop()
 
     def _account_capture_workspace(self, owner):
         if self._static_allocated is None:

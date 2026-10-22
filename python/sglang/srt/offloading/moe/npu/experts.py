@@ -481,8 +481,8 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
                 belongs = (layout.row_ids >= selected.offset) & (
                     layout.row_ids < selected.offset + selected.row_count
                 )
-                layout.output.copy_(
-                    torch.where(belongs.unsqueeze(1), values, layout.output)
+                torch.where(
+                    belongs.unsqueeze(1), values, layout.output, out=layout.output
                 )
             layout.selected = None
 
@@ -565,8 +565,9 @@ class NPUExpertRunner:
             # Unwritten GMM padding may contain NaN; multiply-by-zero is unsafe.
             row_ids = torch.arange(output.shape[0], device=output.device)
             good_rows = (row_ids < dispatched.row_count) & healthy
-            output = torch.where(good_rows.unsqueeze(1), output, 0)
-            context.retain(output)
+            # Own the GMM result: clear padding in place rather than allocating
+            # and retaining a second [receive_capacity, hidden] output per wave.
+            output.masked_fill_(~good_rows.unsqueeze(1), 0)
             return LocalExecution(output, self._reader_ticket(context))
 
 

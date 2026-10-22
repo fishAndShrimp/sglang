@@ -5,6 +5,7 @@ and weight reloads are supplied by the binding; none of these helpers certifies
 an accelerator graph or creates another expert-weight allocation.
 """
 
+from contextlib import contextmanager
 from dataclasses import fields
 from threading import RLock
 
@@ -46,6 +47,7 @@ class ManagedExecutionContext(ExecutionContext):
         self._failure_drain = failure_drain
         self._lock = RLock()
         self._resources = []
+        self._temporary_resources = []
         self._dependencies = []
         self._closed = False
         self._completion = None
@@ -56,11 +58,48 @@ class ManagedExecutionContext(ExecutionContext):
                 raise RuntimeError(
                     "Invocation already closed; join workers before finish"
                 )
-            self._resources.append(resource)
-            if isinstance(resource, TransferTicket):
-                self._dependencies.append(resource.completion)
-            elif isinstance(resource, Completion):
-                self._dependencies.append(resource)
+            if isinstance(resource, (TransferTicket, Completion)):
+                # Captured events and transfer keepalives outlive tensor scopes.
+                self._resources.append(resource)
+                self._dependencies.append(
+                    resource.completion
+                    if isinstance(resource, TransferTicket)
+                    else resource
+                )
+            elif self._temporary_resources:
+                self._temporary_resources[-1].append(resource)
+            else:
+                self._resources.append(resource)
+
+    @contextmanager
+    def temporary_scope(self):
+        """Allow compute-stream temporaries to be reused during decode capture.
+
+        Only use after joining off-stream readers onto compute_stream. Ordinary
+        tensor allocation/free then follows the same allocator rules as resident
+        inference; graph pools keep addresses reserved without pinning every
+        intermediate Tensor. Owners/tickets keep registrations and events alive.
+        Prefill workers retain their existing invocation-wide lifetime.
+        """
+        if self.phase is not Phase.DECODE:
+            yield
+            return
+        resources = []
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Invocation already closed")
+            self._temporary_resources.append(resources)
+        try:
+            yield
+        except BaseException:
+            # Partial submission may have no usable event. Do not release these
+            # resources until the runtime drains every device/communication stream.
+            with self._lock:
+                self._resources.extend(resources)
+            raise
+        finally:
+            with self._lock:
+                self._temporary_resources.pop()
 
     def record_compute_completion(self):
         return self._record_on(self.compute_stream)
@@ -76,6 +115,8 @@ class ManagedExecutionContext(ExecutionContext):
         with self._lock:
             if self._closed:
                 raise RuntimeError("Invocation already finished")
+            if self._temporary_resources:
+                raise RuntimeError("Close temporary scopes before finishing invocation")
             # Fresh records on *this* submission; capture-time tickets cannot
             # establish completion of a later replay.
             output_ready = output_ready or self.record_compute_completion()
@@ -92,6 +133,24 @@ class ManagedExecutionContext(ExecutionContext):
             self._completion = ForwardCompletion(output_ready, residency_ready, idle)
             self._closed = True
             return self._completion
+
+    def release_completed(self):
+        """Release a completed invocation's keepalives outside device capture.
+
+        Used for eager graph warmups. Captured invocations must stay pinned until
+        their graph is destroyed. Keep every reference if completion waiting fails.
+        """
+        with self._lock:
+            if not self._closed or self._completion is None:
+                raise RuntimeError("Finish the invocation before releasing resources")
+            completion = self._completion
+        completion.resources_idle.completion.synchronize()
+        with self._lock:
+            self._resources.clear()
+            self._dependencies.clear()
+            # Leases can refer back to this context. Drop the completion's copy
+            # of the keepalives too, so warmup tensors do not wait for cyclic GC.
+            self._completion = None
 
     def abort(self):
         """Drain failed submissions before releasing any retained Python object."""

@@ -70,13 +70,23 @@ class ExecutionContext(ABC):
 
     @abstractmethod
     def retain(self, resource):
-        """Pin before submission, through failure drain and graph leases.
+        """Pin before submission, within the current resource scope.
 
         TransferTicket dependencies also join resources_idle. A partial submission
         without a ticket is drained by the runtime's stream/worker failure path.
         Capture-time tickets are not host proof of a subsequent replay finishing.
         Eager implementations must support calls from the prefill submitter thread.
         """
+
+    def temporary_scope(self):
+        """Optional stream-ordered lifetime for decode wave/layer temporaries.
+
+        The caller must join every auxiliary consumer onto compute_stream before
+        successful exit. Events, transfer descriptors and persistent allocations
+        remain owned through completion/graph teardown. Failure must pin partial
+        submissions until drain. Conservative contexts keep invocation lifetimes.
+        """
+        return nullcontext()
 
     @abstractmethod
     def record_compute_completion(self) -> TransferTicket:
@@ -313,6 +323,14 @@ class BoundMoERuntime(ABC):
         raise NotImplementedError(
             "Bind MoE warmup/capture scope before creating graphs"
         )
+
+    def after_graph_warmup(self):
+        """Retire the just-finished eager warmup, outside device graph capture.
+
+        Called after each backend warmup and its existing reset hook. Drain all
+        readers/copies before releasing temporary keepalives; preserve resources
+        from earlier captured buckets. Failure must leave keepalives pinned.
+        """
 
     @abstractmethod
     def forward_scope(self, owner, forward_batch):

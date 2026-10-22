@@ -93,11 +93,20 @@ class GraphLeaseBackend:
         lease = self.owner.acquire_graph((self._identity, shape_key))
         self._leases[shape_key] = lease
         try:
+            warmup_hook = post_warmup_hook
+            retire_warmup = getattr(self.owner.runtime, "after_graph_warmup", None)
+            if retire_warmup is not None:
+
+                def warmup_hook():
+                    if post_warmup_hook is not None:
+                        post_warmup_hook()
+                    retire_warmup()
+
             result = self.backend.capture_one(
                 shape_key,
                 forward_fn,
                 capture_inputs=capture_inputs,
-                post_warmup_hook=post_warmup_hook,
+                post_warmup_hook=warmup_hook,
             )
             logger.info(
                 "MoE offload graph.capture.ready: rank=%s bucket=%s",
