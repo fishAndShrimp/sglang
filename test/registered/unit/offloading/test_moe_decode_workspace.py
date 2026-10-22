@@ -1,8 +1,9 @@
-"""CPU tests of production decode lifetimes/layout; native EP/GMM are simulated."""
+"""CPU tests of MoE compute lifetimes/layout; native EP/GMM are simulated."""
 
 import unittest
 import weakref
 from collections import namedtuple
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -16,6 +17,8 @@ from sglang.srt.offloading.moe.npu.runtime import NpuBoundMoERuntime
 from sglang.srt.offloading.moe.programs import (
     DecodeLocalExpertProgram,
     DispatchOnceProgram,
+    PrefillDispatchOnceProgram,
+    PrefillLocalExpertProgram,
 )
 from sglang.srt.offloading.moe.runtime import ManagedExecutionContext
 from sglang.srt.offloading.transfer import ImmediateCompletion, TransferTicket
@@ -33,7 +36,7 @@ class QuantInfo:
 
 
 class TestDecodeWorkspace(unittest.TestCase):
-    def fixture(self, ids=(0, 2), experts=4, slots=2):
+    def fixture(self, ids=(0, 2), experts=4, slots=2, *, phase=Phase.DECODE):
         ids = torch.tensor(ids, dtype=torch.int64).unsqueeze(1)
         rows, hidden = max(8, ids.numel()), 4
         raw_refs, output_refs, waits = [], [], []
@@ -57,10 +60,15 @@ class TestDecodeWorkspace(unittest.TestCase):
                 self.handle = order
                 self.token_rows = hidden_states.shape[0]
                 return SimpleNamespace(
-                    format=SimpleNamespace(value="deepep_ll"),
+                    format=SimpleNamespace(
+                        value="deepep_normal" if phase is Phase.PREFILL else "deepep_ll"
+                    ),
                     hidden_states=receive,
                     hidden_states_scale=None,
                     masked_m=torch.bincount(expert_ids[order], minlength=experts),
+                    num_recv_tokens_per_expert=torch.bincount(
+                        expert_ids[order], minlength=experts
+                    ).tolist(),
                     topk_ids=topk_output.topk_ids,
                     topk_weights=topk_output.topk_weights,
                 )
@@ -112,21 +120,57 @@ class TestDecodeWorkspace(unittest.TestCase):
         dispatcher._combine_input = lambda raw, hidden_states: SimpleNamespace(
             hidden_states=hidden_states
         )
-        runner = native.NPUExpertRunner(
-            None, _core=Core(), _input_type=SimpleNamespace
-        )
-        local = DecodeLocalExpertProgram(
-            Access(),
-            lambda layer, wave_input, wave, context: SimpleNamespace(wave=wave),
-            runner,
-        )
-        program = DispatchOnceProgram(
-            fixed_waves(experts, slots),
-            dispatcher,
-            local,
-            layout,
-            local_experts=experts,
-        )
+        runner = native.NPUExpertRunner(None, _core=Core(), _input_type=SimpleNamespace)
+        waves = fixed_waves(experts, slots)
+        access = Access()
+        if phase is Phase.PREFILL:
+
+            class Pipeline:
+                def __init__(self):
+                    self.access = access
+                    self.active_layer = None
+
+                def start(self, layer, context):
+                    test.assertIsNone(self.active_layer)
+                    self.active_layer = layer
+
+                def validate_session(self, layer, context):
+                    test.assertEqual(self.active_layer, layer)
+
+                def seal(self, layer, ready, context):
+                    self.validate_session(layer, context)
+                    return waves
+
+                def acquire(self, layer, wave, context):
+                    self.validate_session(layer, context)
+                    return self.access.stage(SimpleNamespace(wave=wave), context)
+
+                def finish(self, layer, context):
+                    self.validate_session(layer, context)
+                    self.active_layer = None
+                    return TransferTicket(ImmediateCompletion())
+
+                def abort(self, context):
+                    self.active_layer = None
+                    return TransferTicket(ImmediateCompletion())
+
+            pipeline = Pipeline()
+            program = PrefillDispatchOnceProgram(
+                dispatcher,
+                PrefillLocalExpertProgram(pipeline, runner),
+                layout,
+                local_experts=experts,
+                pipeline=pipeline,
+            )
+        else:
+            local = DecodeLocalExpertProgram(
+                access,
+                lambda layer, wave_input, wave, context: SimpleNamespace(wave=wave),
+                runner,
+            )
+            program = DispatchOnceProgram(
+                waves, dispatcher, local, layout, local_experts=experts
+            )
         device = SimpleNamespace(
             copy_stream="copy",
             current_stream=lambda: "compute",
@@ -140,12 +184,15 @@ class TestDecodeWorkspace(unittest.TestCase):
             cache_updates=None,
             snapshot=None,
             reload_weights=None,
-            layer_programs={i: SimpleNamespace(decode=program) for i in range(3, 43)},
+            layer_programs={
+                i: SimpleNamespace(decode=program, prefill=program)
+                for i in range(3, 43)
+            },
             resources=(),
             expert_nbytes=1,
             storage=(),
         )
-        context = runtime._new_context(Phase.DECODE, capturing=True)
+        context = runtime._new_context(phase, capturing=phase is Phase.DECODE)
         context.forward_batch = SimpleNamespace(
             moe_num_token_non_padded=lambda: torch.tensor(ids.shape[0])
         )
@@ -163,33 +210,53 @@ class TestDecodeWorkspace(unittest.TestCase):
         )
 
     def test_forty_layers_reuse_workspace_without_pinning_receive_or_ffn_outputs(self):
-        with patch.dict("os.environ", {"MOE_ENABLE_TOPK_NEG_ONE": "1"}), patch.object(
-            native, "_compute_scope", lambda *args: nullcontext()
+        with (
+            patch.dict("os.environ", {"MOE_ENABLE_TOPK_NEG_ONE": "1"}),
+            patch.object(native, "_compute_scope", lambda *args: nullcontext()),
         ):
-            fixture = self.fixture()
-            pointers = {k: v.data_ptr() for k, v in fixture.layout._owned.items()}
-            value = fixture.input
-            for step, layer in enumerate(range(3, 43), 1):
-                value = fixture.runtime.run_layer(layer, value, fixture.routes)
-                self.assertTrue(all(ref() is None for ref in fixture.raw_refs))
-                self.assertTrue(all(ref() is None for ref in fixture.output_refs))
-                torch.testing.assert_close(
-                    value,
-                    fixture.input + step * (fixture.routes.topk_ids + 1),
-                )
-            self.assertEqual(
-                pointers, {k: v.data_ptr() for k, v in fixture.layout._owned.items()}
-            )
-            self.assertEqual(fixture.waits, ["ready", "read_done"] * 80)
-            # Normal decode submission/capture never adds a host synchronization.
-            self.assertNotIn("drain", fixture.waits)
-            completion = fixture.context.finish()
-            self.assertTrue(completion.resources_idle.completion.done())
+            for phase in Phase:
+                with self.subTest(phase=phase):
+                    fixture = self.fixture(phase=phase)
+                    pointers = {
+                        k: v.data_ptr() for k, v in fixture.layout._owned.items()
+                    }
+                    value = fixture.input
+                    for step, layer in enumerate(range(3, 43), 1):
+                        if phase is Phase.PREFILL:
+                            fixture.runtime.prefill_program.layer_start(
+                                layer, fixture.context
+                            )
+                        routes = Routes(
+                            fixture.routes.topk_ids.clone(),
+                            fixture.routes.topk_weights.clone(),
+                        )
+                        route_refs = [weakref.ref(tensor) for tensor in routes]
+                        value = fixture.runtime.run_layer(layer, value, routes)
+                        del routes
+                        self.assertTrue(all(ref() is None for ref in route_refs))
+                        self.assertTrue(all(ref() is None for ref in fixture.raw_refs))
+                        self.assertTrue(
+                            all(ref() is None for ref in fixture.output_refs)
+                        )
+                        torch.testing.assert_close(
+                            value,
+                            fixture.input + step * (fixture.routes.topk_ids + 1),
+                        )
+                    self.assertEqual(
+                        pointers,
+                        {k: v.data_ptr() for k, v in fixture.layout._owned.items()},
+                    )
+                    self.assertEqual(fixture.waits, ["ready", "read_done"] * 80)
+                    # Neither prefill nor decode adds a host synchronization.
+                    self.assertNotIn("drain", fixture.waits)
+                    completion = fixture.context.finish()
+                    self.assertTrue(completion.resources_idle.completion.done())
 
     def test_padding_is_sanitized_in_place_including_empty_and_partial_waves(self):
         cases = [((0, 2), 4, 2), ((2, 2), 4, 2), ((-1, -1), 4, 2), ((4, 0), 5, 2)]
-        with patch.dict("os.environ", {"MOE_ENABLE_TOPK_NEG_ONE": "1"}), patch.object(
-            native, "_compute_scope", lambda *args: nullcontext()
+        with (
+            patch.dict("os.environ", {"MOE_ENABLE_TOPK_NEG_ONE": "1"}),
+            patch.object(native, "_compute_scope", lambda *args: nullcontext()),
         ):
             for ids, experts, slots in cases:
                 with self.subTest(ids=ids, experts=experts):
@@ -225,32 +292,36 @@ class TestDecodeWorkspace(unittest.TestCase):
             def synchronize(self):
                 self.ready = True
 
-        completion = Completion()
-        context = ManagedExecutionContext(
-            Phase.DECODE,
-            compute_stream="compute",
-            copy_stream="copy",
-            record_completion=lambda stream: TransferTicket(ImmediateCompletion()),
-            failure_drain=lambda: None,
-            capturing=True,
-        )
-        with context.temporary_scope():
-            temporary = torch.ones(4)
-            protected = torch.ones(4)
-            temporary_ref = weakref.ref(temporary)
-            protected_ref = weakref.ref(protected)
-            context.retain(temporary)
-            context.retain(TransferTicket(completion, (protected,)))
-            del temporary, protected
-        self.assertIsNone(temporary_ref())
-        self.assertIsNotNone(protected_ref())
-        self.assertFalse(completion.done())
-        finished = context.finish()
-        self.assertFalse(finished.resources_idle.completion.done())
-        finished.resources_idle.completion.synchronize()
-        self.assertTrue(completion.done())
-        # Captured event/transfer storage stays pinned until explicit teardown.
-        self.assertIsNotNone(protected_ref())
+        for phase in Phase:
+            with self.subTest(phase=phase):
+                completion = Completion()
+                context = ManagedExecutionContext(
+                    phase,
+                    compute_stream="compute",
+                    copy_stream="copy",
+                    record_completion=lambda stream: TransferTicket(
+                        ImmediateCompletion()
+                    ),
+                    failure_drain=lambda: None,
+                    capturing=phase is Phase.DECODE,
+                )
+                with context.temporary_scope():
+                    temporary = torch.ones(4)
+                    protected = torch.ones(4)
+                    temporary_ref = weakref.ref(temporary)
+                    protected_ref = weakref.ref(protected)
+                    context.retain(temporary)
+                    context.retain(TransferTicket(completion, (protected,)))
+                    del temporary, protected
+                self.assertIsNone(temporary_ref())
+                self.assertIsNotNone(protected_ref())
+                self.assertFalse(completion.done())
+                finished = context.finish()
+                self.assertFalse(finished.resources_idle.completion.done())
+                finished.resources_idle.completion.synchronize()
+                self.assertTrue(completion.done())
+                # Event/transfer storage survives normal compute-scope release.
+                self.assertIsNotNone(protected_ref())
 
     def test_prefill_keeps_invocation_lifetimes_for_worker_submissions(self):
         context = ManagedExecutionContext(
@@ -260,19 +331,102 @@ class TestDecodeWorkspace(unittest.TestCase):
             record_completion=lambda stream: TransferTicket(ImmediateCompletion()),
             failure_drain=lambda: None,
         )
-        with context.temporary_scope():
+
+        def submit():
             tensor = torch.ones(4)
             reference = weakref.ref(tensor)
             context.retain(tensor)
-            del tensor
-        self.assertIsNotNone(reference())
+            return reference
+
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            with context.temporary_scope():
+                tensor = torch.ones(4)
+                compute_reference = weakref.ref(tensor)
+                context.retain(tensor)
+                reference = workers.submit(submit).result()
+                del tensor
+            self.assertIsNone(compute_reference())
+            self.assertIsNotNone(reference())
         context.finish()
         context.release_completed()
         self.assertIsNone(reference())
 
+    def test_nested_prefill_scopes_release_only_their_own_compute_temporaries(self):
+        context = ManagedExecutionContext(
+            Phase.PREFILL,
+            compute_stream="compute",
+            copy_stream="copy",
+            record_completion=lambda stream: TransferTicket(ImmediateCompletion()),
+            failure_drain=lambda: None,
+        )
+        with context.temporary_scope():
+            outer = torch.ones(4)
+            outer_ref = weakref.ref(outer)
+            context.retain(outer)
+            del outer
+            with context.temporary_scope():
+                tensor = torch.ones(4)
+                reference = weakref.ref(tensor)
+                context.retain(tensor)
+                del tensor
+            self.assertIsNone(reference())
+            self.assertIsNotNone(outer_ref())
+        self.assertIsNone(outer_ref())
+        context.finish()
+
+    def test_worker_cannot_open_submission_thread_temporary_scopes(self):
+        context = ManagedExecutionContext(
+            Phase.PREFILL,
+            compute_stream="compute",
+            copy_stream="copy",
+            record_completion=lambda stream: TransferTicket(ImmediateCompletion()),
+            failure_drain=lambda: None,
+        )
+
+        def submit():
+            with context.temporary_scope():
+                self.fail("Worker must keep invocation lifetimes")
+
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            with self.assertRaisesRegex(RuntimeError, "submission thread"):
+                workers.submit(submit).result()
+        self.assertFalse(context._temporary_resources)
+        context.finish()
+
+    def test_failed_prefill_wave_keeps_tensors_through_failed_drain(self):
+        with (
+            patch.dict("os.environ", {"MOE_ENABLE_TOPK_NEG_ONE": "1"}),
+            patch.object(native, "_compute_scope", lambda *args: nullcontext()),
+        ):
+            fixture = self.fixture(phase=Phase.PREFILL)
+            fixture.runtime.prefill_program.layer_start(3, fixture.context)
+
+            def fail(*args):
+                raise RuntimeError("write failed after F")
+
+            fixture.layout.write_wave = fail
+            with self.assertRaisesRegex(RuntimeError, "write failed after F"):
+                fixture.runtime.run_layer(3, fixture.input, fixture.routes)
+            self.assertIsNotNone(fixture.raw_refs[-1]())
+            self.assertIsNotNone(fixture.output_refs[-1]())
+            self.assertFalse(fixture.context._temporary_resources)
+            with patch.object(
+                fixture.context,
+                "_failure_drain",
+                side_effect=RuntimeError("drain failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "drain failed"):
+                    fixture.context.abort()
+            self.assertIsNotNone(fixture.raw_refs[-1]())
+            self.assertIsNotNone(fixture.output_refs[-1]())
+            fixture.context.abort()
+            self.assertIsNone(fixture.raw_refs[-1]())
+            self.assertIsNone(fixture.output_refs[-1]())
+
     def test_failed_wave_keeps_tensors_until_failure_drain(self):
-        with patch.dict("os.environ", {"MOE_ENABLE_TOPK_NEG_ONE": "1"}), patch.object(
-            native, "_compute_scope", lambda *args: nullcontext()
+        with (
+            patch.dict("os.environ", {"MOE_ENABLE_TOPK_NEG_ONE": "1"}),
+            patch.object(native, "_compute_scope", lambda *args: nullcontext()),
         ):
             fixture = self.fixture()
 

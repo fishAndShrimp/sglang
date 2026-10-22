@@ -7,7 +7,7 @@ an accelerator graph or creates another expert-weight allocation.
 
 from contextlib import contextmanager
 from dataclasses import fields
-from threading import RLock
+from threading import RLock, get_ident
 
 from ..transfer import Completion, JoinedCompletion, TransferTicket
 from .config import Phase
@@ -48,6 +48,7 @@ class ManagedExecutionContext(ExecutionContext):
         self._lock = RLock()
         self._resources = []
         self._temporary_resources = []
+        self._submission_thread = get_ident()
         self._dependencies = []
         self._closed = False
         self._completion = None
@@ -66,24 +67,24 @@ class ManagedExecutionContext(ExecutionContext):
                     if isinstance(resource, TransferTicket)
                     else resource
                 )
-            elif self._temporary_resources:
+            elif self._temporary_resources and get_ident() == self._submission_thread:
                 self._temporary_resources[-1].append(resource)
             else:
                 self._resources.append(resource)
 
     @contextmanager
     def temporary_scope(self):
-        """Allow compute-stream temporaries to be reused during decode capture.
+        """Release submission-thread wave/layer temporaries in prefill and decode.
 
         Only use after joining off-stream readers onto compute_stream. Ordinary
         tensor allocation/free then follows the same allocator rules as resident
         inference; graph pools keep addresses reserved without pinning every
         intermediate Tensor. Owners/tickets keep registrations and events alive.
-        Prefill workers retain their existing invocation-wide lifetime.
+        Background submitters bypass these scopes, retaining their resources for
+        the invocation even while the submission thread has an open scope.
         """
-        if self.phase is not Phase.DECODE:
-            yield
-            return
+        if get_ident() != self._submission_thread:
+            raise RuntimeError("Only the submission thread may open temporary scopes")
         resources = []
         with self._lock:
             if self._closed:

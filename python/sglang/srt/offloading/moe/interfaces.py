@@ -79,12 +79,14 @@ class ExecutionContext(ABC):
         """
 
     def temporary_scope(self):
-        """Optional stream-ordered lifetime for decode wave/layer temporaries.
+        """Optional stream-ordered lifetime for prefill/decode wave/layer temporaries.
 
         The caller must join every auxiliary consumer onto compute_stream before
         successful exit. Events, transfer descriptors and persistent allocations
-        remain owned through completion/graph teardown. Failure must pin partial
-        submissions until drain. Conservative contexts keep invocation lifetimes.
+        remain owned through completion/graph teardown. Background submitters
+        retain invocation lifetimes independently of compute-thread scopes.
+        Failure must pin partial submissions until drain. Conservative contexts
+        keep invocation lifetimes.
         """
         return nullcontext()
 

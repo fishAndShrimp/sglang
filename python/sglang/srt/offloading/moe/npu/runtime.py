@@ -307,7 +307,6 @@ class NpuBoundMoERuntime(BoundMoERuntime):
         # Eager preprocessing may replace the local-padding Tensor after
         # forward_scope entry. Read the finalized batch binding at actual D.
         context.num_token_non_padded = context.forward_batch.moe_num_token_non_padded()
-        self.emit_after_router(layer_id, routing, context)
         program = (
             self.prefill_program
             if context.phase is Phase.PREFILL
@@ -318,6 +317,7 @@ class NpuBoundMoERuntime(BoundMoERuntime):
         # the graph allocator can reuse them for the next layer. Events and copy
         # descriptors remain pinned by the invocation; failed scopes keep tensors.
         with context.temporary_scope():
+            self.emit_after_router(layer_id, routing, context)
             return program.run(layer_id, hidden_states, routing, context)
 
     @staticmethod
