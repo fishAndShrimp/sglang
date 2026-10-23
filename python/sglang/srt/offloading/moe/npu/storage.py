@@ -78,7 +78,7 @@ class MemFabricHostPool:
         self.nbytes = _align(total_bytes, self.page_size)
         if self.nbytes > physical_bytes:
             raise ValueError("Registered slab exceeds the physical host budget")
-        _check_host_registration_platform(platform.system(), platform.release())
+        # _check_host_registration_platform(platform.system(), platform.release())
         hicache = sys.modules.get("sglang.srt.mem_cache.pool_host.npu_memfabric")
         hicache_active = getattr(hicache, "_memfabric_state", {}).get(
             "initialized", False

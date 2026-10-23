@@ -382,7 +382,7 @@ class NpuMoEBackend(MoEBackend):
             self.runtime.context.retain(resource)
 
         host_ops = make_acl_host_ops(
-            retain=retain, module=self.native_acl, source_location="unregistered"
+            retain=retain, module=self.native_acl, source_location="host"
         )
         device_ops = MemFabricDeviceTransferOps(retain=retain)
         transfer = ComposedTransferBackend(host_ops=host_ops, device_ops=device_ops)
