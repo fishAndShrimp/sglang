@@ -9,12 +9,14 @@ Usage:
   MODEL_PATH=/path/to/DeepSeek-V4-Flash bash scripts/launch_moe_offload_npu.sh
   MODEL_PATH=/path/to/DeepSeek-V4-Flash bash scripts/launch_moe_offload_npu.sh --dry-run
 
-Defaults: WORLD_SIZE=4, ASCEND_RT_VISIBLE_DEVICES=0,1,2,3, TP=4, EP=4, DP=1.
+Defaults: WORLD_SIZE=4, ASCEND_RT_VISIBLE_DEVICES=0,1,2,3, TP=4, EP=4.
+ATTN_DP_SIZE=1 by default; model-replica DP=1 and MoE DP=1 stay fixed.
 MODEL_PATH must point to local DeepSeek V4 FP4 or ModelSlim W8A8 safetensors.
 GLM, converted FP8 experts and speculative decoding are not supported.
 
 Overrides:
   SGLANG_ROOT, PYTHON_BIN, WORLD_SIZE, ASCEND_RT_VISIBLE_DEVICES
+  ATTN_DP_SIZE=1 (must divide WORLD_SIZE; e.g. 8/8 or 16/16)
   MOE_EXPERT_FORMAT=auto (fp4 or w8a8; auto reads quant_model_description.json)
   MOE_OFFLOAD_CONFIG (defaults to the repository's npu/examples/v4.json)
   SERVER_HOST=127.0.0.1 SERVER_PORT=8818 SERVED_MODEL_NAME=deepseek-v4-moe-offload
@@ -57,6 +59,7 @@ SGLANG_ROOT=${SGLANG_ROOT:-$(cd -- "$SCRIPT_DIR/.." && pwd)}
 PYTHON_BIN=${PYTHON_BIN:-python3}
 MODEL_PATH=${MODEL_PATH:-}
 WORLD_SIZE=${WORLD_SIZE:-4}
+ATTN_DP_SIZE=${ATTN_DP_SIZE:-1}
 SERVER_HOST=${SERVER_HOST:-127.0.0.1}
 SERVER_PORT=${SERVER_PORT:-8818}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-deepseek-v4-moe-offload}
@@ -81,10 +84,11 @@ OTLP_SERVICE_NAME=${OTLP_SERVICE_NAME:-$SERVED_MODEL_NAME}
 PROFILE_CAPTURE=${PROFILE_CAPTURE:-0}
 
 [[ -n "$MODEL_PATH" ]] || die "Set MODEL_PATH to a DeepSeek V4 FP4 or W8A8 checkpoint; see --help."
-for name in WORLD_SIZE SERVER_PORT MAX_RUNNING_REQUESTS CHUNKED_PREFILL_SIZE CONTEXT_LENGTH DECODE_LOG_INTERVAL; do
+for name in WORLD_SIZE ATTN_DP_SIZE SERVER_PORT MAX_RUNNING_REQUESTS CHUNKED_PREFILL_SIZE CONTEXT_LENGTH DECODE_LOG_INTERVAL; do
     value=${!name}
     [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "$name must be a positive integer."
 done
+(( WORLD_SIZE % ATTN_DP_SIZE == 0 )) || die "ATTN_DP_SIZE must divide WORLD_SIZE."
 (( SERVER_PORT <= 65535 )) || die "SERVER_PORT exceeds 65535."
 (( MAX_RUNNING_REQUESTS <= 128 )) || die "MAX_RUNNING_REQUESTS must not exceed the DeepEP dispatch limit (128)."
 [[ "$BUILD_NATIVE" =~ ^[01]$ ]] || die "BUILD_NATIVE must be 0 or 1."
@@ -315,22 +319,27 @@ print(directory)
 PY
 )
 
+# Include the attention-TP alignment bucket even when concurrency is lower.
+# The graph runner applies its final backend-specific bucket filtering.
+ATTN_TP_SIZE=$((WORLD_SIZE / ATTN_DP_SIZE))
+GRAPH_MAX_BS=$(((MAX_RUNNING_REQUESTS + ATTN_TP_SIZE - 1) / ATTN_TP_SIZE * ATTN_TP_SIZE))
 GRAPH_BS=()
-for ((bs=1; bs<MAX_RUNNING_REQUESTS; bs*=2)); do GRAPH_BS+=("$bs"); done
-GRAPH_BS+=("$MAX_RUNNING_REQUESTS")
+for ((bs=1; bs<GRAPH_MAX_BS; bs*=2)); do GRAPH_BS+=("$bs"); done
+GRAPH_BS+=("$GRAPH_MAX_BS")
 BUILD_CMD=("$PYTHON_BIN" -m sglang.srt.offloading.moe.npu.native_acl --build-directory "$NATIVE_BUILD_DIR")
 SERVER_CMD=(
     "$PYTHON_BIN" -m sglang.launch_server
     --model-path "$MODEL_PATH" --served-model-name "$SERVED_MODEL_NAME"
     --host "$SERVER_HOST" --port "$SERVER_PORT"
     --tp-size "$WORLD_SIZE" --ep-size "$WORLD_SIZE" --dp-size 1
+    --attn-dp-size "$ATTN_DP_SIZE" --moe-dp-size 1
     --device npu --attention-backend dsv4 --page-size 128 --trust-remote-code
     --load-format safetensors --quantization "$MODEL_QUANTIZATION" --kv-cache-dtype bfloat16
     --moe-a2a-backend deepep --deepep-mode auto --moe-runner-backend ascend
     --disable-overlap-schedule --disable-shared-experts-fusion
     --cuda-graph-backend-decode full --cuda-graph-backend-prefill disabled
     --cuda-graph-bs-decode "${GRAPH_BS[@]}"
-    --cuda-graph-max-bs-decode "$MAX_RUNNING_REQUESTS"
+    --cuda-graph-max-bs-decode "$GRAPH_MAX_BS"
     --max-running-requests "$MAX_RUNNING_REQUESTS"
     --max-prefill-tokens "$CHUNKED_PREFILL_SIZE" --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
     --context-length "$CONTEXT_LENGTH" --mem-fraction-static "$MEM_FRACTION_STATIC"
@@ -349,7 +358,7 @@ if [[ "$PROFILE_CAPTURE" == 1 ]]; then
     SERVER_CMD+=(--enable-profile-cuda-graph)
 fi
 
-printf 'WORLD_SIZE=%s TP=%s EP=%s DP=1 DEVICES=%s\n' "$WORLD_SIZE" "$WORLD_SIZE" "$WORLD_SIZE" "$ASCEND_RT_VISIBLE_DEVICES"
+printf 'WORLD_SIZE=%s TP=%s EP=%s ATTN_DP=%s ATTN_TP=%s DP=1 MOE_DP=1 DEVICES=%s\n' "$WORLD_SIZE" "$WORLD_SIZE" "$WORLD_SIZE" "$ATTN_DP_SIZE" "$((WORLD_SIZE / ATTN_DP_SIZE))" "$ASCEND_RT_VISIBLE_DEVICES"
 printf 'Expert format: %s; quantization: %s\n' "$MOE_EXPERT_FORMAT" "$MODEL_QUANTIZATION"
 printf 'Offload JSON: %s\nNative build: %s\n' "$MOE_OFFLOAD_CONFIG" "$NATIVE_BUILD_DIR"
 printf 'Log directory: %s\nLogging config: %s\n' "$LOG_DIR" "$SGLANG_LOGGING_CONFIG_PATH"

@@ -321,13 +321,24 @@ class NpuBoundMoERuntime(BoundMoERuntime):
             return program.run(layer_id, hidden_states, routing, context)
 
     @staticmethod
-    def _phase(forward_batch):
+    def _phase(forward_batch, *, has_global_work, current_phase):
         mode = forward_batch.forward_mode
-        if mode.is_decode_or_idle():
-            return Phase.DECODE
-        if mode.is_extend_without_speculative():
+        local_prefill = (
+            not mode.is_decode_or_idle() and mode.is_extend_without_speculative()
+        )
+        if not (mode.is_decode_or_idle() or local_prefill):
+            raise ValueError("MoE offload accepts decode/idle or ordinary extend only")
+        if not has_global_work:
+            # Padded slots are not work. An entirely idle group must not restore
+            # decode weights merely because its local mode is IDLE.
+            return current_phase
+        # Attention-DP ranks may be IDLE or DECODE while peers run prefill.
+        # This scheduler flag is shared even without two-batch overlap; the
+        # local Attention mode remains unchanged. Decide before owner transitions
+        # and before eager preprocessing can relabel/pad the local batch.
+        if local_prefill or getattr(forward_batch, "is_extend_in_batch", False):
             return Phase.PREFILL
-        raise ValueError("MoE offload accepts decode/idle or ordinary extend only")
+        return Phase.DECODE
 
     @staticmethod
     def _has_global_work(forward_batch):
@@ -345,27 +356,36 @@ class NpuBoundMoERuntime(BoundMoERuntime):
         self._require_open()
         if self._context is not None or self._capture is not None:
             raise RuntimeError("Concurrent forwards/capture are not supported")
-        phase = self._phase(forward_batch)
+        has_global_work = self._has_global_work(forward_batch)
+        phase = self._phase(
+            forward_batch,
+            has_global_work=has_global_work,
+            current_phase=owner.phase,
+        )
         stream = self.device_runtime.current_stream()
         token = owner.begin_forward(phase, stream)
         context = self._new_context(phase, stream=stream)
         self._context, self._step_started = context, False
         logger.debug(
-            "MoE offload forward.begin: seq=%s phase=%s bs=%s tokens=%s",
+            "MoE offload forward.begin: rank=%s seq=%s phase=%s mode=%s "
+            "extend_in_batch=%s global_work=%s bs=%s tokens=%s",
+            getattr(getattr(owner, "config", None), "ep_rank", None),
             token.sequence,
             phase.value,
+            getattr(forward_batch.forward_mode, "name", None),
+            getattr(forward_batch, "is_extend_in_batch", False),
+            has_global_work,
             getattr(forward_batch, "batch_size", 0),
             getattr(getattr(forward_batch, "input_ids", None), "numel", lambda: 0)(),
         )
         try:
-            if phase is Phase.DECODE:
-                # Shared host metadata decides whether the whole batch is idle;
-                # a rank receiving no routes still advances with active peers.
-                # The graph consumes the live fixed-address flag on replay.
-                with self.device_runtime.stream_scope(stream):
-                    self.residency.update_enabled.fill_(
-                        self._has_global_work(forward_batch)
-                    )
+            # The graph consumes this fixed-address flag on replay. Active
+            # decode peers advance even on locally idle ranks; prefill and an
+            # entirely idle group never advance the decode cache policy.
+            with self.device_runtime.stream_scope(stream):
+                self.residency.update_enabled.fill_(
+                    has_global_work and phase is Phase.DECODE
+                )
             context.forward_batch = forward_batch
             context.num_token_non_padded = None
             context.retain(forward_batch)

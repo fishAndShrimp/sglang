@@ -191,6 +191,158 @@ class TestNativePeriodicCache(unittest.TestCase):
             self.assembly.finalize()
         self.assertEqual(self.assembly.backend.format.banks, [])
 
+    @staticmethod
+    def dp_batch(mode_name, *, width=8, rank=1, prefill=False, counts=None):
+        if counts is None:
+            counts = [3] + [0] * (width - 1)
+        mode = SimpleNamespace(
+            name=mode_name,
+            is_decode_or_idle=lambda: mode_name in ("DECODE", "IDLE"),
+            is_extend_without_speculative=lambda: mode_name == "EXTEND",
+        )
+        rows = 0 if mode_name == "IDLE" else counts[rank]
+        return SimpleNamespace(
+            forward_mode=mode,
+            is_extend_in_batch=prefill,
+            original_global_num_tokens_cpu=counts,
+            global_num_tokens_cpu=list(counts),
+            input_ids=torch.ones(rows, dtype=torch.int64),
+        )
+
+    def test_attention_dp_prefill_selects_host_phase_on_active_and_idle_ranks(self):
+        runtime = self.assembly.finalize()
+        owner = MoEOffloadOwner(self.assembly.config, self.assembly.catalog, runtime)
+        try:
+            for width in (8, 16):
+                for rank in range(width):
+                    with self.subTest(width=width, rank=rank):
+                        local = "EXTEND" if rank == 0 else "IDLE"
+                        batch = self.dp_batch(
+                            local, width=width, rank=rank, prefill=True
+                        )
+                        mode = batch.forward_mode
+                        with runtime.forward_scope(owner, batch):
+                            self.assertIs(runtime.context.phase, Phase.PREFILL)
+                            self.assertIs(owner.phase, Phase.PREFILL)
+                            self.assertFalse(bool(runtime.residency.update_enabled))
+                            # Exercise the actual eager entry guard, not only the
+                            # phase helper. No captured-decode scope is installed.
+                            self.assertIsNone(runtime._capture)
+                            runtime._ensure_step()
+                            self.assertIs(batch.forward_mode, mode)
+                        self.assertEqual(
+                            int(runtime.cache_updates.policy_state.step_mod), 0
+                        )
+                        owner.switch_phase(Phase.DECODE)
+        finally:
+            owner.close()
+
+    def test_attention_dp_global_prefill_also_overrides_a_local_decode(self):
+        runtime = self.assembly.finalize()
+        owner = MoEOffloadOwner(self.assembly.config, self.assembly.catalog, runtime)
+        try:
+            for width in (8, 16):
+                counts = [3, 1] + [0] * (width - 2)
+                batch = self.dp_batch(
+                    "DECODE", width=width, prefill=True, counts=counts
+                )
+                with runtime.forward_scope(owner, batch):
+                    self.assertIs(runtime.context.phase, Phase.PREFILL)
+                    runtime._ensure_step()
+                    self.assertEqual(batch.forward_mode.name, "DECODE")
+                self.assertEqual(int(runtime.cache_updates.policy_state.step_mod), 0)
+                owner.switch_phase(Phase.DECODE)
+        finally:
+            owner.close()
+
+    def test_global_idle_preserves_prefill_banks_and_period_despite_padding(self):
+        runtime = self.assembly.finalize()
+        owner = MoEOffloadOwner(self.assembly.config, self.assembly.catalog, runtime)
+        try:
+            owner.switch_phase(Phase.PREFILL)
+            for tensor in self.assembly.backend.format.banks[0].tensors.values():
+                tensor.fill_(199)
+            transfers = len(self.assembly.host.plans)
+            for width in (8, 16):
+                batch = self.dp_batch("IDLE", width=width, counts=[0] * width)
+                batch.global_num_tokens_cpu = [8] * width
+                batch.input_ids = torch.ones(8, dtype=torch.int64)
+                with runtime.forward_scope(owner, batch):
+                    self.assertIs(runtime.context.phase, Phase.PREFILL)
+                    self.assertFalse(bool(runtime.residency.update_enabled))
+                self.assertIs(owner.phase, Phase.PREFILL)
+                self.assertEqual(len(self.assembly.host.plans), transfers)
+                self.assertEqual(int(runtime.cache_updates.policy_state.step_mod), 0)
+                for tensor in self.assembly.backend.format.banks[0].tensors.values():
+                    self.assertTrue(bool((tensor == 199).all()))
+        finally:
+            owner.close()
+
+    def test_idle_prefill_restores_cache_before_active_peer_decode_replay(self):
+        runtime = self.assembly.finalize()
+        owner = MoEOffloadOwner(self.assembly.config, self.assembly.catalog, runtime)
+        keys = runtime.residency.slot_to_key.clone()
+        usage = runtime.cache_updates.policy_state.usage.clone()
+        try:
+            for width in (8, 16):
+                before = int(runtime.cache_updates.policy_state.step_mod)
+                with runtime.forward_scope(
+                    owner, self.dp_batch("IDLE", width=width, prefill=True)
+                ):
+                    runtime._ensure_step()
+                    bank = self.assembly.backend.format.banks[0]
+                    for tensor in bank.tensors.values():
+                        tensor.fill_(199)
+                self.assertEqual(
+                    int(runtime.cache_updates.policy_state.step_mod), before
+                )
+                batch = self.dp_batch(
+                    "IDLE", width=width, counts=[1] + [0] * (width - 1)
+                )
+                with runtime.forward_scope(owner, batch):
+                    self.assertIs(runtime.context.phase, Phase.DECODE)
+                    self.assertTrue(bool(runtime.residency.update_enabled))
+                    torch.testing.assert_close(runtime.residency.slot_to_key, keys)
+                    torch.testing.assert_close(
+                        runtime.cache_updates.policy_state.usage, usage
+                    )
+                    bank = self.assembly.backend.format.banks[0]
+                    for tensor in bank.tensors.values():
+                        self.assertEqual(tensor[:, 0].tolist(), [30, 32, 40, 43])
+                    # Stand in for replay's recorded nodes. The serving scope
+                    # must not add a second policy step on exit.
+                    runtime.ops.begin_step(runtime.context)
+                    runtime.emit_step_end(runtime.context)
+                self.assertEqual(
+                    int(runtime.cache_updates.policy_state.step_mod), before + 1
+                )
+        finally:
+            owner.close()
+
+    def test_attention_dp_keeps_rejecting_real_eager_decode_and_idle(self):
+        runtime = self.assembly.finalize()
+        owner = MoEOffloadOwner(self.assembly.config, self.assembly.catalog, runtime)
+        try:
+            for local in ("DECODE", "IDLE"):
+                batch = self.dp_batch(local, counts=[1, 1] + [0] * 6)
+                with runtime.forward_scope(owner, batch):
+                    with self.assertRaisesRegex(RuntimeError, "captured full graph"):
+                        runtime._ensure_step()
+        finally:
+            owner.close()
+
+    def test_global_prefill_does_not_admit_unsupported_local_forward_modes(self):
+        runtime = self.assembly.finalize()
+        owner = MoEOffloadOwner(self.assembly.config, self.assembly.catalog, runtime)
+        try:
+            batch = self.dp_batch("TARGET_VERIFY", prefill=True)
+            with mock.patch.object(owner, "begin_forward") as begin:
+                with self.assertRaisesRegex(ValueError, "ordinary extend"):
+                    with runtime.forward_scope(owner, batch):
+                        self.fail("Unsupported mode entered the serving scope")
+                begin.assert_not_called()
+        finally:
+            owner.close()
 
 class TestNativePeriodicConfig(unittest.TestCase):
     def settings(self, **kwargs):
@@ -268,6 +420,26 @@ class TestNativePeriodicConfig(unittest.TestCase):
         self.assertFalse(NpuBoundMoERuntime._has_global_work(empty))
         self.assertTrue(NpuBoundMoERuntime._has_global_work(active))
 
+    def test_native_factory_accepts_attention_dp8_and_dp16_with_moe_dp1(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "offload.json"
+            path.write_text(json.dumps(asdict(self.settings())))
+            for width in (8, 16):
+                parallel = SimpleNamespace(
+                    moe_ep_size=width,
+                    moe_ep_rank=width - 1,
+                    tp_size=width,
+                    moe_tp_size=1,
+                    pp_size=1,
+                    moe_dp_size=1,
+                    attn_dp_size=width,
+                )
+                with mock.patch("sglang.srt.offloading.moe.npu.backend.NpuMoEBackend"):
+                    offloader = create_npu_offloader(
+                        path, hf_config=object(), parallel=parallel, device="npu:0"
+                    )
+                self.assertEqual(offloader.config.ep_size, width)
+                self.assertEqual(offloader.config.tp_size, width)
 
 if __name__ == "__main__":
     unittest.main()

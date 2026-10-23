@@ -46,7 +46,10 @@ metadata 预算也必须容纳诊断池。
 
 INFO 生命周期日志包括 runtime/bank 容量、初始 cache、内存计账、model hooks、Graph
 bucket 捕获及 prefill/decode 切换。DEBUG 明细包括层注册、forward 提交、D/F/C 提交、
-wave 专家范围/bank、prefill 首组提交量，以及 ACL batch 字节数。`memfabric.emit` 和
+wave 专家范围/bank、prefill 首组提交量，以及 ACL batch 字节数。
+`forward.begin` 同时记录 EP rank、本地 `mode`、共享 `extend_in_batch`、
+`global_work` 和解析后的 `phase`；Attention DP 的空闲 rank 在全局 prefill 时应显示
+`mode=IDLE phase=prefill`，本地无请求不代表 dispatch 后没有专家需求。`memfabric.emit` 和
 decode wave 的 Python DEBUG 日志发生于 warmup/capture，不会每次 replay 重跑；实际
 服务批次的命中率以异步 batch 汇总为准。
 

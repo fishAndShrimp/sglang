@@ -42,7 +42,7 @@ prefill 借池，decode 按原 slot 从 host 重载后检查错误标记再恢�
 仅在匹配的 Ascend A5 / CANN / torch_npu 环境执行。需要已安装当前仓库和用户
 提供版本的 MemFabric、sgl-kernel-npu DeepEP。此 macOS 开发机不能完成硬件验收。
 
-### 单机四卡启动脚本
+### 单机多卡启动脚本
 
 从仓库根目录执行，先加载目标机匹配的 CANN 环境，再设置实际的 **DeepSeek V4
 FP4 或 ModelSlim W8A8 safetensors** 权重目录：
@@ -64,6 +64,29 @@ MODEL_PATH=/path/to/DeepSeek-V4-Flash \
   bash scripts/launch_moe_offload_npu.sh
 ```
 
+`ATTN_DP_SIZE` 控制同一个 TP/EP 组内的 Attention DP，默认 1，必须整除
+`WORLD_SIZE`；模型副本 `--dp-size` 和 `--moe-dp-size` 固定为 1。
+例如单机 16 卡的 TP16 / Attention DP16 / EP16：
+
+```bash
+WORLD_SIZE=16 ATTN_DP_SIZE=16 \
+MODEL_PATH=/models/DeepSeek-V4-Flash \
+MOE_OFFLOAD_CONFIG=/configs/moe-offload.json \
+MOE_LOG_LEVEL=debug \
+  bash scripts/launch_moe_offload_npu.sh
+```
+
+可见设备未指定时自动生成 `0..WORLD_SIZE-1`；也支持 `WORLD_SIZE=8 ATTN_DP_SIZE=8`
+和能整除 TP 的部分 Attention DP。脚本仍为单机启动，需有对应数量的可见 NPU。
+所有 offload 预算仍按每 rank 计，默认 128 GiB host 预留在 16 rank 时合计 2 TiB，
+应先调整实际 JSON 预算。普通 decode 在 Attention TP=1 时可使用 BS=1 的图 bucket；
+EP 接收容量由 DeepEP 和 workspace 上界决定，不能把 graph BS 当作接收行数。
+
+全局有 prefill 时，全部 rank 的 offload 阶段为 PREFILL，本地 IDLE/DECODE 模式
+保持不变；空闲 rank 仍执行专家 dispatch/compute/combine，以服务其他 rank 的路由。
+全局全部空闲时保留当前阶段，不恢复/借用热池，也不推进 decode LFU 周期。
+纯 decode 必须使用 full graph；不提供 graph miss 后的 eager decode 回退。
+
 脚本从自身位置定位当前源码并设置 `PYTHONPATH`，不依赖固定的 `/home/.../sglang`
 目录。默认先构建 ACL 扩展；`BUILD_NATIVE=0` 可复用与当前环境匹配的已构建扩展，
 扩展目录直接读取 offload JSON 的 `native_extension_directory`，避免构建与运行使用不同目录。
@@ -76,7 +99,8 @@ MODEL_PATH=/path/to/DeepSeek-V4-Flash \
 首启默认最大并发 8、decode buckets 为 `1 2 4 8`、chunked prefill 和最大 prefill
 token 数均为 1024、context length 为 8192，`mem_fraction_static=0.8`。
 `MAX_RUNNING_REQUESTS`、`CHUNKED_PREFILL_SIZE`、`CONTEXT_LENGTH`、
-`MEM_FRACTION_STATIC` 可通过环境变量修改；并发变化时脚本同步生成捕图 buckets。
+`MEM_FRACTION_STATIC` 可通过环境变量修改；并发变化时脚本同步生成捕图 buckets，
+捕图上限按 Attention TP 对齐，避免低并发时所有候选 bucket 被过滤。
 增大 prefill/concurrency 时还需检查 JSON 的 `max_dispatch_rows` 和 workspace 上界，
 容量不足会拒绝运行。`--dry-run` 仅打印命令，不验证真实权重和设备。
 
@@ -84,7 +108,7 @@ token 数均为 1024、context length 为 8192，`mem_fraction_static=0.8`。
 启用本后端要求的 `-1` 路由与逐专家计数。脚本默认根据量化描述选择 `fp8`
 （原生 FP4 experts）或 `modelslim`（W8A8_DYNAMIC），也可用 `MOE_EXPERT_FORMAT`
 显式指定并校验；两条路径均关闭 FP4→FP8 解量化。
-它不带 EAGLE、DP attention 或 HiCache 参数，关闭 overlap；GLM-5.2 权重
+它不带 EAGLE 或 HiCache 参数，关闭 overlap；Attention DP 由 `ATTN_DP_SIZE` 控制。GLM-5.2 权重
 不适用于当前后端，实际启动时会在构建扩展前检查 `model_type` 和 EP 可整除性。
 
 默认 JSON 的 `offline_stats_path` 是占位符。非零 cache_ratio 必须提供真实 profile，
@@ -146,7 +170,7 @@ loader 一次只转换单专家并受 workspace_limit_bytes 限制。capture 从
 分配完后的基线测量 NPU allocator peak，把 graph/临时内存增长保守计入 workspace；
 这不能替代实机驱动内存、通信私有 workspace 和真实峰值监测。
 
-当前支持 PP=1、MoE DP=1、MoE TP=1，TP+EP 可用；前三层及 hash 层 routed
+当前支持 PP=1、MoE DP=1、MoE TP=1，TP+EP 和组内 Attention DP 可用；前三层及 hash 层 routed
 专家和 shared experts 常驻。DeepEP default 策略需要 -1 路由屏蔽支持。未接入
 FuseEP、DeepEP ops/alltoall、AscendTP、EPLB、elastic EP、LoRA、speculation、torch.compile、并发
 forward、其他专家 pager 或在线权重更新；不满足条件在加载或绑定时拒绝。

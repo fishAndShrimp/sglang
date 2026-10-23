@@ -86,6 +86,7 @@ os.execv(REAL_PYTHON, [REAL_PYTHON] + sys.argv[1:])
             "SGLANG_LOGGING_CONFIG_PATH",
             "SGLANG_TRACE_ASYNC",
             "SGLANG_TORCH_PROFILER_DIR",
+            "ATTN_DP_SIZE",
             "LOG_LEVEL",
             "MOE_LOG_LEVEL",
             "LOG_LEVEL_HTTP",
@@ -161,6 +162,9 @@ os.execv(REAL_PYTHON, [REAL_PYTHON] + sys.argv[1:])
         for flag, value in (
             ("--tp-size", "4"),
             ("--ep-size", "4"),
+            ("--dp-size", "1"),
+            ("--attn-dp-size", "1"),
+            ("--moe-dp-size", "1"),
             ("--cuda-graph-backend-decode", "full"),
             ("--cuda-graph-backend-prefill", "disabled"),
             ("--decode-log-interval", "40"),
@@ -308,6 +312,63 @@ os.execv(REAL_PYTHON, [REAL_PYTHON] + sys.argv[1:])
                 self.assertNotEqual(code, 0)
         self.assertFalse(self.server_output.exists())
 
+    def test_attention_dp8_and_dp16_keep_ep_width_and_single_model_replica(self):
+        for width in (8, 16):
+            with self.subTest(width=width):
+                (self.model / "config.json").write_text(
+                    json.dumps({"model_type": "deepseek_v4", "n_routed_experts": width})
+                )
+                code, output = self.run_script(
+                    WORLD_SIZE=str(width), ATTN_DP_SIZE=str(width),
+                    ASCEND_RT_VISIBLE_DEVICES="",
+                )
+                self.assertEqual(code, 0, output)
+                arguments = self.server_result()["args"]
+                for flag, value in (
+                    ("--tp-size", str(width)), ("--ep-size", str(width)),
+                    ("--attn-dp-size", str(width)), ("--dp-size", "1"),
+                    ("--moe-dp-size", "1"),
+                ):
+                    self.assertEqual(arguments[arguments.index(flag) + 1], value)
+                start = arguments.index("--cuda-graph-bs-decode") + 1
+                end = arguments.index("--cuda-graph-max-bs-decode")
+                self.assertEqual(arguments[start:end], ["1", "2", "4", "8"])
+                self.assertIn(f"ATTN_DP={width} ATTN_TP=1", output)
+                self.assertNotIn("--enable-dp-attention", arguments)
+
+    def test_partial_attention_dp_dry_run_does_not_create_logs(self):
+        code, output = self.run_script(
+            "--dry-run", WORLD_SIZE="16", ATTN_DP_SIZE="4",
+            ASCEND_RT_VISIBLE_DEVICES="",
+        )
+        self.assertEqual(code, 0, output)
+        self.assertIn("ATTN_DP=4 ATTN_TP=4", output)
+        self.assertIn("--attn-dp-size 4", output)
+        self.assertFalse(self.log_dir.exists())
+        self.assertFalse(self.server_output.exists())
+
+    def test_graph_buckets_cover_attention_tp_when_concurrency_is_smaller(self):
+        code, output = self.run_script(
+            "--dry-run", WORLD_SIZE="16", ATTN_DP_SIZE="1",
+            ASCEND_RT_VISIBLE_DEVICES="", MAX_RUNNING_REQUESTS="8",
+        )
+        self.assertEqual(code, 0, output)
+        self.assertIn("--cuda-graph-bs-decode 1 2 4 8 16", output)
+        self.assertIn("--cuda-graph-max-bs-decode 16", output)
+        self.assertIn("--max-running-requests 8", output)
+        self.assertFalse(self.log_dir.exists())
+
+    def test_invalid_attention_dp_layouts_fail_before_build_or_launch(self):
+        for width, dp in (("16", "3"), ("8", "16"), ("8", "0"), ("8", "-1")):
+            with self.subTest(width=width, dp=dp):
+                code, output = self.run_script(
+                    "--dry-run", WORLD_SIZE=width, ATTN_DP_SIZE=dp,
+                    ASCEND_RT_VISIBLE_DEVICES="",
+                )
+                self.assertNotEqual(code, 0)
+                self.assertIn("ATTN_DP_SIZE", output)
+        self.assertFalse(self.build_marker.exists())
+        self.assertFalse(self.server_output.exists())
 
 if __name__ == "__main__":
     unittest.main()

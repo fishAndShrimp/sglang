@@ -444,6 +444,75 @@ class TestDecodeWorkspace(unittest.TestCase):
             self.assertIsNone(fixture.raw_refs[-1]())
             self.assertIsNone(fixture.output_refs[-1]())
 
+    def test_eager_idle_prefill_serves_remote_experts_and_joins_empty_waves(self):
+        with (
+            patch.dict("os.environ", {"MOE_ENABLE_TOPK_NEG_ONE": "1"}),
+            patch.object(native, "_compute_scope", lambda *args: nullcontext()),
+        ):
+            for width in (8, 16):
+                for received in (0, 2):
+                    with self.subTest(width=width, received=received):
+                        fixture = self.fixture(ids=(), phase=Phase.PREFILL)
+                        runtime = fixture.runtime
+                        runtime._context, runtime._capture = None, None
+                        runtime.device_runtime.stream_scope = (
+                            lambda stream: nullcontext()
+                        )
+                        owner = SimpleNamespace(
+                            phase=Phase.DECODE,
+                            begin_forward=lambda phase, stream: SimpleNamespace(
+                                sequence=1
+                            ),
+                            finish_forward=lambda token, completion: None,
+                            fail_forward=lambda token: None,
+                        )
+                        batch = SimpleNamespace(
+                            forward_mode=SimpleNamespace(
+                                name="IDLE",
+                                is_decode_or_idle=lambda: True,
+                                is_extend_without_speculative=lambda: False,
+                            ),
+                            is_extend_in_batch=True,
+                            original_global_num_tokens_cpu=[1] + [0] * (width - 1),
+                            input_ids=torch.empty(0, dtype=torch.int64),
+                            moe_num_token_non_padded=lambda: torch.tensor(0),
+                        )
+                        program = runtime.layer_programs[3].prefill
+                        dispatcher = program.dispatcher.dispatcher
+                        original_dispatch = dispatcher.dispatch
+                        calls = []
+
+                        def receive_remote(hidden_states, topk_output):
+                            self.assertEqual(hidden_states.shape[0], 0)
+                            raw = original_dispatch(hidden_states, topk_output)
+                            raw.hidden_states[:received].fill_(2)
+                            raw.num_recv_tokens_per_expert = [0, received, 0, 0]
+                            raw.masked_m = torch.tensor([0, received, 0, 0])
+                            calls.append("dispatch")
+                            return raw
+
+                        dispatcher.dispatch = receive_remote
+                        original_write = fixture.layout.write_wave
+
+                        def checked_write(layout, wave, output, context):
+                            count = int(layout.selected.row_count)
+                            calls.append((wave.index, count))
+                            if count:
+                                torch.testing.assert_close(
+                                    output[:count], torch.full_like(output[:count], 4)
+                                )
+                            self.assertTrue(bool((output[count:] == 0).all()))
+                            original_write(layout, wave, output, context)
+
+                        fixture.layout.write_wave = checked_write
+                        with runtime.forward_scope(owner, batch):
+                            self.assertIs(runtime.context.phase, Phase.PREFILL)
+                            runtime._enter_layer(3)
+                            output = runtime.run_layer(3, fixture.input, fixture.routes)
+                            self.assertEqual(output.shape, (0, 4))
+                        self.assertEqual(calls, ["dispatch", (0, received), (1, 0)])
+                        self.assertIsNone(dispatcher.handle)
+                        self.assertIsNone(program.pipeline.active_layer)
 
 if __name__ == "__main__":
     unittest.main()
