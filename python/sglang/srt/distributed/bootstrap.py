@@ -96,8 +96,8 @@ def init_parallel_runtime(
     """Initialize the parallel runtime once, after publishing configuration.
 
     Set up CPU thread binding, the current device, and the shared Mooncake
-    engine before creating process groups. Draft workers reuse their target's
-    groups and must not call this function.
+    engine after process-group creation and communicator warmup. Draft workers
+    reuse their target's groups and must not call this function.
     """
     global _PARALLEL_INITIALISED
     if _PARALLEL_INITIALISED:
@@ -113,6 +113,12 @@ def init_parallel_runtime(
 
     tic = time.perf_counter()
     logger.info("Init parallel begin.")
+
+    # NPU: install transfer_to_npu to route torch.cuda.* to torch.npu.*
+    if is_npu():
+        from sglang.srt.hardware_backend.npu.utils import init_npu_backend
+
+        init_npu_backend()
 
     backend = _resolve_backend(device=device)
     if not get_parallel().enable_p2p_check:
