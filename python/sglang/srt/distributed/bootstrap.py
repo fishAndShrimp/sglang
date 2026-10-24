@@ -96,8 +96,8 @@ def init_parallel_runtime(
     """Initialize the parallel runtime once, after publishing configuration.
 
     Set up CPU thread binding, the current device, and the shared Mooncake
-    engine before creating process groups. Draft workers reuse their target's
-    groups and must not call this function.
+    engine after process-group creation and communicator warmup. Draft workers
+    reuse their target's groups and must not call this function.
     """
     global _PARALLEL_INITIALISED
     if _PARALLEL_INITIALISED:
