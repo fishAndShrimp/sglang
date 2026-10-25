@@ -84,11 +84,14 @@ Residency 保留幸存者原 slot，失效 victim，搬运完整 bundle，最后
 每次有效完整 decode 在设备上推进策略；调用方预分配独立 bool 标量 `due_out`。
 `finish_step` 清理策略私有周期标志不影响该输出；planner 将 due 与 runtime 的
 `update_enabled` 结合并锁存。capture/warmup、prefill 和全局空步不推进周期。
-默认 periodic 策略维持离线 Top-K 确定的每层配额；普通 LFU 可跨层竞争。
+默认 periodic 策略和普通 LFU 都允许本 EP rank 内的可卸载层跨层竞争热 slot。
+离线 Top-K 只决定初始驻留集合，不固定各层在线配额。
 
-当前 full graph 使用 masked tail。非 due 时屏蔽无效事务、搬运和发布，固定的
-选择/规划节点仍可执行；设备条件执行或融合 kernel 真早退没有完成硬件证明。
-没有 host 周期镜像，也不通过 `.item()` / 事件查询选择 decode 动态工作。
+周期策略为每个 bucket 捕获普通/维护两种 full graph。普通 batch 仅累计热度和周期，
+维护 batch 在整模型尾部执行跨层选入/淘汰和更新事务；不会在每层 FFN 内排序维护。
+host 根据有效 decode batch 的提交次数选图，计数跨 bucket 共用并在 prefill 中保持；
+不通过 `.item()` / 事件查询读取设备 due 或专家热度。额外图存储纳入 workspace 预算；
+双图的真实 A3 捕获/切换及性能仍需实机验证。
 
 每个 arena 共用不可变地址目录，同一物理 destination view 共用地址表；会被覆写的
 wave/tail scratch 保持独立。`AllocationLedger` 对物理分配去重，权重、metadata、workspace

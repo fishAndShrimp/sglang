@@ -11,16 +11,21 @@
 `select_hot_set(state, key_to_slot, target_keys)`、`finish_step(state)` 和 `copy_state`。
 `target_keys[K]` 是唯一逻辑集合契约：有效 key 不重复、空位 -1，位置不指定物理 slot。
 `TensorLFUPolicy` 每个有效步输出 due；`PeriodicLFUPolicy` 维护设备周期，按期输出 due。
-运行时只消费接口，不读取策略的私有 config、catalog 或内部计数器。
+运行时只消费接口和可选 `graph_maintenance_interval` 声明，不读取策略的私有 config、
+catalog 或设备内部计数器。周期策略的在线选入/淘汰允许跨层，不固定离线初始化的各层配额。
 
 `due_out` 是 caller 预分配并计入 metadata 预算的独立 bool 标量，不能与策略内部
 `update_due` 别名。Coordinator 完成 observation/selection/finish 后将其交给
 `prepare_update(..., update_enabled=due_out)`；planner 与 runtime guard 相与并锁存。
 关闭的 gate 不执行有效缓存事务，也不因陈旧无效 targets 产生错误。
 
-Full decode graph 包含策略与更新尾部。当前采用 masked fallback：非 due 的固定选择、
-规划节点仍可执行，不等于 kernel 真早退。设备条件执行或融合优化须另行实机验证；
-不维护 host 周期镜像，也不通过设备数值回读来选择图。
+周期策略为同一个 bucket 捕获两张完整 decode 图：普通图尾部只 observation，维护图尾部
+再执行 selection/finish/prepare/transfer/commit。普通图没有维护排序或规划节点。
+host 用现成 batch 元数据统计有效 decode 提交次数，每 `update_interval` 次选维护图；
+这不需要回读设备标量。图选择与设备周期都排除 prefill、capture/warmup 和全局空步，
+本 rank 无路由但 peer 有 decode 工作时仍推进，跨 bucket 复用同一周期。
+新增图共享原有权重和策略存储，其 workspace 由现有 capture peak 计费。
+CPU 契约已检查；真实 NPU 双图捕获、切换与内存峰值须实机验证。
 
 ## 驻留、统计和快照
 

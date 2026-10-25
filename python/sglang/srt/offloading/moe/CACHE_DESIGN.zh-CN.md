@@ -23,7 +23,7 @@
 
 | 已实现功能 | 具体行为 |
 | --- | --- |
-| PeriodicLFU 与 batch 统计 | 离线 Top-K 初始化、有效 assignment 计数、层内冷热配对、周期替换与衰减 |
+| PeriodicLFU 与 batch 统计 | 离线 Top-K 初始化、有效 assignment 计数、rank 内跨层冷热配对、周期替换与衰减 |
 | Decode 缓存执行 | 根据实际需求选择热池或 host 来源，生成执行计划，等待复制后发布映射，计算读完后允许复用 |
 | Prefill 阶段适配 | 保存 decode 元数据和 LFU 状态，调用借池与流水接口，切回 decode 时按原 slot 回填并恢复状态 |
 | 模型与算子适配 | 安装 DeepSeek V4 层首及 routed experts 入口，转换 DeepEP receive 布局，通过 bank 视图调用原生 Ascend F |
@@ -82,7 +82,7 @@ K = floor(cache_ratio * N)
 | `step_mod`、`update_due` | 4 步周期及本步是否调整 |
 | `target_keys[K]` | 策略选中的目标集合；数组位置不是 slot |
 
-热 slot 本身不绑定层。LFU 的层内替换保证各层驻留数量不变；residency 保留幸存者原位置，将新增 key 分配到空出的物理 slot，不要求物理 slot 也按同层配对。
+热 slot 本身不绑定层。LFU 可以用某层的冷专家腾出 slot，装入另一层的热专家；residency 保留幸存者原位置，将新增 key 分配到空出的物理 slot。共享池总容量不变，各层驻留数量随在线热度变化。
 
 ## 3. LFU：五项需求及准确语义
 
@@ -105,13 +105,15 @@ class PeriodicLFUConfig:
 | --- | --- |
 | 离线初始化 | 在本 rank 全部可卸载专家中选离线频次 Top-K，装入热池 |
 | 在线计数 | 每个有效 token→expert assignment 加 1，命中与 miss 均计数 |
-| 周期替换 | 每 4 个有效完整 decode forward，在每层内部冷热一一配对 |
-| 换入上限与衰减 | 候选 usage ≥ 2，候选减被替换者 ≥ 1.5；所有层合格配对按差值排序，每 rank 最多 96 对；随后全部 usage × 0.7 |
+| 周期替换 | 每 4 个有效完整 decode forward，在本 rank 所有可卸载层中全局冷热配对 |
+| 换入上限与衰减 | 冷专家 usage 降序与热专家 usage 升序配对；候选 usage ≥ 2、差值 ≥ 1.5，每 rank 最多 96 对；随后全部 usage × 0.7 |
 | 搬运与发布分开 | 等完整 bundle 搬完后发布；异步提交和实际计算重叠分别看待 |
 
 1.5 是**差值**，不是 1.5 倍，等号满足门槛。每轮即使没有交换也衰减；非周期轮不衰减。
 
-初始化跨层 Top-K，运行期层内一换一，因此各层热专家数量由初始化确定。某层初始化为 0 个热专家时，它一直通过 miss 路径执行，本策略不会从其他层给它调入缓存配额。这是当前策略的明确取舍。
+初始化和运行期都允许跨层选择。初始化为零配额的层也能在维护时换入，缓存配额不受离线初始化锁定。专家 EP 归属不变；当前同一个池内要求完整权重 bundle 的格式和物理大小兼容。
+
+周期策略捕获普通/维护两种完整 decode 图。普通图只累计访问次数和周期，维护图在完整 batch 末尾排序并更新热池。host 根据有效 decode batch 的提交次数选图，不回读设备热度或 due。计数跨 bucket 共用，prefill、warmup/capture 和全局空步不推进。本改动的 CPU 策略和模拟图契约已检查，真实 A3 双图捕获与性能尚待验证。
 
 原五点需求提到 verify，但当前 serving 接入仍拒绝投机解码。本文不将 verify 列为已实现功能。
 

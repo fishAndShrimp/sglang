@@ -1,8 +1,9 @@
-"""Periodic, layer-local LFU with rank-wide admission limits.
+"""Periodic LFU over one rank's shared, cross-layer hot pool.
 
-Online decisions stay on the tensor device. Python loops only over static layer
-ranges; no routing/popularity tensor is read by the host. Accelerator bindings
-must validate capture support and budget the sorting temporaries/workspace.
+Online expert decisions stay on the tensor device; no routing/popularity tensor
+is read by the host. A host batch clock selects full decode graph variants only.
+Accelerator bindings must validate capture support and budget the sorting
+temporaries/workspace.
 """
 
 import json
@@ -51,13 +52,10 @@ class PeriodicLFUPolicy(CachePolicy):
     def __init__(self, config: PeriodicLFUConfig, catalog: ExpertCatalog):
         self.config = config
         self.catalog = catalog
-        offset = 0
-        ranges = []
-        for layer in catalog.offloaded_layers:
-            ranges.append((offset, offset + layer.local_experts))
-            offset += layer.local_experts
-        # Catalog order is layer_id order, also the global pair tie-break order.
-        self.layer_ranges = tuple(ranges)
+
+    @property
+    def graph_maintenance_interval(self):
+        return self.config.update_interval
 
     def initial_keys(self, capacity: int, model_id: str) -> tuple[int, ...]:
         """Host-only offline Top-K; backend loads/publishes these before serving.
@@ -133,45 +131,34 @@ class PeriodicLFUPolicy(CachePolicy):
         if capacity == 0:
             return
         resident = key_to_slot >= 0
-        candidates, victims, gains, valid_pairs = [], [], [], []
-        for start, end in self.layer_ranges:
-            usage = state.usage[start:end]
-            hot = resident[start:end]
-            # Fixed-size permutations: invalid entries sort to the end. Their
-            # pairs are masked out instead of constructing variable-size arrays.
-            cold_order = torch.argsort(
-                torch.where(~hot, usage, -torch.inf), descending=True, stable=True
-            )
-            hot_order = torch.argsort(torch.where(hot, usage, torch.inf), stable=True)
-            gain = usage[cold_order] - usage[hot_order]
-            valid = (
-                ~hot[cold_order]
-                & hot[hot_order]
-                & (usage[cold_order] >= self.config.min_usage)
-                & (gain >= self.config.replacement_min_gain)
-            )
-            candidates.append(cold_order + start)
-            victims.append(hot_order + start)
-            gains.append(gain)
-            valid_pairs.append(valid)
-
-        candidate = torch.cat(candidates)
-        victim = torch.cat(victims)
-        gain = torch.cat(gains)
-        valid = torch.cat(valid_pairs)
-        # Stable sorting preserves layer_id, candidate key, victim key on ties:
-        # within each layer equal gains imply equal candidate/victim usages.
-        order = torch.argsort(
-            torch.where(valid, gain, -torch.inf), descending=True, stable=True
+        keys = torch.arange(count, device=state.usage.device, dtype=torch.int64)
+        usage = state.usage
+        # Canonical keys span every offloaded layer owned by this EP rank.
+        # A hot candidate may replace a colder expert from ANY of those layers.
+        # Stable sorting breaks equal-usage ties by (layer_id, local_expert_id).
+        candidate = torch.argsort(
+            torch.where(~resident, usage, -torch.inf), descending=True, stable=True
         )
-        chosen = order[: self.config.max_swaps]
-        swaps = (valid[chosen] & state.update_due).to(torch.int64)
+        victim = torch.argsort(
+            torch.where(resident, usage, torch.inf), stable=True
+        )
+        # Descending cold usage minus ascending hot usage is nonincreasing;
+        # valid pairs form a prefix, so no second gain-ranking sort is needed.
+        candidate = candidate[: self.config.max_swaps]
+        victim = victim[: self.config.max_swaps]
+        gain = usage[candidate] - usage[victim]
+        valid = (
+            ~resident[candidate]
+            & resident[victim]
+            & (usage[candidate] >= self.config.min_usage)
+            & (gain >= self.config.replacement_min_gain)
+        )
+        swaps = (valid & state.update_due).to(torch.int64)
         membership = resident.to(torch.int64)
-        membership.scatter_add_(0, victim[chosen], -swaps)
-        membership.scatter_add_(0, candidate[chosen], swaps)
+        membership.scatter_add_(0, victim, -swaps)
+        membership.scatter_add_(0, candidate, swaps)
 
         # Canonical set representation; output position is NOT a physical slot.
-        keys = torch.arange(count, device=state.usage.device, dtype=torch.int64)
         selected = torch.sort(torch.where(membership > 0, keys, count)).values[
             :capacity
         ]

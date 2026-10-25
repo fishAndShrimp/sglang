@@ -14,9 +14,9 @@
 - 首次权重通过原生 `ExpertWeightAccess.apply_update` 和 MemFabric 路径装入，完整 bundle
   完成且共享错误状态健康后才结束初始化；初始化不执行虚拟 decode，不注入在线 usage。
 - 在线按 post-dispatch 有效 token-expert assignment 累计，命中和 miss 都计入热度。
-- 每 `update_interval` 个有效完整 decode forward 做同层冷热配对；最低 usage、加性增益
+- 每 `update_interval` 个有效完整 decode forward 做本 rank 跨层冷热配对；最低 usage、加性增益
   和 rank 级 `max_swaps` 限制替换，周期尾再执行衰减。默认参数为 4、2、1.5、96、0.7。
-- 每层在线热专家数量由离线初始化固定；零配额层一直走 miss 路径，不跨层抢占。
+- 全部可卸载层共享固定大小的热池；在线配额可跨层迁移，初始化零配额的层也能选入。
 - prefill 和 capture/warmup 不推进热度或周期；全局空步不推进，有工作但本 rank 无路由仍推进。
 - prefill 借池后，按原 slot 从 host 重载完整权重，并恢复 usage、周期和驻留状态。
 
@@ -56,7 +56,8 @@ profile 的专家编号为 **global expert ID**，格式如下。示例数字仅
 ```
 
 `model_id` 必须与配置匹配；缺失频率按零处理，同频率按 canonical key 排序。
-线上 usage 独立从零开始。离线数据会决定每层配额，部署时应提供覆盖实际模型的统计。
+线上 usage 独立从零开始。离线数据决定初始驻留集合，在线策略可以重新分配各层配额；
+部署时仍应提供覆盖实际模型的统计。
 已有 `examples/v4.json` 中的 `/path/to/...` 必须替换为真实 profile。
 
 ## 命中统计与后端边界
@@ -78,9 +79,25 @@ assignment 命中率为 `hits / accesses`，无访问时应报告 N/A。重复�
 int32 count ABI，不再维护第二套 metadata adapter。
 
 公共 `observe(..., due_out)` 写调用方独立的设备 bool 标量；`finish_step` 清内部 due
-不影响事务输出。planner 锁存 due 与 runtime guard，不读取策略私有 config 或 host
-周期。非 due 屏蔽有效事务；当前 full graph 的固定选择/规划节点仍可执行，未完成
-设备条件执行或融合 kernel 真早退验证。
+不影响事务输出。planner 仍锁存 due 与 runtime guard，并负责错误检查与映射发布。
+
+2026-10-26：每个 bucket 捕获普通和维护两种完整 decode 图。普通图只累计 usage 和周期，
+不包含热集排序、维护搬运或更新规划；第 `update_interval` 个有效 decode batch 使用维护图，
+在完整模型计算后执行全局选入/淘汰、权重装入和映射发布，再供下一 batch 使用。
+该阶段的普通图仍包含各层计算所需的按需 miss 搬运。
+
+运行时用已有 CPU batch 元数据推进提交计数，选择图时不读取设备 usage/due。计数跨 bucket
+共用，prefill/capture/warmup/全局空步不推进；本 rank 空闲但其他 rank 有 decode 工作时推进。
+每个有效 decode forward 必须且只能提交一张图，提交失败会进入原有故障停止流程。
+prefill 快照恢复设备 usage/step_mod；host 计数在整个 prefill 阶段保持不变。
+
+跨层配对按全局冷专家 usage 降序、热专家 usage 升序进行，同频率按 canonical key 决定；
+满足 `min_usage`、`replacement_min_gain` 的前 `max_swaps` 对可替换。这里的“全局”仅指
+单个 EP rank 的可卸载层，不改变专家的 EP 归属。当前原生后端要求池内格式和大小兼容。
+
+两张图共用原有参数池、residency 和策略状态，分别持有 graph lease，销毁时统一排空并释放。
+额外捕获及临时存储仍计入现有 workspace 预算。已完成 CPU 策略参考比对、跨层 residency
+发布和模拟图周期检查；真实 A3 双图捕获/切换、峰值内存、数值一致性和 TPOT 尚需实机验证。
 
 ## 本地验证
 

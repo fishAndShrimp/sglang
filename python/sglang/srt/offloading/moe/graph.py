@@ -1,12 +1,19 @@
 """Opt-in graph backend ownership; serving completion stays in forward_scope."""
 
 import logging
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from threading import RLock
 
 from .owner import _serialized
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _MaintenanceShape:
+    shape: object
+    maintenance: bool
 
 
 class GraphLeaseBackend:
@@ -26,6 +33,9 @@ class GraphLeaseBackend:
         self.owner = owner
         self._rank = getattr(getattr(owner, "config", None), "ep_rank", None)
         self.graph_runner = graph_runner
+        self._periodic = (
+            getattr(owner.runtime, "graph_maintenance_interval", None) is not None
+        )
         self._identity = object()
         self._leases = set()
         self._capture_resources = []
@@ -41,6 +51,21 @@ class GraphLeaseBackend:
     def _require_open(self):
         if self._closed or self._failed or self._closing:
             raise RuntimeError("MoE graph backend is closed or failed")
+
+    def _variants(self, shape_key):
+        if not self._periodic:
+            return ((shape_key, True),)
+        return tuple(
+            (_MaintenanceShape(shape_key, maintenance), maintenance)
+            for maintenance in (False, True)
+        )
+
+    def _replay_key(self, shape_key):
+        if any(key not in self._leases for key, _ in self._variants(shape_key)):
+            raise ValueError("MoE graph bucket has no complete owner lease")
+        if not self._periodic:
+            return shape_key
+        return _MaintenanceShape(shape_key, self.owner.runtime.claim_decode_graph())
 
     def _capture_failed(self):
         self._failed = True
@@ -98,17 +123,14 @@ class GraphLeaseBackend:
         self._require_open()
         if not self._capturing:
             raise RuntimeError("Capture graphs inside a MoE capture_session")
-        if shape_key in self._leases:
+        variants = self._variants(shape_key)
+        if any(key in self._leases for key, _ in variants):
             raise ValueError(
                 "Destroy an existing MoE graph before replacing its bucket"
             )
         logger.info(
             "MoE offload graph.capture.begin: rank=%s bucket=%s", self._rank, shape_key
         )
-        self.owner.acquire_graph(
-            (self._identity, shape_key), capture_identity=self._identity
-        )
-        self._leases.add(shape_key)
         try:
 
             def warmup_hook():
@@ -116,12 +138,23 @@ class GraphLeaseBackend:
                     post_warmup_hook()
                 self.owner.runtime.after_graph_warmup()
 
-            result = self.backend.capture_one(
-                shape_key,
-                forward_fn,
-                capture_inputs=capture_inputs,
-                post_warmup_hook=warmup_hook,
-            )
+            for key, maintenance in variants:
+                self.owner.acquire_graph(
+                    (self._identity, key), capture_identity=self._identity
+                )
+                self._leases.add(key)
+                scope = (
+                    self.owner.runtime.capture_maintenance(maintenance)
+                    if self._periodic
+                    else nullcontext()
+                )
+                with scope:
+                    result = self.backend.capture_one(
+                        key,
+                        forward_fn,
+                        capture_inputs=capture_inputs,
+                        post_warmup_hook=warmup_hook,
+                    )
             logger.info(
                 "MoE offload graph.capture.ready: rank=%s bucket=%s",
                 self._rank,
@@ -142,8 +175,9 @@ class GraphLeaseBackend:
     @_serialized
     def can_run(self, forward_batch, shape_key):
         self._require_open()
-        return shape_key in self._leases and self.backend.can_run(
-            forward_batch, shape_key
+        return all(
+            key in self._leases and self.backend.can_run(forward_batch, key)
+            for key, _ in self._variants(shape_key)
         )
 
     @contextmanager
@@ -156,16 +190,14 @@ class GraphLeaseBackend:
     @_serialized
     def replay(self, shape_key, static_forward_batch, **kwargs):
         self._require_open()
-        if shape_key not in self._leases:
-            raise ValueError("MoE graph bucket has no owner lease")
-        return self.backend.replay(shape_key, static_forward_batch, **kwargs)
+        key = self._replay_key(shape_key)
+        return self.backend.replay(key, static_forward_batch, **kwargs)
 
     @_serialized
     def replay_with_input_update(self, shape_key, *args, **kwargs):
         self._require_open()
-        if shape_key not in self._leases:
-            raise ValueError("MoE graph bucket has no owner lease")
-        return self.backend.replay_with_input_update(shape_key, *args, **kwargs)
+        key = self._replay_key(shape_key)
+        return self.backend.replay_with_input_update(key, *args, **kwargs)
 
     @_serialized
     def cleanup(self):

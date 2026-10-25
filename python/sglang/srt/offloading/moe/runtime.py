@@ -421,6 +421,13 @@ class BoundMoERuntime:
         self.residency = residency
         self.ops = residency_ops
         self.cache_updates = cache_updates
+        self.graph_maintenance_interval = getattr(
+            cache_updates.policy, "graph_maintenance_interval", None
+        )
+        # Shared across graph buckets and preserved through prefill/capture.
+        # Only successful, globally active decode submissions advance this clock.
+        self._decode_step_mod = 0
+        self._capture_maintenance = True
         self.cache_stats = cache_stats
         self.diagnostics = diagnostics
         self.snapshot = snapshot
@@ -748,8 +755,24 @@ class BoundMoERuntime:
                 )
             context.forward_batch = forward_batch
             context.num_token_non_padded = None
+            active_decode = has_global_work and phase is Phase.DECODE
+            interval = self.graph_maintenance_interval
+            context.cache_maintenance = (
+                active_decode and (self._decode_step_mod + 1) % interval == 0
+                if interval is not None
+                else True
+            )
+            context.cache_graph_replayed = False
             context.retain(forward_batch)
             yield context
+            if (
+                interval is not None
+                and active_decode
+                and not context.cache_graph_replayed
+            ):
+                raise RuntimeError(
+                    "Periodic decode requires exactly one full graph replay"
+                )
             # Replay does not run Python hooks. Its tail was emitted in capture;
             # record fresh events only, without updating the policy twice.
             record = None
@@ -775,6 +798,8 @@ class BoundMoERuntime:
                     )
             completion = context.finish()
             owner.finish_forward(token, completion)
+            if interval is not None and active_decode:
+                self._decode_step_mod = (self._decode_step_mod + 1) % interval
             if self.diagnostics is not None:
                 try:
                     self.diagnostics.publish(record, completion.output_ready.completion)
@@ -802,6 +827,28 @@ class BoundMoERuntime:
         finally:
             self._context = None
 
+    def claim_decode_graph(self):
+        """Choose from known batch metadata; never read a device policy scalar."""
+        context = self.context
+        if self._capture is not None or context.capturing:
+            raise RuntimeError("Serving graph selection is outside capture")
+        if context.cache_graph_replayed:
+            raise RuntimeError("A decode batch may replay only one offload graph")
+        context.cache_graph_replayed = True
+        return context.cache_maintenance
+
+    @contextmanager
+    def capture_maintenance(self, enabled):
+        """Select a static full-graph tail before warmup and capture."""
+        if self._capture is None or self._context is not None:
+            raise RuntimeError("Select maintenance inside an idle capture session")
+        previous = self._capture_maintenance
+        self._capture_maintenance = enabled
+        try:
+            yield
+        finally:
+            self._capture_maintenance = previous
+
     def _capture_head(self, graph_runner, forward_batch, num_tokens):
         if self._capture is None or self._context is not None:
             raise RuntimeError("Invalid offload capture invocation")
@@ -817,7 +864,9 @@ class BoundMoERuntime:
     def _capture_tail(self, graph_runner, output, forward_batch, num_tokens):
         if self._capture is None or self._context is None:
             raise RuntimeError("Capture tail requires its matching head")
-        tail = self.cache_updates.emit_step_end(self.context)
+        tail = self.cache_updates.emit_step_end(
+            self.context, maintenance=self._capture_maintenance
+        )
         self.context.finish(residency_ready=tail)
         self._context = None
 

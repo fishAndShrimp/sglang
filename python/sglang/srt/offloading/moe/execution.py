@@ -235,7 +235,7 @@ class CacheUpdateCoordinator:
         self.access = access
         self.due_out = due_out
 
-    def emit_step_end(self, context):
+    def emit_step_end(self, context, *, maintenance=True):
         if context.phase is Phase.PREFILL:
             require_prefill(context)
             return TransferTicket(ImmediateCompletion())
@@ -248,6 +248,10 @@ class CacheUpdateCoordinator:
             self.residency_state.update_enabled,
             self.due_out,
         )
+        # This is a capture-time graph variant, never a Python branch on a
+        # device scalar. Ordinary replay contains no selection/transfer tail.
+        if not maintenance:
+            return context.record_compute_completion()
         self.policy.select_hot_set(
             self.policy_state, self.residency_state.key_to_slot, self.target_keys
         )

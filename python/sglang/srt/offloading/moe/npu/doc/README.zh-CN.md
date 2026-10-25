@@ -23,17 +23,18 @@
 
 `NpuMoEBackend` 在模型构造前安装，由 FusedMoE 的统一权重创建入口接管
 host 参数分配；post-load 后装配共享 host master、hot/execution bank、固定 Tensor
-residency、离线 Top-K / 周期层内 LFU、ACL eager prefill、MemFabric decode 和现有 Ascend EP/FFN。
+residency、离线 Top-K / 周期跨层 LFU、ACL eager prefill、MemFabric decode 和现有 Ascend EP/FFN。
 本项依赖 native ACL、真实存储和 EP/FFN 三项适配一起使用。
 
 当前只装配一个兼容 schema arena，分配前拒绝混合格式/不兼容拓扑。地址目录共享
 不可变 host/hot/destination 表，binding 只描述目标，wave/tail 可变 scratch 独立；一套 prefill pipeline
 拥有所有层的 A/B 读者历史。公共策略只输出 logical target_keys 与显式设备 due，
-full graph 保留 masked tail，非 due 不等于选择/规划 kernel 真早退。
+周期策略捕获普通和维护两种 full graph，非维护 batch 的图尾不包含选择/更新规划。
+host 只按有效 decode batch 计数选图，不回读设备热度或路由；详见周期缓存说明。
 
 2026-10-22 缓存接入说明见 [周期缓存配置与验证](PERIODIC_CACHE_1022.zh-CN.md)。
 非零热池必须配置 `offline_stats_path` 与 `offline_model_id`；示例 JSON 中的 profile
-路径需要替换为真实离线统计文件。在线各层缓存配额由离线初始化确定。
+路径需要替换为真实离线统计文件。在线各层缓存配额可在同一个 EP rank 内重新分配。
 
 公共 `BoundMoERuntime` 在 decoder 层首启动 prefill worker，在 FusedMoE.forward_impl
 进入 routed program，外层原有 shared experts 与缩放保持原路径。层间、forward

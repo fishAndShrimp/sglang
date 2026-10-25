@@ -22,7 +22,8 @@ Common overrides:
   MODEL_PATH, SGLANG_ROOT, PYTHON_BIN, SERVER_HOST, SERVER_PORT
   ASCEND_RT_VISIBLE_DEVICES, WORLD_SIZE, SYSTEM_TUNING, BUILD_NATIVE
   LOG_DIR, LOG_LEVEL, MOE_LOG_LEVEL
-  Offload mode: MOE_OFFLOAD_CONFIG, MAX_RUNNING_REQUESTS,
+  Offload mode: MOE_OFFLOAD_CONFIG, ATTN_DP_SIZE (default WORLD_SIZE),
+                MAX_RUNNING_REQUESTS,
                 MAX_PREFILL_TOKENS, CHUNKED_PREFILL_SIZE, CONTEXT_LENGTH,
                 MEM_FRACTION_STATIC
 
@@ -48,6 +49,7 @@ PYTHON_BIN=${PYTHON_BIN:-python3}
 MODEL_PATH=${MODEL_PATH:-/home/weights/DeepSeek-V4-Flash-0731-w8a8}
 MODE=${MODE:-offload}
 WORLD_SIZE=${WORLD_SIZE:-16}
+ATTN_DP_SIZE=${ATTN_DP_SIZE:-$WORLD_SIZE}
 SYSTEM_TUNING=${SYSTEM_TUNING:-1}
 BUILD_NATIVE=${BUILD_NATIVE:-1}
 SERVER_HOST=${SERVER_HOST:-0.0.0.0}
@@ -66,11 +68,14 @@ MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.6}
 case "$MODE" in offload|reference) ;; *) die "MODE must be offload or reference" ;; esac
 case "$SYSTEM_TUNING" in 0|1) ;; *) die "SYSTEM_TUNING must be 0 or 1" ;; esac
 case "$BUILD_NATIVE" in 0|1) ;; *) die "BUILD_NATIVE must be 0 or 1" ;; esac
-for name in WORLD_SIZE SERVER_PORT MAX_RUNNING_REQUESTS MAX_PREFILL_TOKENS CHUNKED_PREFILL_SIZE CONTEXT_LENGTH; do
+for name in WORLD_SIZE ATTN_DP_SIZE SERVER_PORT MAX_RUNNING_REQUESTS MAX_PREFILL_TOKENS CHUNKED_PREFILL_SIZE CONTEXT_LENGTH; do
     value=${!name}
     [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "$name must be a positive integer."
 done
 (( SERVER_PORT <= 65535 )) || die "SERVER_PORT exceeds 65535."
+if [[ "$MODE" == offload ]]; then
+    (( WORLD_SIZE % ATTN_DP_SIZE == 0 )) || die "ATTN_DP_SIZE must divide WORLD_SIZE."
+fi
 
 [[ -d "$SGLANG_ROOT/python/sglang" ]] || die "Invalid SGLANG_ROOT: $SGLANG_ROOT"
 [[ -d "$MODEL_PATH" ]] || die "MODEL_PATH does not exist: $MODEL_PATH"
@@ -210,17 +215,25 @@ PY
     unset SGLANG_ENABLE_WAR_BARRIER SGLANG_FORCE_COARSE_WAR_BARRIER
 
     BUILD_CMD=("$PYTHON_BIN" -m sglang.srt.offloading.moe.npu.native_acl --build-directory "$NATIVE_BUILD_DIR")
+    # Attention TP can filter out unaligned graph buckets. Include the aligned
+    # upper bound even when serving a single request; eager decode is unsupported.
+    ATTN_TP_SIZE=$((WORLD_SIZE / ATTN_DP_SIZE))
+    GRAPH_MAX_BS=$(((MAX_RUNNING_REQUESTS + ATTN_TP_SIZE - 1) / ATTN_TP_SIZE * ATTN_TP_SIZE))
+    GRAPH_BS=()
+    for ((bs=1; bs<GRAPH_MAX_BS; bs*=2)); do GRAPH_BS+=("$bs"); done
+    GRAPH_BS+=("$GRAPH_MAX_BS")
     SERVER_CMD=(
         "$PYTHON_BIN" -m sglang.launch_server
         --model-path "$MODEL_PATH" --served-model-name "$SERVED_MODEL_NAME"
         --host "$SERVER_HOST" --port "$SERVER_PORT"
-        --tp-size "$WORLD_SIZE" --ep-size "$WORLD_SIZE" --attn-dp-size 16
+        --tp-size "$WORLD_SIZE" --ep-size "$WORLD_SIZE" --attn-dp-size "$ATTN_DP_SIZE"
         --device npu --attention-backend dsv4 --page-size 128 --trust-remote-code
         --load-format safetensors --quantization modelslim --kv-cache-dtype bfloat16
         --moe-a2a-backend deepep --deepep-mode auto
         --disable-overlap-schedule --disable-shared-experts-fusion
         --cuda-graph-backend-decode full --cuda-graph-backend-prefill disabled
-        --cuda-graph-bs-decode 1
+        --cuda-graph-bs-decode "${GRAPH_BS[@]}"
+        --cuda-graph-max-bs-decode "$GRAPH_MAX_BS"
         --max-running-requests "$MAX_RUNNING_REQUESTS"
         --max-prefill-tokens "$MAX_PREFILL_TOKENS"
         --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
@@ -272,6 +285,7 @@ fi
 printf 'MODE=%s WORLD_SIZE=%s DEVICES=%s\n' "$MODE" "$WORLD_SIZE" "$ASCEND_RT_VISIBLE_DEVICES"
 printf 'Model=%s\nHost=%s Port=%s\n' "$MODEL_PATH" "$SERVER_HOST" "$SERVER_PORT"
 if [[ "$MODE" == offload ]]; then
+    printf 'ATTN_DP=%s ATTN_TP=%s decode_graph_buckets=%s\n' "$ATTN_DP_SIZE" "$ATTN_TP_SIZE" "${GRAPH_BS[*]}"
     printf 'Offload config=%s\nNative build dir=%s\n' "$MOE_OFFLOAD_CONFIG" "$NATIVE_BUILD_DIR"
     "$PYTHON_BIN" - "$MOE_OFFLOAD_CONFIG" <<'PY'
 import json

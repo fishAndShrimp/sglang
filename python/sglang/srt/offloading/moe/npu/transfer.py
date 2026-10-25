@@ -472,23 +472,32 @@ class MemFabricDeviceTransferOps(DeviceTransferOps):
         with self.stream_context(stream):
             try:
                 self._mask(plan, bindings)
+                # Bundle components share logical indices and validity. Compute
+                # them once on the copy stream, while keeping native mutable
+                # groups/packed buffers private to each component and batch.
+                source_index = plan.source_index + 1
+                host_indices = source_index.clamp(0, bindings.host_count)
+                hot_indices = source_index.clamp(0, bindings.hot_count)
+                destination_indices = (plan.destination_slot + 1).clamp(
+                    0, bindings.destination_count
+                )
+                from_host = plan.source_kind == int(CopySourceKind.HOST)
+                packed_indices = tuple(
+                    (bindings.mask[begin:end].to(torch.int64).cumsum(0) - 1).clamp_min(0)
+                    for begin, end, *_ in bindings.batches[0]
+                )
                 for tables, batches in zip(bindings.tables, bindings.batches):
                     host_table, hot_table, destination_table = tables
-                    for begin, end, src, dst, lengths, scan, groups, packed in batches:
-                        source_index = plan.source_index[begin:end]
-                        host_ptr = host_table.gather(
-                            0, (source_index + 1).clamp(0, bindings.host_count)
-                        )
-                        hot_ptr = hot_table.gather(
-                            0, (source_index + 1).clamp(0, bindings.hot_count)
-                        )
+                    for batch, packed_index in zip(batches, packed_indices):
+                        begin, end, src, dst, lengths, scan, groups, packed = batch
+                        host_ptr = host_table.gather(0, host_indices[begin:end])
+                        hot_ptr = hot_table.gather(0, hot_indices[begin:end])
                         selected = bindings.mask[begin:end]
                         src.copy_(
                             torch.where(
                                 selected,
                                 torch.where(
-                                    plan.source_kind[begin:end]
-                                    == int(CopySourceKind.HOST),
+                                    from_host[begin:end],
                                     host_ptr,
                                     hot_ptr,
                                 ),
@@ -498,14 +507,11 @@ class MemFabricDeviceTransferOps(DeviceTransferOps):
                         groups.copy_(selected)
                         destinations = destination_table.gather(
                             0,
-                            (plan.destination_slot[begin:end] + 1).clamp(
-                                0, bindings.destination_count
-                            ),
+                            destination_indices[begin:end],
                         )
                         # Native output j corresponds to the j-th selected i.
                         # Zero additions from inactive entries cannot overwrite an
                         # active destination, including entirely empty masks.
-                        packed_index = (groups.cumsum(0) - 1).clamp_min(0)
                         dst.zero_()
                         dst.scatter_add_(
                             0, packed_index, torch.where(selected, destinations, 0)

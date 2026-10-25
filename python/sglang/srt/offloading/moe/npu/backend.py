@@ -318,7 +318,9 @@ class NpuMoEBackend(MoEBackend):
             update_bindings=update,
             error_status=error,
             prepare_prefill=prepare_prefill,
-            cache_stats=cache_stats,
+            # LFU uses step_access_count independently. Disabled batch logging
+            # must also omit its per-wave reductions from the decode graph.
+            cache_stats=cache_stats if self.settings.batch_log_interval else None,
         )
 
         # Native operations retain into the current context, including worker
