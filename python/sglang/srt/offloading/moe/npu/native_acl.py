@@ -15,6 +15,7 @@ import os
 import shlex
 import subprocess
 import tempfile
+from collections import OrderedDict
 from pathlib import Path
 from threading import RLock
 
@@ -199,6 +200,7 @@ class AclHostTransferOps(HostTransferOps):
         source_location="host",
         source_location_id=0,
         max_batch_entries=256,
+        max_cached_plans=1024,
     ):
         if not callable(retain):
             raise TypeError("A durable runtime retention callback is required")
@@ -208,6 +210,8 @@ class AclHostTransferOps(HostTransferOps):
             raise ValueError("ACL source location ID must fit uint32")
         if type(max_batch_entries) is not int or max_batch_entries <= 0:
             raise ValueError("ACL batch capacity must be positive")
+        if type(max_cached_plans) is not int or max_cached_plans < 0:
+            raise ValueError("ACL descriptor cache capacity must be nonnegative")
         info = module.api_info()
         if info.get("queue_ordering") != "torch_npu_stream_flush" or info.get(
             "device_synchronize"
@@ -221,6 +225,31 @@ class AclHostTransferOps(HostTransferOps):
             source_location_id,
         )
         self.max_batch_entries = max_batch_entries
+        self.max_cached_plans = max_cached_plans
+        self._prepared = OrderedDict()
+        self._submission_lock = RLock()
+
+    def clear_cache(self):
+        """Drop cached address owners after the runtime has drained its streams."""
+        with self._submission_lock:
+            self._prepared.clear()
+
+    def _prepared_batches(self, plan, device):
+        # HostCopyPlan/regions/capabilities are immutable. Keep the plan alive in
+        # each entry so its identity cannot be reused for unrelated addresses.
+        key = (device.index, id(plan))
+        cached = self._prepared.get(key)
+        if cached is not None:
+            self._prepared.move_to_end(key)
+            return cached[1]
+        batches = self._lower(plan, device)
+        if self.max_cached_plans:
+            self._prepared[key] = (plan, batches)
+            if len(self._prepared) > self.max_cached_plans:
+                # Eviction drops only cache ownership; in-flight tickets still
+                # own every descriptor and source/destination allocation.
+                self._prepared.popitem(last=False)
+        return batches
 
     def _lower(self, plan, device):
         entries, destinations, mapped_sources = [], [], []
@@ -277,6 +306,12 @@ class AclHostTransferOps(HostTransferOps):
         return tuple(batches)
 
     def materialize_into(self, plan, bindings, stream):
+        # Native Batch reuses a mutable fail_index while the GIL is released.
+        # Serialize submissions, including cache lookup and completion recording.
+        with self._submission_lock:
+            return self._materialize_into(plan, bindings, stream)
+
+    def _materialize_into(self, plan, bindings, stream):
         if not isinstance(plan, HostCopyPlan):
             raise TypeError("ACL transfers require HostCopyPlan")
         device = getattr(stream, "device", None)
@@ -292,7 +327,7 @@ class AclHostTransferOps(HostTransferOps):
             raise ValueError(
                 "Native ACL requires a managed NPU stream with an explicit device"
             )
-        batches = self._lower(plan, device)
+        batches = self._prepared_batches(plan, device)
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "MoE offload acl.submit: batches=%s regions=%s bytes=%s stream=%s",

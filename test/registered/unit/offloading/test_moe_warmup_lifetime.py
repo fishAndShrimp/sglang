@@ -43,7 +43,10 @@ class TestMoEWarmupLifetime(unittest.TestCase):
                 begin_step=lambda context: None, error_status=torch.tensor(0)
             ),
             cache_updates=SimpleNamespace(
-                emit_step_end=lambda context: TransferTicket(ImmediateCompletion())
+                policy=SimpleNamespace(),
+                emit_step_end=lambda context, *, maintenance=True: TransferTicket(
+                    ImmediateCompletion()
+                ),
             ),
             snapshot=None,
             reload_weights=None,
@@ -58,6 +61,18 @@ class TestMoEWarmupLifetime(unittest.TestCase):
         owner.runtime = runtime
         wrapper = GraphLeaseBackend(Backend(calls), owner, object())
         return wrapper, owner, runtime, device, calls
+
+    def test_runtime_closes_prefill_worker_after_drain_before_freeing_storage(self):
+        _, _, runtime, _, calls = self.make_runtime()
+        runtime.pipelines = (
+            SimpleNamespace(close=lambda: calls.append("worker_closed")),
+        )
+        runtime._release = lambda: calls.append("storage_freed")
+        runtime.close()
+        self.assertEqual(calls, ["device_drain", "worker_closed", "storage_freed"])
+        self.assertEqual(runtime.pipelines, ())
+        runtime.close()
+        self.assertEqual(len(calls), 3)
 
     @staticmethod
     def real_owner(runtime):

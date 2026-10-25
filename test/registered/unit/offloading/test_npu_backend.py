@@ -195,6 +195,9 @@ class HostOps:
     def __init__(self, retain):
         self.retain, self.plans = retain, []
 
+    def clear_cache(self):
+        self.plans.clear()
+
     def materialize_into(self, plan, bindings, stream):
         self.retain((plan, bindings))
         self.plans.append(plan)
@@ -262,6 +265,8 @@ class Assembly:
             prefill_microbatch_size=1,
             prefill_max_inflight=2,
             max_dispatch_rows=32,
+            batch_log_interval=0,
+            batch_log_capacity=64,
         )
         backend.config, backend.device = self.config, torch.device("cpu")
         backend.model_plan = self.catalog
@@ -523,6 +528,40 @@ class NpuBackendAssemblyTests(unittest.TestCase):
                     access.release_after(
                         lease, context.record_compute_completion(), context
                     )
+
+    def test_prefill_reuses_physical_plans_but_not_reservation_state(self):
+        assembly = self.assemble()
+        runtime = assembly.finalize()
+        pipeline = runtime.pipelines[0]
+        context = runtime._new_context(Phase.PREFILL)
+        runtime._context = context
+        wave = ExpertWave(0, 0, 2, 0)
+        request = pipeline.make_request(3, wave, 0, context)
+        repeated = pipeline.make_request(3, wave, 0, context)
+        self.assertIs(request.local_demand.binding, repeated.local_demand.binding)
+        first = pipeline.access.stage(request, context)
+        pipeline.access.release_after(
+            first, context.record_compute_completion(), context
+        )
+        second = pipeline.access.stage(repeated, context)
+        self.assertIs(assembly.host.plans[0], assembly.host.plans[1])
+        self.assertIs(first.bindings, second.bindings)
+        self.assertIsNot(first.reservations[0].state, second.reservations[0].state)
+        self.assertTrue(first.reservations[0].state.retired)
+        self.assertFalse(second.reservations[0].state.retired)
+        pipeline.access.release_after(
+            second, context.record_compute_completion(), context
+        )
+        # Physical bank views are shared across layers, host source plans are not.
+        third = pipeline.access.stage(
+            pipeline.make_request(4, wave, 0, context), context
+        )
+        self.assertIsNot(assembly.host.plans[0], assembly.host.plans[2])
+        for tensor in third.bindings.bank.tensors.values():
+            self.assertEqual(tensor[:, 0].tolist(), [40, 41])
+        pipeline.access.release_after(
+            third, context.record_compute_completion(), context
+        )
 
     def test_decode_transfer_and_restore_reuse_fixed_bank_storage(self):
         assembly = self.assemble(ratio=0.25)
@@ -851,6 +890,46 @@ class TestAclHostTransfer(unittest.TestCase):
         self.assertEqual(len(resources[2]), 2)
         self.assertIs(raised.exception.completion_ticket, self.retained[-1])
         self.assertIs(resources[0].regions[0].source.registration, self.owner)
+
+    def test_repeated_plan_reuses_native_descriptors_and_records_fresh_completion(self):
+        first = self.ops.materialize_into(self.plan, None, self.stream)
+        first_batches = self.retained[0][2]
+        with mock.patch.object(
+            self.ops, "_lower", side_effect=AssertionError("rebuilt")
+        ):
+            second = self.ops.materialize_into(self.plan, None, self.stream)
+        self.assertIsNot(first, second)
+        self.assertEqual(self.completion.call_count, 2)
+        self.assertEqual(self.module.Batch.call_count, 2)
+        self.assertEqual(self.module.submit.call_count, 4)
+        self.assertIs(self.retained[2][2], first_batches)
+        # Cache hits must still validate the device/stream contract.
+        with self.assertRaisesRegex(ValueError, "managed NPU stream"):
+            self.ops.materialize_into(
+                self.plan, None, SimpleNamespace(device=self.device)
+            )
+
+    def test_cache_eviction_preserves_inflight_descriptors_and_clear_rebuilds(self):
+        self.ops.max_cached_plans = 1
+        first = self.ops.materialize_into(self.plan, None, self.stream)
+        original_batches = self.retained[0][2]
+        other = HostCopyPlan((self.plan.regions[0],))
+        self.ops.materialize_into(other, None, self.stream)
+        self.assertEqual(len(self.ops._prepared), 1)
+        self.assertIs(first.keepalive[2], original_batches)
+        self.ops.materialize_into(self.plan, None, self.stream)
+        self.assertEqual(self.module.Batch.call_count, 5)
+        self.ops.clear_cache()
+        self.assertEqual(len(self.ops._prepared), 0)
+        self.ops.materialize_into(self.plan, None, self.stream)
+        self.assertEqual(self.module.Batch.call_count, 7)
+
+    def test_disabled_descriptor_cache_revalidates_every_submission(self):
+        self.ops.max_cached_plans = 0
+        for _ in range(2):
+            self.ops.materialize_into(self.plan, None, self.stream)
+        self.assertEqual(len(self.ops._prepared), 0)
+        self.assertEqual(self.module.Batch.call_count, 4)
 
     def test_failed_completion_record_keeps_presubmission_retention(self):
         self.module.submit.side_effect = RuntimeError("submit failed")

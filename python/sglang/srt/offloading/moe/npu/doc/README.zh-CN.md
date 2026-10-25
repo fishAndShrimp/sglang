@@ -36,11 +36,26 @@ host 只按有效 decode batch 计数选图，不回读设备热度或路由；�
 非零热池必须配置 `offline_stats_path` 与 `offline_model_id`；示例 JSON 中的 profile
 路径需要替换为真实离线统计文件。在线各层缓存配额可在同一个 EP rank 内重新分配。
 
-公共 `BoundMoERuntime` 在 decoder 层首启动 prefill worker，在 FusedMoE.forward_impl
+公共 `BoundMoERuntime` 在 decoder 层首向常驻 prefill worker 提交任务，在 FusedMoE.forward_impl
 进入 routed program，外层原有 shared experts 与缩放保持原路径。层间、forward
 间复用 A/B 前会把前一个 compute reader frontier 接到 copy stream。激活打包
 workspace 在串行层之间共用。Dispatch 后真实本地计数进入 residency；设备
 padding 上界由 ForwardBatch 传入 dispatcher，不使用本 rank Router 频次代替。
+
+Prefill 的初始 microbatch 和后续 wave 共用一个 worker，跨层、跨 chunk 复用线程。
+主线程取得当前 wave 后即可提交 FFN，下一 wave 的描述符准备、ACL 提交在 worker 执行；
+覆盖 A/B 前仍在 copy stream 等待该 bank 的最后一个 reader。初始组先记录覆盖全部
+microbatch 的 copy fence，再允许提交 B，因此首个 FFN 只等待初始组，不被 B 的搬运阻塞。
+固定 bank 视图、HostCopyPlan 和 native ACL Batch 使用有界缓存（分别最多 256、1024、1024 项），
+命中后复用地址检查结果和 native 描述符；lease、reservation、完成事件仍逐次创建。
+缓存淘汰不释放在途 ticket 的资源，runtime 停止提交并 drain 后才清空缓存及释放注册。
+`torch_npu` host queue flush 继续保留，确保 stream 上先前的 event wait 排在 ACL 拷贝之前。
+
+`scripts/moe_offload_a3.json` 针对长输入把 `prefill_microbatch_size` 调为 4、
+`prefill_max_inflight` 调为 4，`prefill_group_size=8` 不变；初始组若提交满 16 个专家，
+ACL microbatch 提交从 16 次降为 4 次，不增加权重池容量。短输入可继续使用更小 microbatch。
+CPU 回归验证线程复用、资源保活、覆盖顺序和描述符复用；16K～128K 输入的 TTFT 收益
+仍需在 A3 上对比测量，未把 CPU 模拟测试时间作为设备性能结果。
 
 Capture head/tail 覆盖 warmup 与完整模型；update_enabled 在图外关闭/恢复。
 真实 replay 不重复执行 Python 统计或 LFU tail，而在提交后记录 fresh NPU

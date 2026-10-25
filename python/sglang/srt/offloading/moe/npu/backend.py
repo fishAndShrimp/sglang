@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, fields
+from functools import lru_cache
 from types import SimpleNamespace
 
 from ...transfer import (
@@ -244,6 +245,7 @@ class NpuMoEBackend(MoEBackend):
             for index, bank in prefill_banks.items()
         }
 
+        @lru_cache(maxsize=256)
         def prefill_binding(bank_id, offset, count):
             bank = prefill_banks[bank_id].view(offset, count)
             return SimpleNamespace(
@@ -270,17 +272,17 @@ class NpuMoEBackend(MoEBackend):
                 Phase.PREFILL,
             )
 
-        def prepare_prefill(request, context):
-            target = request.local_demand
-            if not isinstance(target, _PrefillTarget):
-                raise TypeError("Prefill requires a bounded physical bank target")
-            bank = target.binding.bank
-            storage = self.layers[request.layer_id]
+        @lru_cache(maxsize=1024)
+        def prefill_plan(layer_id, start, end, bank_id, offset):
+            # Registered host masters and arena addresses stay fixed until drain.
+            # Cache only physical descriptors; residency creates a fresh mutable
+            # reservation and completion/reader state for every invocation.
+            binding = prefill_binding(bank_id, offset, end - start)
+            bank = binding.bank
+            storage = self.layers[layer_id]
             regions = []
             for name in component_names:
-                for lane, expert in enumerate(
-                    range(request.wave.local_start, request.wave.local_end)
-                ):
+                for lane, expert in enumerate(range(start, end)):
                     source = storage.component_capabilities[name][expert]
                     destination = bank.component_regions[name][lane]
                     nbytes = self.format.layouts[name].nbytes
@@ -294,7 +296,19 @@ class NpuMoEBackend(MoEBackend):
                         )
                     )
             return MaterializationPlan(
-                HostCopyPlan(tuple(regions), (storage, bank)), target.binding
+                HostCopyPlan(tuple(regions), (storage, bank)), binding
+            )
+
+        def prepare_prefill(request, context):
+            target = request.local_demand
+            if not isinstance(target, _PrefillTarget):
+                raise TypeError("Prefill requires a bounded physical bank target")
+            return prefill_plan(
+                request.layer_id,
+                request.wave.local_start,
+                request.wave.local_end,
+                target.binding.bank_id,
+                target.binding.offset,
             )
 
         def combine_bindings(layer_id, wave, leases, context):
@@ -379,6 +393,7 @@ class NpuMoEBackend(MoEBackend):
             record_copy_completion=lambda ctx: self.device_runtime.record(
                 ctx.copy_stream
             ),
+            ordered_copy_stream=True,
         )
         pipelines = (pipeline,)
         shared_layout = None
@@ -463,6 +478,14 @@ class NpuMoEBackend(MoEBackend):
             group,
             getattr(self.settings, "batch_log_interval", 1) if diagnostics else 0,
         )
+
+        def release():
+            # close_after_drain has joined the worker and drained device reads.
+            host_ops.clear_cache()
+            prefill_plan.cache_clear()
+            prefill_binding.cache_clear()
+            self._release()
+
         self.runtime = BoundMoERuntime(
             device_runtime=self.device_runtime,
             residency=state,
@@ -477,7 +500,7 @@ class NpuMoEBackend(MoEBackend):
             expert_nbytes=self.format.expert_nbytes,
             storage=tuple(self.layers.values()),
             pipelines=pipelines,
-            release=self._release,
+            release=release,
         )
         if initial_keys is not None:
             try:

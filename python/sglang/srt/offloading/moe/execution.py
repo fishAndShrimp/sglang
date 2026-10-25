@@ -101,12 +101,14 @@ class ExpertWeightAccess:
         context.retain(lease)
         return lease
 
-    def combine_prefill(self, leases, bindings, context):
+    def combine_prefill(self, leases, bindings, context, *, ready=None):
         """Join submitted microbatches into the sealed large FFN group, without copy.
 
         Bindings must be a validated view of those reservations. The pipeline
         validates contiguous expert coverage/format; this helper transfers usage
         rights and joins completion. Child leases cannot be consumed separately.
+        An optional ready ticket must fence every child copy/publication; only
+        an explicitly ordered backend may replace the individual dependencies.
         """
         require_prefill(context)
         leases = tuple(leases)
@@ -116,8 +118,15 @@ class ExpertWeightAccess:
             self._check_lease(lease)
             if lease.context_token is not context.invocation_id:
                 raise ValueError("Cannot combine leases from different invocations")
+        if ready is not None and not isinstance(ready, TransferTicket):
+            raise TypeError("Prefill group readiness must be a TransferTicket")
         ticket = TransferTicket(
-            JoinedCompletion(lease.ticket.completion for lease in leases), leases
+            (
+                ready.completion
+                if ready is not None
+                else JoinedCompletion(lease.ticket.completion for lease in leases)
+            ),
+            (*leases, ready) if ready is not None else leases,
         )
         grouped = WeightLease(
             tuple(r for lease in leases for r in lease.reservations),

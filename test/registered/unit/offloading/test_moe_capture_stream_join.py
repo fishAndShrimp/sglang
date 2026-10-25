@@ -99,9 +99,10 @@ class TestMoECaptureStreamJoin(unittest.TestCase):
             ),
             residency_ops=SimpleNamespace(begin_step=lambda context: None),
             cache_updates=SimpleNamespace(
-                emit_step_end=lambda context: self.materialize_and_publish(
+                policy=SimpleNamespace(),
+                emit_step_end=lambda context, *, maintenance=True: self.materialize_and_publish(
                     context, graph
-                )
+                ),
             ),
             snapshot=None,
             reload_weights=None,

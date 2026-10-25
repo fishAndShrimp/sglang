@@ -6,8 +6,9 @@ physical bindings remain injected and require separate hardware validation.
 
 import logging
 import math
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from threading import Condition, RLock, Thread
+from threading import Condition, RLock
 
 from ..transfer import Completion, ImmediateCompletion, JoinedCompletion, TransferTicket
 from .config import ExpertWave, Phase
@@ -117,6 +118,7 @@ class BoundedPrefillWeightPipeline:
         combine_bindings,
         worker_scope,
         record_copy_completion,
+        ordered_copy_stream=False,
     ):
         self.access = access
         if not isinstance(config, PrefillPipelineConfig):
@@ -134,6 +136,14 @@ class BoundedPrefillWeightPipeline:
         self.combine_bindings = combine_bindings
         self.worker_scope = worker_scope
         self.record_copy_completion = record_copy_completion
+        # Native PREFILL publication has no auxiliary device work: a fence on
+        # this one stream covers every initial lease. Other backends opt in only
+        # when they provide the same ordering guarantee.
+        self.ordered_copy_stream = ordered_copy_stream
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="moe-prefill"
+        )
+        self._closed = False
         self._lock = RLock()
         self._active_session = None
         self._aborted = {}
@@ -168,6 +178,8 @@ class BoundedPrefillWeightPipeline:
             raise ValueError("A prefill layer needs a nonnegative integer identifier")
         session = _PrefillSession(layer_id, context.invocation_id)
         with self._lock:
+            if self._closed:
+                raise RuntimeError("Prefill pipeline is closed")
             if context.invocation_id in self._aborted:
                 raise RuntimeError("Cannot restart an aborted prefill invocation")
             # A/B views are shared: a sealed but unread layer still owns them.
@@ -179,23 +191,46 @@ class BoundedPrefillWeightPipeline:
             self._active_session = session
         context.retain(self)
         context.retain(session)
-        session.worker = Thread(
-            target=self._load_initial,
-            args=(session, context),
-            name=f"moe-prefill-{layer_id}",
-            daemon=False,
-        )
+        self._submit(session, context, self._load_initial)
+
+    def _submit(self, session, context, operation, *args):
+        """One pending job per layer; the copy stream has one submitting thread."""
         context.worker_started()
+        session.worker_done = False
+        session.worker_started = False
+        session.worker = None
         try:
-            session.worker.start()
+            session.worker = self._executor.submit(
+                self._run_job, session, context, operation, args
+            )
             session.worker_started = True
         except BaseException as error:
+            # Executor.submit may enqueue before starting its first thread. A
+            # failed start must never leave that job runnable by a later submit.
+            self._closed = True
+            self._executor.shutdown(wait=True, cancel_futures=True)
             context.worker_finished()
             with session.condition:
                 session.error = error
                 session.worker_done = True
                 session.condition.notify_all()
             raise
+
+    def _run_job(self, session, context, operation, args):
+        try:
+            with self.worker_scope(context):
+                operation(session, context, *args)
+        except BaseException as error:
+            with session.condition:
+                session.error = error
+                session.stop = True
+        finally:
+            try:
+                context.worker_finished()
+            finally:
+                with session.condition:
+                    session.worker_done = True
+                    session.condition.notify_all()
 
     def validate_session(self, layer, context):
         session = self._session(layer, context)
@@ -218,60 +253,45 @@ class BoundedPrefillWeightPipeline:
     def _load_initial(self, session, context):
         config = self.config
         inflight = []
-        try:
-            with self.worker_scope(context):
-                if session.previous_idle is not None:
-                    context.retain(session.previous_idle)
-                    session.previous_idle.completion.wait_on(context.copy_stream)
-                while session.loaded < config.initial_capacity:
-                    with session.condition:
-                        if session.stop:
-                            break
-                        # Never query an event before the dispatcher publishes it.
-                        if (
-                            session.loaded
-                            and session.dispatch_ready is not None
-                            and session.dispatch_ready.done()
-                        ):
-                            break
-                    inflight = [
-                        lease
-                        for lease in inflight
-                        if not lease.ticket.completion.done()
-                    ]
-                    if len(inflight) >= config.max_inflight:
-                        with session.condition:
-                            if not session.stop:
-                                session.condition.wait(config.poll_interval)
-                        continue
-                    start = session.loaded
-                    end = min(start + config.microbatch_size, config.initial_capacity)
-                    wave = ExpertWave(
-                        len(session.leases), start, end, config.initial_bank
-                    )
-                    lease = self.access.stage(
-                        self._request(session, wave, start, context), context
-                    )
-                    # A complete expert bundle was submitted; readiness is separate.
-                    with session.condition:
-                        session.leases.append(lease)
-                        session.loaded = end
-                        inflight.append(lease)
-                        session.condition.notify_all()
-        except BaseException as error:
+        if session.previous_idle is not None:
+            context.retain(session.previous_idle)
+            session.previous_idle.completion.wait_on(context.copy_stream)
+        while session.loaded < config.initial_capacity:
             with session.condition:
-                session.error = error
-                session.stop = True
-        finally:
-            context.worker_finished()
+                if session.stop:
+                    break
+                # Never query an event before the dispatcher publishes it.
+                if (
+                    session.loaded
+                    and session.dispatch_ready is not None
+                    and session.dispatch_ready.done()
+                ):
+                    break
+            inflight = [
+                lease for lease in inflight if not lease.ticket.completion.done()
+            ]
+            if len(inflight) >= config.max_inflight:
+                with session.condition:
+                    if not session.stop:
+                        session.condition.wait(config.poll_interval)
+                continue
+            start = session.loaded
+            end = min(start + config.microbatch_size, config.initial_capacity)
+            wave = ExpertWave(len(session.leases), start, end, config.initial_bank)
+            lease = self.access.stage(
+                self._request(session, wave, start, context), context
+            )
+            # A complete expert bundle was submitted; readiness is separate.
             with session.condition:
-                session.worker_done = True
+                session.leases.append(lease)
+                session.loaded = end
+                inflight.append(lease)
                 session.condition.notify_all()
 
     @staticmethod
     def _join_worker(session):
         if session.worker_started:
-            session.worker.join()
+            session.worker.result()
 
     def seal(self, layer, dispatch_ready, context):
         """Stop new batches at dispatch feedback; join and combine submitted leases."""
@@ -317,13 +337,23 @@ class BoundedPrefillWeightPipeline:
         bindings = self.combine_bindings(
             session.layer_id, waves[0], tuple(session.leases), context
         )
-        lease = self.access.combine_prefill(session.leases, bindings, context)
+        if self.ordered_copy_stream and len(session.leases) > 1:
+            # Fence A before acquire can enqueue B: waiting for B here would
+            # destroy the copy/FFN overlap. Child tickets still retain storage.
+            ready = self._copy_fence(context)
+            lease = self.access.combine_prefill(
+                session.leases, bindings, context, ready=ready
+            )
+        else:
+            lease = self.access.combine_prefill(session.leases, bindings, context)
         session.leases = [lease]
         session.waves = tuple(waves)
         return session.waves
 
     def acquire(self, layer, wave, context):
         session = self._session(layer, context)
+        # Wait only for host submission of this wave, not for DMA completion.
+        self._join_worker(session)
         self._raise_failed(session)
         index = session.next_wave
         if index >= len(session.waves) or session.waves[index] != wave:
@@ -336,19 +366,35 @@ class BoundedPrefillWeightPipeline:
         next_index = index + 1
         if next_index < len(session.waves):
             next_wave = session.waves[next_index]
-            # The first reuse of A must wait for ALL first-group reservations.
+            previous_read = None
             old_index = next_index - 2
             if old_index >= 0:
-                previous = session.leases[old_index]
-                if previous.read_done is None:
+                previous_read = session.leases[old_index].read_done
+                if previous_read is None:
                     raise RuntimeError("Cannot overwrite a bank without its old reader")
-                previous.read_done.completion.wait_on(context.copy_stream)
-            lease = self.access.stage(
-                self._request(session, next_wave, 0, context), context
-            )
-            session.leases.append(lease)
+            self._submit(session, context, self._load_next, next_wave, previous_read)
         session.next_wave += 1
         return current
+
+    def _load_next(self, session, context, wave, previous_read):
+        with session.condition:
+            if session.stop:
+                return
+        if previous_read is not None:
+            previous_read.completion.wait_on(context.copy_stream)
+        lease = self.access.stage(self._request(session, wave, 0, context), context)
+        with session.condition:
+            session.leases.append(lease)
+
+    def close(self):
+        """Stop the persistent worker after finish/abort has joined its last job."""
+        with self._lock:
+            if self._active_session is not None:
+                raise RuntimeError("Finish or abort prefill before closing its worker")
+            self._closed = True
+        self._executor.shutdown(wait=True)
+        self._previous_idle = None
+        self._aborted.clear()
 
     @staticmethod
     def _tickets(session):

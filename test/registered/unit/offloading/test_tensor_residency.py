@@ -1,6 +1,7 @@
 """CPU differential checks for the graph-oriented fixed tensor residency planner."""
 
 import random
+from threading import Event, Thread, get_ident
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -125,7 +126,15 @@ class ManualCompletion(Completion):
 
 
 class TestPrefillPipelineFailures(unittest.TestCase):
-    def make_pipeline(self, *, fail_copy_at=None, fail_combine=False):
+    def make_pipeline(
+        self,
+        *,
+        fail_copy_at=None,
+        fail_combine=False,
+        config=None,
+        on_copy=None,
+        ordered_copy_stream=False,
+    ):
         calls, prepared = [], []
         ops, _, _, _ = setup(hot=0, experts=4, slots=2)
 
@@ -142,6 +151,8 @@ class TestPrefillPipelineFailures(unittest.TestCase):
         class HostOps(HostTransferOps):
             def materialize_into(self, plan, bindings, stream):
                 calls.append(("submit", bindings.wave.local_start))
+                if on_copy is not None:
+                    on_copy(bindings.wave)
                 if bindings.wave.local_start + 1 == fail_copy_at:
                     # The driver can queue writes before it reports an error.
                     raise RuntimeError("copy failed after partial submission")
@@ -160,7 +171,13 @@ class TestPrefillPipelineFailures(unittest.TestCase):
 
         def copy_fence(context):
             session = pipeline._active_session
-            calls.append(("fence", session.worker.is_alive(), context._workers))
+            calls.append(
+                (
+                    "fence",
+                    (session.worker is not None and not session.worker.done()),
+                    context._workers,
+                )
+            )
             return TransferTicket(ManualCompletion(False, calls))
 
         def combine_bindings(layer, wave, leases, context):
@@ -170,14 +187,22 @@ class TestPrefillPipelineFailures(unittest.TestCase):
 
         pipeline = BoundedPrefillWeightPipeline(
             ExpertWeightAccess(ops, host_ops=HostOps()),
-            PrefillPipelineConfig(4, 2, 2, 2),
+            config or PrefillPipelineConfig(4, 2, 2, 2),
             make_request=lambda layer, wave, offset, context: ExecutionRequest(
                 layer, offset, wave, Phase.PREFILL
             ),
             combine_bindings=combine_bindings,
             worker_scope=lambda context: nullcontext(),
             record_copy_completion=copy_fence,
+            ordered_copy_stream=ordered_copy_stream,
         )
+
+        def cleanup():
+            if pipeline._active_session is not None:
+                pipeline.abort(context)
+            pipeline.close()
+
+        self.addCleanup(cleanup)
         return SimpleNamespace(
             pipeline=pipeline, context=context, calls=calls, prepared=prepared
         )
@@ -199,14 +224,14 @@ class TestPrefillPipelineFailures(unittest.TestCase):
         completion = context.finish()
         self.assertFalse(completion.resources_idle.completion.done())
         self.assertTrue(completion.resources)
-        with self.assertRaisesRegex(RuntimeError, "aborted"):
+        with self.assertRaisesRegex(RuntimeError, "aborted|closed"):
             pipeline.start(3, context)
         return ticket
 
     def test_worker_start_failure_keeps_session_until_idempotent_abort(self):
         fixture = self.make_pipeline()
         with patch(
-            "sglang.srt.offloading.moe.prefill.Thread.start",
+            "threading.Thread.start",
             side_effect=RuntimeError("thread start failed"),
         ):
             with self.assertRaisesRegex(RuntimeError, "thread start failed"):
@@ -222,8 +247,8 @@ class TestPrefillPipelineFailures(unittest.TestCase):
         fixture = self.make_pipeline(fail_copy_at=2)
         fixture.pipeline.start(3, fixture.context)
         session = fixture.pipeline._active_session
-        session.worker.join(timeout=2)
-        self.assertFalse(session.worker.is_alive())
+        session.worker.result(timeout=2)
+        self.assertFalse((session.worker is not None and not session.worker.done()))
         self.assertIsInstance(session.error, RuntimeError)
         self.assertEqual(len(session.leases), 1)
         self.assertEqual(len(fixture.prepared), 2)
@@ -240,8 +265,8 @@ class TestPrefillPipelineFailures(unittest.TestCase):
         fixture = self.make_pipeline(fail_combine=True)
         fixture.pipeline.start(3, fixture.context)
         session = fixture.pipeline._active_session
-        session.worker.join(timeout=2)
-        self.assertFalse(session.worker.is_alive())
+        session.worker.result(timeout=2)
+        self.assertFalse((session.worker is not None and not session.worker.done()))
         initial = tuple(session.leases)
         self.assertEqual(len(initial), 2)
         with self.assertRaisesRegex(ValueError, "binding validation"):
@@ -254,6 +279,171 @@ class TestPrefillPipelineFailures(unittest.TestCase):
         ticket = self.assert_aborted_and_retained(fixture, session)
         for lease in initial:
             self.assertIn(lease.ticket, ticket.keepalive)
+
+    def test_worker_is_reused_across_layers_and_closed_before_restart(self):
+        workers = []
+        fixture = self.make_pipeline(on_copy=lambda wave: workers.append(get_ident()))
+        pipeline, context = fixture.pipeline, fixture.context
+        thread_starts = []
+        original_start = Thread.start
+
+        def start(thread):
+            thread_starts.append(thread)
+            original_start(thread)
+
+        with patch.object(Thread, "start", start):
+            for layer in (3, 4, 3, 4):
+                pipeline.start(layer, context)
+                pipeline._active_session.worker.result(timeout=2)
+                waves = pipeline.seal(layer, ManualCompletion(True, []), context)
+                for wave in waves:
+                    lease = pipeline.acquire(layer, wave, context)
+                    pipeline.access.release_after(
+                        lease, context.record_compute_completion(), context
+                    )
+                pipeline.finish(layer, context)
+                self.assertEqual(context._workers, 0)
+        self.assertEqual(len(thread_starts), 1)
+        self.assertEqual(len(set(workers)), 1)
+        self.assertNotEqual(workers[0], get_ident())
+        pipeline.close()
+        self.assertFalse(thread_starts[0].is_alive())
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            pipeline.start(3, context)
+
+    def test_next_wave_submission_does_not_block_current_ffn_and_orders_reuse(self):
+        entered, resume = Event(), Event()
+
+        def on_copy(wave):
+            if wave.local_start == 2:
+                entered.set()
+                if not resume.wait(2):
+                    raise TimeoutError("test copy gate was not released")
+
+        fixture = self.make_pipeline(
+            config=PrefillPipelineConfig(6, 2, 2, 2), on_copy=on_copy
+        )
+        self.addCleanup(resume.set)
+        pipeline, context = fixture.pipeline, fixture.context
+        pipeline.start(3, context)
+        pipeline._active_session.worker.result(timeout=2)
+        waves = pipeline.seal(3, ManualCompletion(True, []), context)
+        first = pipeline.acquire(3, waves[0], context)
+        self.assertTrue(entered.wait(2))
+        self.assertFalse(pipeline._active_session.worker.done())
+        self.assertIsNone(pipeline._active_session.error)
+        pipeline.access.wait_ready(first, context.compute_stream, context=context)
+        # A's final reader must be queued before the background A overwrite.
+        reader_calls = []
+        read_done = TransferTicket(ManualCompletion(False, reader_calls))
+        pipeline.access.release_after(first, read_done, context)
+        resume.set()
+        second = pipeline.acquire(3, waves[1], context)
+        pipeline._active_session.worker.result(timeout=2)
+        self.assertEqual(reader_calls, [("wait", "copy")])
+        pipeline.access.release_after(
+            second, context.record_compute_completion(), context
+        )
+        third = pipeline.acquire(3, waves[2], context)
+        pipeline.access.release_after(
+            third, context.record_compute_completion(), context
+        )
+        pipeline.finish(3, context)
+        self.assertEqual(context._workers, 0)
+
+    def test_background_wave_failure_is_reported_and_fenced_before_release(self):
+        fixture = self.make_pipeline(fail_copy_at=3)
+        pipeline, context = fixture.pipeline, fixture.context
+        pipeline.start(3, context)
+        session = pipeline._active_session
+        session.worker.result(timeout=2)
+        waves = pipeline.seal(3, ManualCompletion(True, []), context)
+        first = pipeline.acquire(3, waves[0], context)
+        session.worker.result(timeout=2)
+        pipeline.access.release_after(
+            first, context.record_compute_completion(), context
+        )
+        with self.assertRaisesRegex(RuntimeError, "submitter failed"):
+            pipeline.acquire(3, waves[1], context)
+        self.assertEqual(len(fixture.prepared), 3)
+        self.assertIsNotNone(fixture.prepared[-1]())
+        self.assert_aborted_and_retained(fixture, session)
+        self.assertLess(
+            fixture.calls.index(("submit", 2)),
+            fixture.calls.index(("fence", False, 0)),
+        )
+
+    def test_abort_joins_background_submission_before_recording_fence(self):
+        entered, resume, aborting, aborted = Event(), Event(), Event(), Event()
+
+        def on_copy(wave):
+            if wave.local_start == 2:
+                entered.set()
+                if not resume.wait(2):
+                    raise TimeoutError("test copy gate was not released")
+
+        fixture = self.make_pipeline(on_copy=on_copy)
+        self.addCleanup(resume.set)
+        pipeline, context = fixture.pipeline, fixture.context
+        pipeline.start(3, context)
+        pipeline._active_session.worker.result(timeout=2)
+        waves = pipeline.seal(3, ManualCompletion(True, []), context)
+        pipeline.acquire(3, waves[0], context)
+        self.assertTrue(entered.wait(2))
+        errors = []
+
+        def abort():
+            try:
+                aborting.set()
+                pipeline.abort(context)
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                aborted.set()
+
+        thread = Thread(target=abort)
+        thread.start()
+        try:
+            self.assertTrue(aborting.wait(2))
+            self.assertFalse(aborted.is_set())
+            self.assertFalse(any(call[0] == "fence" for call in fixture.calls))
+        finally:
+            resume.set()
+            thread.join(2)
+        self.assertTrue(aborted.is_set())
+        self.assertEqual(errors, [])
+        self.assertEqual(fixture.calls[-1], ("fence", False, 0))
+        self.assertEqual(context._workers, 0)
+
+    def test_ordered_initial_fence_replaces_waits_but_keeps_child_leases(self):
+        for ordered in (False, True):
+            with self.subTest(ordered=ordered):
+                fixture = self.make_pipeline(ordered_copy_stream=ordered)
+                pipeline, context = fixture.pipeline, fixture.context
+                pipeline.start(3, context)
+                session = pipeline._active_session
+                session.worker.result(timeout=2)
+                children = tuple(session.leases)
+                waves = pipeline.seal(3, ManualCompletion(True, []), context)
+                # The fence must precede even the host submission of B.
+                self.assertNotIn(("submit", 2), fixture.calls)
+                if ordered:
+                    self.assertEqual(fixture.calls[-1], ("fence", False, 0))
+                first = pipeline.acquire(3, waves[0], context)
+                pipeline.access.wait_ready(first, "compute", context=context)
+                self.assertEqual(
+                    fixture.calls.count(("wait", "compute")), 1 if ordered else 2
+                )
+                self.assertTrue(all(child.transferred for child in children))
+                for child in children:
+                    self.assertIn(child, first.ticket.keepalive)
+                pipeline.abort(context)
+
+    def test_close_rejects_an_active_session(self):
+        fixture = self.make_pipeline()
+        fixture.pipeline.start(3, fixture.context)
+        with self.assertRaisesRegex(RuntimeError, "Finish or abort"):
+            fixture.pipeline.close()
 
 
 class TestTensorResidency(unittest.TestCase):

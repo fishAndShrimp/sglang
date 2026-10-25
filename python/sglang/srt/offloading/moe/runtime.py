@@ -568,6 +568,10 @@ class BoundMoERuntime:
         if self._owner is not None and self._owner._graphs:
             raise RuntimeError("Destroy graph buckets before closing runtime")
         self._closing = True
+        for pipeline in self.pipelines:
+            close = getattr(pipeline, "close", None)
+            if close is not None:
+                close()
         if self.diagnostics is not None:
             try:
                 self.diagnostics.close()
