@@ -109,7 +109,9 @@ sys.exit(0 if result.wasSuccessful() and not result.skipped else 1)
 PY
 ```
 
-旧重复缓存栈测试已迁移到生产 residency、Graph lease 与原生装配 fixture；不再保留第二套测试运行栈。
+旧重复缓存栈的部分覆盖迁入既有生产 residency、Graph lease 与原生装配 fixture；
+本次另行新增的六个测试文件已按后续要求删除，删除前验证及当前结果见[重构记录](../../doc/REFACTOR_20261025.zh-CN.md)。
+不再保留第二套测试运行栈。
 装配测试中的 CPU 字节复制和事件替身只存在于测试目录，不恢复生产 CPU emulation 开关。
 新增用例覆盖离线完整 bundle 初始化、第四步替换/衰减、下一步命中、assignment 计数、
 capture gate、空步周期、原 slot/策略恢复、初始化 sticky fault 和配置选择。

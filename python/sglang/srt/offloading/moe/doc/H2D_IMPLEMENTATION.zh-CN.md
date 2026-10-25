@@ -45,8 +45,9 @@ reader 的独立完成语义，仅已证明的同流 frontier 可以归并。pla
 
 ## 验证边界
 
-CPU 测试包含共享目录去重、独立 scratch、别名/设备/布局拒绝、完整 bundle、
-稀疏计划、读者保护和部分提交保活；测试替身不进入生产实现。
+保留的 CPU 测试包含完整 bundle、稀疏计划、读者保护和部分提交保活；测试替身不进入生产实现。
+共享目录去重、独立 scratch 等新增专项测试已按后续要求删除，删除前验证记录及当前
+测试范围见[重构记录](REFACTOR_20261025.zh-CN.md)。
 本轮未取得真实 NPU 实测。目标机还需验证 ACL ABI/队列顺序、MemFabric 动态地址、
 跨流 full graph、FP4/W8A8 数值、多 rank EP、内存峰值及 H2D/F 时间线。
 非 due 使用 masked tail，不声称设备 kernel 已真正早退。

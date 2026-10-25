@@ -111,7 +111,8 @@ wave/tail scratch 保持独立。`AllocationLedger` 对物理分配去重，权�
 ## 验证与支持边界
 
 当前 CPU 测试位于 `test/registered/unit/offloading/`，覆盖生产组件装配、缓存策略、
-设备计划契约、共享 pipeline、失败保活、graph lease、格式与地址目录。运行方法见
+设备计划、失败保活、graph lease 和格式。本次另行新增的六个测试文件已按后续要求删除。
+运行方法见
 [周期缓存说明](../npu/doc/PERIODIC_CACHE_1022.zh-CN.md)，本轮结果以[重构记录](REFACTOR_20261025.zh-CN.md)为准。
 
 NPU 验收仍需真实 native ACL/MemFabric、NZ 格式与 FP4/W8A8 数值对照、多 rank EP、
