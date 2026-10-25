@@ -64,7 +64,8 @@ class HostPool:
             self.bytes.data_ptr(), size, True, self.bytes.data_ptr(), self
         )
 
-    def allocate(self, size):
+    def allocate(self, size, alignment=64):
+        self.offset = (self.offset + alignment - 1) // alignment * alignment
         value = self.bytes[self.offset : self.offset + size]
         self.offset += size
         if value.numel() != size:
@@ -191,7 +192,7 @@ class TestW8A8Format(unittest.TestCase):
         self.load_one(2, "w1", "weight")
         with self.assertRaisesRegex(ValueError, "Duplicate"):
             self.load_one(2, "w1", "weight")
-        with self.assertRaisesRegex(RuntimeError, "nine components"):
+        with self.assertRaisesRegex(RuntimeError, "9 component shards"):
             self.storage.finalize()
 
     def test_invalid_dtype_scale_offset_and_shape_are_rejected(self):
@@ -221,6 +222,83 @@ class TestW8A8Format(unittest.TestCase):
             self.storage.finalize()
         with self.assertRaisesRegex(RuntimeError, "not writable"):
             self.load_one(2, "w1", "weight")
+
+    def test_seal_retires_loader_state_and_close_retires_all_parameter_views(self):
+        from sglang.srt.offloading.moe.formats import ExpertFormat
+        from sglang.srt.offloading.moe.npu.format import ExpertLayerStorage
+
+        self.assertIsInstance(self.format, ExpertFormat)
+        self.assertIs(type(self.storage), ExpertLayerStorage)
+        self.load_all()
+        self.storage.finalize()
+        self.assertIsNone(self.storage._loaded)
+        self.assertIsNone(self.storage._checkpoint_state)
+        self.assertEqual(self.storage.raw_components, {})
+        loaders = [
+            getattr(self.layer, c.name).weight_loader
+            for c in self.format.schema.components
+        ]
+        self.assertTrue(all(loader is loaders[0] for loader in loaders))
+        self.assertIsNone(loaders[0].__closure__)
+        with self.assertRaisesRegex(RuntimeError, "not writable"):
+            self.load_one(2, "w1", "weight")
+        self.storage.close()
+        self.assertFalse(hasattr(self.layer, "_moe_offload_storage"))
+        for c in self.format.schema.components:
+            parameter = getattr(self.layer, c.name)
+            self.assertEqual(parameter.numel(), 0)
+            self.assertFalse(hasattr(parameter, "weight_loader"))
+
+    def test_projection_abi_validation_precedes_any_host_overwrite(self):
+        self.load_all()
+        before = self.pool.bytes.clone()
+        prepare = self.format.adapter.prepare
+
+        def changed(*inputs):
+            weight, scale, offset = prepare(*inputs)
+            return weight, scale[:, :-1], offset
+
+        with mock.patch.object(self.format.adapter, "prepare", side_effect=changed):
+            with self.assertRaisesRegex(RuntimeError, "changed after the format probe"):
+                self.storage.finalize()
+        self.assertTrue(torch.equal(before, self.pool.bytes))
+        with self.assertRaisesRegex(RuntimeError, "failed repack"):
+            self.storage.finalize()
+
+    def test_concurrent_duplicate_shards_commit_exactly_once(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        def submit():
+            try:
+                self.load_one(2, "w1", "weight")
+                return "loaded"
+            except ValueError as error:
+                self.assertIn("Duplicate", str(error))
+                return "duplicate"
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            result = list(executor.map(lambda _: submit(), range(2)))
+        self.assertEqual(sorted(result), ["duplicate", "loaded"])
+        self.assertEqual(len(self.storage._loaded), 1)
+
+    def test_bank_region_ownership_does_not_require_cyclic_gc(self):
+        import gc
+        import weakref
+
+        enabled = gc.isenabled()
+        gc.disable()
+        try:
+            bank = self.format.allocate_bank(2, ResourceKind.HOT_WEIGHTS, "lifetime")
+            weak_bank = weakref.ref(bank)
+            region = bank.component_regions["w13_weight"][0]
+            address = region.address
+            del bank
+            self.assertIsNone(weak_bank())
+            # The region retains exactly the allocation it certifies.
+            self.assertEqual(region.owner.data_ptr(), address)
+        finally:
+            if enabled:
+                gc.enable()
 
     def test_too_small_loader_budget_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "workspace"):
@@ -282,6 +360,15 @@ class TestFP4FormatRegression(unittest.TestCase):
                         shard_id="w2",
                     )
         storage.finalize()
+        self.assertEqual(format.schema.required_shards, 6)
+        self.assertEqual(format.schema.format_id, "ascend.v4.mxfp4.nz.v1")
+        self.assertEqual(
+            dict(format.schema.dispatch_config)["low_latency_dispatcher_output_dtype"],
+            "mxfp8",
+        )
+        self.assertIsNone(storage._loaded)
+        self.assertIsNone(storage._checkpoint_state)
+        self.assertEqual(storage.raw_components, {})
         bank = format.allocate_bank(2, ResourceKind.HOT_WEIGHTS, "fp4")
         self.assertEqual(pool.offset, format.host_nbytes(2))
         for name, tensor in bank.view(1, 1).tensors.items():
@@ -345,7 +432,7 @@ class TestW8A8Binding(unittest.TestCase):
         self.assertIsInstance(result.activation, NPUSwigluInt8Quant)
 
     def test_backend_accepts_only_the_two_w8a8_schemes_and_marks_hash_layers(self):
-        from sglang.srt.offloading.moe.npu.backend import NpuMoEBackend
+        from sglang.srt.offloading.moe.npu.format_resolver import resolve_npu_format
 
         class FP4:
             pass
@@ -367,18 +454,19 @@ class TestW8A8Binding(unittest.TestCase):
                 ModelSlimW8A8Int8MoE=Scheme
             ),
         }
-        backend = NpuMoEBackend.__new__(NpuMoEBackend)
-        backend.resident_layers, backend.layer_ids = 3, (3,)
         with mock.patch.dict("sys.modules", modules):
             for layer_id in (0, 3):
                 layer = SimpleNamespace(
                     layer_id=layer_id, w13_scheme=Scheme(), w2_scheme=Scheme()
                 )
-                self.assertEqual(backend.validate_quant_method(layer, Method()), "w8a8")
+                self.assertIs(
+                    resolve_npu_format(layer, Method(), resident=layer_id < 3),
+                    w8a8_format.NpuV4W8A8Format,
+                )
                 self.assertTrue(layer._moe_offload_bf16_dispatch)
             layer.w2_scheme = object()
             with self.assertRaisesRegex(ValueError, "W8A8_DYNAMIC"):
-                backend.validate_quant_method(layer, Method())
+                resolve_npu_format(layer, Method(), resident=False)
 
 
 class TestW8A8Activation(unittest.TestCase):
@@ -399,10 +487,13 @@ class TestW8A8Activation(unittest.TestCase):
         x = torch.tensor(
             [[30.0, -3.0, 40.0, -20.0], [2.0, 3.0, 4.0, 5.0], [float("nan")] * 4]
         )
-        with mock.patch.object(
-            torch.ops.npu, "npu_dynamic_quant", self.quantize, create=True
-        ), mock.patch.object(
-            torch.ops.npu, "npu_clipped_swiglu", self.clipped, create=True
+        with (
+            mock.patch.object(
+                torch.ops.npu, "npu_dynamic_quant", self.quantize, create=True
+            ),
+            mock.patch.object(
+                torch.ops.npu, "npu_clipped_swiglu", self.clipped, create=True
+            ),
         ):
             for counts in (
                 torch.tensor([1, 1]),

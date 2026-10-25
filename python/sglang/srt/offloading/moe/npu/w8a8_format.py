@@ -8,20 +8,16 @@ converted at a time. Offsets must be zero: the current INT8 GMM is symmetric.
 
 from __future__ import annotations
 
-from types import MappingProxyType
-
 import torch
 
+from .format import ExpertLayerStorage as W8A8LayerStorage
+from .format import NpuExpertFormat, TorchNpuFormatAdapter, _Layout
 from .storage import _align
-from .v4_format import (
-    NpuExpertFormat,
-    V4LayerStorage,
-    _Layout,
-    _TorchNpuFormatAdapter,
-)
+
+__all__ = ["NpuV4W8A8Format", "W8A8LayerStorage"]
 
 
-class _TorchNpuW8A8FormatAdapter(_TorchNpuFormatAdapter):
+class _TorchNpuW8A8FormatAdapter(TorchNpuFormatAdapter):
     def prepare(self, weight, scale, offset):
         from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 
@@ -77,7 +73,7 @@ class NpuV4W8A8Format(NpuExpertFormat):
         self.device = device
         self.workspace_limit_bytes = workspace_limit_bytes
         self.adapter = _TorchNpuW8A8FormatAdapter(device, native_acl)
-        self.layouts, self.checkpoint_dtypes, self.host_component_nbytes = {}, {}, {}
+        self.layouts, checkpoint_dtypes, self.host_component_nbytes = {}, {}, {}
         self.workspace_nbytes = 0
         for prefix, n, k in (
             ("w13", 2 * intermediate_size, hidden_size),
@@ -113,7 +109,7 @@ class NpuV4W8A8Format(NpuExpertFormat):
                     value.dtype,
                     size,
                 )
-                self.checkpoint_dtypes[name] = raw.dtype
+                checkpoint_dtypes[name] = raw.dtype
                 self.host_component_nbytes[name] = max(
                     size, _align(raw.numel() * raw.element_size(), 64)
                 )
@@ -125,166 +121,58 @@ class NpuV4W8A8Format(NpuExpertFormat):
             )
             self._check_workspace(baseline, max(minimum_peak, known_peak))
             del inputs, converted, raw, value
-        self.component_nbytes = MappingProxyType(
-            {name: layout.nbytes for name, layout in self.layouts.items()}
+        self._bind_schema(
+            "ascend.v4.w8a8.nz.v1",
+            checkpoint_dtypes=checkpoint_dtypes,
+            shards={
+                name: (("w1", "w3") if name.startswith("w13_") else ("w2",))
+                for name in self.layouts
+            },
+            conversion_groups=tuple(
+                tuple(
+                    f"{prefix}_{suffix}"
+                    for suffix in ("weight", "weight_scale", "weight_offset")
+                )
+                for prefix in ("w13", "w2")
+            ),
+            new_outputs=tuple(
+                name for name in self.layouts if not name.endswith("_offset")
+            ),
+            runtime_names={},
+            dispatch_config={
+                "normal_dispatcher_output_dtype": "bf16",
+                "low_latency_dispatcher_output_dtype": "bf16",
+            },
         )
-        self.expert_nbytes = sum(self.component_nbytes.values())
-
-    def checkpoint_view(self, allocation, name, experts):
-        dtype = self.checkpoint_dtypes[name]
-        typed = allocation.view(dtype)
-        shape = self.layouts[name].raw_shape
-        stride = (shape[2], 1)
-        extent = self.host_component_nbytes[name] // typed.element_size()
-        return torch.as_strided(typed, (experts,) + shape[1:], (extent,) + stride)
 
     def checkpoint_attributes(self, name):
         return {"quant_method": "channel"} if not name.endswith("_weight") else {}
 
-    def quant_info(self, tensors):
-        from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
-
-        return AscendQuantInfo(**tensors)
-
-    def repack_into(self, raw_components, expert, destinations):
-        for prefix in ("w13", "w2"):
-            names = tuple(
-                f"{prefix}_{s}" for s in ("weight", "weight_scale", "weight_offset")
-            )
-            baseline = self.adapter.begin_workspace()
-            inputs = tuple(
-                self.adapter.to_device(raw_components[name][expert : expert + 1])
-                for name in names
-            )
-            converted = self.adapter.prepare(*inputs)
-            self.adapter.synchronize()
-            known_peak = sum(x.numel() * x.element_size() for x in inputs)
-            known_peak += sum(self.layouts[name].nbytes for name in names[:2])
-            self._check_workspace(baseline, known_peak)
-            # Validate the complete projection before replacing checkpoint bytes.
-            for name, value in zip(names, converted):
-                layout = self.layouts[name]
-                if (
-                    tuple(value.shape) != layout.runtime_shape
-                    or tuple(value.stride()) != layout.runtime_stride
-                    or value.dtype != layout.dtype
-                    or self.adapter.physical_nbytes(value) != layout.nbytes
-                ):
-                    raise RuntimeError("W8A8 conversion changed after the format probe")
-            for name, value in zip(names, converted):
-                target = destinations[name][expert]
-                self.adapter.copy_to_host(target.host_address, value, target.nbytes)
-            del inputs, converted, value
-
-
-class W8A8LayerStorage(V4LayerStorage):
-    """Reuse host ownership/registration, with a typed nine-component loader."""
-
-    def _loader(self, name):
-        def load(
-            param,
-            loaded_weight,
-            weight_name=None,
-            shard_id=None,
-            expert_id=None,
-            **kwargs,
-        ):
-            with self._lock:
-                if self._sealed or self._failed or self._closed:
-                    raise RuntimeError("Host expert master is not writable")
-                if (
-                    type(expert_id) is not int
-                    or not 0 <= expert_id < self.spec.global_experts
-                ):
+    def write_checkpoint(self, name, target, loaded_weight, shard_id, metadata):
+        if name.startswith("w13_"):
+            i = self.intermediate_size
+            target = target.narrow(0, 0 if shard_id == "w1" else i, i)
+        if name.endswith("_weight"):
+            if loaded_weight.dtype != torch.int8 or loaded_weight.shape != target.shape:
+                raise ValueError("Expected checkpoint INT8 [out, in] expert weight")
+        else:
+            if loaded_weight.dtype not in (
+                torch.float32,
+                torch.bfloat16,
+                torch.float16,
+            ):
+                raise ValueError("Expected floating per-channel scale/offset")
+            if loaded_weight.shape == target.shape[:-1]:
+                loaded_weight = loaded_weight.unsqueeze(-1)
+            if loaded_weight.shape != target.shape:
+                raise ValueError("Per-channel metadata shape differs from the expert")
+            if not bool(torch.isfinite(loaded_weight).all()):
+                raise ValueError("Expert scale/offset must be finite")
+            if name.endswith("_offset"):
+                if bool(loaded_weight.ne(0).any()):
                     raise ValueError(
-                        "Checkpoint expert ID is outside the global catalog"
+                        "W8A8 offload supports symmetric zero offsets only"
                     )
-                if (
-                    not self.spec.global_start
-                    <= expert_id
-                    < self.spec.global_start + self.spec.local_experts
-                ):
-                    return
-                local = self.spec.local_id(expert_id)
-                allowed = ("w1", "w3") if name.startswith("w13_") else ("w2",)
-                if shard_id not in allowed:
-                    raise ValueError(
-                        "Checkpoint shard does not match the expert component"
-                    )
-                key = name, local, shard_id
-                if key in self._loaded:
-                    raise ValueError("Duplicate expert checkpoint component")
-                if loaded_weight.device.type != "cpu":
-                    raise ValueError(
-                        "Bounded W8A8 loading requires CPU checkpoint tensors"
-                    )
-                target = self.raw_components[name][local]
-                if name.startswith("w13_"):
-                    i = self.format.intermediate_size
-                    target = target.narrow(0, 0 if shard_id == "w1" else i, i)
-                if name.endswith("_weight"):
-                    if (
-                        loaded_weight.dtype != torch.int8
-                        or loaded_weight.shape != target.shape
-                    ):
-                        raise ValueError(
-                            "Expected checkpoint INT8 [out, in] expert weight"
-                        )
-                else:
-                    if loaded_weight.dtype not in (
-                        torch.float32,
-                        torch.bfloat16,
-                        torch.float16,
-                    ):
-                        raise ValueError("Expected floating per-channel scale/offset")
-                    if loaded_weight.shape == target.shape[:-1]:
-                        loaded_weight = loaded_weight.unsqueeze(-1)
-                    if loaded_weight.shape != target.shape:
-                        raise ValueError(
-                            "Per-channel metadata shape differs from the expert"
-                        )
-                    if not bool(torch.isfinite(loaded_weight).all()):
-                        raise ValueError("Expert scale/offset must be finite")
-                    if name.endswith("_offset"):
-                        if bool(loaded_weight.ne(0).any()):
-                            raise ValueError(
-                                "W8A8 offload supports symmetric zero offsets only"
-                            )
-                    elif bool(loaded_weight.lt(0).any()):
-                        raise ValueError("Expert scales must be nonnegative")
-                target.copy_(loaded_weight)
-                self._loaded.add(key)
-
-        return load
-
-    def _finalize(self):
-        if self._sealed:
-            return
-        if self._failed or self._closed:
-            raise RuntimeError(
-                "The host master cannot be finalized after a failed repack"
-            )
-        if len(self._loaded) != 9 * self.spec.local_experts:
-            raise RuntimeError(
-                "Incomplete W8A8 checkpoint: each expert needs nine components"
-            )
-        try:
-            for expert in range(self.spec.local_experts):
-                self.format.repack_into(
-                    self.raw_components, expert, self.component_capabilities
-                )
-        except BaseException:
-            self._failed = True
-            raise
-        self.host_store.seal()
-        self.host_store.require_device_access()
-        self._sealed = True
-        if hasattr(self.layer, "dispatcher"):
-            # Keep EP payload BF16 in both modes; W13 quantizes per-token inside
-            # the graph. Do not feed MXFP8 activations into an INT8 GMM.
-            self.layer.dispatcher.set_quant_config(
-                {
-                    "normal_dispatcher_output_dtype": "bf16",
-                    "low_latency_dispatcher_output_dtype": "bf16",
-                }
-            )
+            elif bool(loaded_weight.lt(0).any()):
+                raise ValueError("Expert scales must be nonnegative")
+        target.copy_(loaded_weight)

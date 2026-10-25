@@ -7,6 +7,7 @@ import weakref
 from types import SimpleNamespace
 
 from sglang.srt.offloading.base import BaseOffloader
+from sglang.srt.offloading.moe.config import Phase
 from sglang.srt.offloading.moe.graph import GraphLeaseBackend
 from sglang.srt.offloading.moe.interfaces import BoundMoERuntime
 from sglang.srt.offloading.moe.offloader import MoEOffloaderV2
@@ -61,7 +62,15 @@ class Owner:
         self.failed = True
         self.calls.append(("poison",))
 
-    def acquire_graph(self, key):
+    def begin_capture(self, identity):
+        self.switch_phase(Phase.DECODE)
+        self.wait_idle()
+
+    def end_capture(self, identity, *, failed=False):
+        if failed:
+            self.failed = True
+
+    def acquire_graph(self, key, *, capture_identity=None):
         self.graphs.add(key)
         self.calls.append(("lease", key[1]))
 

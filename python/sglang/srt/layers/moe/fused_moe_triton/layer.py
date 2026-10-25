@@ -547,12 +547,6 @@ class FusedMoE(torch.nn.Module):
         # method can allocate the full routed-expert set on the accelerator.
         from sglang.srt.utils.offloader import get_offloader
 
-        validate_offload_quant_method = getattr(
-            getattr(get_offloader(), "backend", None), "validate_quant_method", None
-        )
-        if validate_offload_quant_method is not None:
-            validate_offload_quant_method(self, self.quant_method)
-
         weight_args = dict(
             num_experts=self.num_local_experts,
             hidden_size=hidden_size,

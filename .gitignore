@@ -280,3 +280,6 @@ artifacts/
 
 # Internal, non-published docs
 internal-docs/
+
+# Machine-local kernel compiler process bookkeeping.
+/kernel_meta/buildPidInfo.json

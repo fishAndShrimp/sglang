@@ -102,7 +102,7 @@ class TestMoECaptureStreamJoin(unittest.TestCase):
             ),
             snapshot=None,
             reload_weights=None,
-            layer_programs={3: object()},
+            layer_programs={3: SimpleNamespace(prefill=object(), decode=object())},
             resources=(),
             expert_nbytes=1,
             storage=(),
@@ -134,7 +134,7 @@ class TestMoECaptureStreamJoin(unittest.TestCase):
                 context = self.context(graph, phase=phase, capturing=False)
                 completion = context.finish()
                 self.assertEqual(graph.waits, [])
-                self.assertIsNot(completion.output_ready, completion.residency_ready)
+                self.assertIs(completion.output_ready, completion.residency_ready)
                 self.assertIsNotNone(graph.copy.frontier)
 
     def test_failed_capture_join_preserves_context_and_keepalives(self):

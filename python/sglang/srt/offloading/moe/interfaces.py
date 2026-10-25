@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 from ..transfer import Completion, TransferTicket
 from .config import Phase
+from .formats import ExpertFormat
 from .state import ResidencyState
 
 
@@ -54,6 +55,21 @@ class ForwardCompletion:
     residency_ready: TransferTicket
     resources_idle: TransferTicket
     # idle joins copy/compute/communication/prefetch.
+    resources: list = field(default_factory=list, repr=False, compare=False)
+    context_ref: object = field(default=None, repr=False, compare=False)
+
+    def dispose_completed(self):
+        """Drop keepalives after the caller has proved completion; never wait.
+
+        Owner retirement and graph teardown supply the proof. The same mutable
+        resource bag is referenced by resources_idle, so an externally held
+        completion does not retain a second copy after retirement.
+        """
+        context = self.context_ref() if self.context_ref is not None else None
+        if context is not None:
+            context.dispose_completed()
+        else:
+            self.resources.clear()
 
 
 class ExecutionContext(ABC):
@@ -68,15 +84,42 @@ class ExecutionContext(ABC):
     compute_stream: object
     copy_stream: object
 
+    @property
+    def invocation_id(self):
+        # Legacy subclasses need not call a base constructor. The managed
+        # implementation initializes this before starting any host workers.
+        if not hasattr(self, "_invocation_id"):
+            self._invocation_id = object()
+        return self._invocation_id
+
     @abstractmethod
     def retain(self, resource):
         """Pin before submission, within the current resource scope.
 
-        TransferTicket dependencies also join resources_idle. A partial submission
-        without a ticket is drained by the runtime's stream/worker failure path.
+        This only retains resources. Register completion separately when an
+        operation returns a dependency. A partially failed submission without a
+        ticket is drained by the runtime's stream/worker failure path.
         Capture-time tickets are not host proof of a subsequent replay finishing.
         Eager implementations must support calls from the prefill submitter thread.
         """
+
+    def register_completion(self, completion, *, stream=None):
+        """Register a dependency independently of resource retention.
+
+        Legacy contexts can conservatively retain tickets; managed contexts
+        deduplicate dependencies and track recorded per-stream frontiers.
+        """
+        self.retain(completion)
+        return completion
+
+    def wait_for(self, dependency, stream):
+        """Join a dependency; device bindings may omit proven same-stream waits."""
+        completion = (
+            dependency.completion
+            if isinstance(dependency, TransferTicket)
+            else dependency
+        )
+        completion.wait_on(stream)
 
     def temporary_scope(self):
         """Optional stream-ordered lifetime for prefill/decode wave/layer temporaries.
@@ -93,23 +136,6 @@ class ExecutionContext(ABC):
     @abstractmethod
     def record_compute_completion(self) -> TransferTicket:
         """Record the current compute frontier, without host synchronization."""
-
-
-class ExpertFormat(ABC):
-    """Extend the existing paged_experts format concepts for native backend layout.
-
-    A bundle includes every expert weight, scale and format-dependent component.
-    Repacking must be lossless, bounded by explicit workspace, and complete before
-    freezing graph addresses. No implicit FP4 -> FP8/BF16 expansion is permitted.
-    """
-
-    @abstractmethod
-    def describe(self, module):
-        """Return checkpoint/runtime components, layout and physical bundle bytes."""
-
-    @abstractmethod
-    def finalize_host_store(self, module, store, workspace):
-        """Finish bounded post-load repacking; return immutable pinned storage."""
 
 
 class CachePolicy(ABC):
@@ -129,12 +155,22 @@ class CachePolicy(ABC):
         pass
 
     @abstractmethod
-    def update_statistics(self, state, step_counts, update_enabled):
-        """Device op; counts cover valid local token-expert executions only."""
+    def observe(self, state, step_counts, update_enabled, due_out):
+        """Accumulate valid local assignments and write the device update gate.
+
+        due_out is a caller-owned fixed-address bool scalar, distinct from policy
+        state. It remains valid through finish_step and transaction planning.
+        Disabled steps must write False and leave statistics/clocks unchanged.
+        The runtime never interprets a policy's state or configuration fields.
+        """
 
     @abstractmethod
     def select_hot_set(self, state, key_to_slot, target_keys):
-        """Write at most K keys, -1 padded; do not assign slots or move weights."""
+        """Write distinct logical keys, -1 padded; positions are not physical slots.
+
+        Selection may run on every captured step. The explicit observe gate
+        controls publication, independently of any internal selection mask.
+        """
 
     @abstractmethod
     def copy_state(self, source, destination):
@@ -165,11 +201,13 @@ class ResidencyOps(ABC):
         """Retire temporary/source leases after the final reader; never on return."""
 
     @abstractmethod
-    def prepare_update(self, target_keys, context):
+    def prepare_update(self, target_keys, context, *, update_enabled=None):
         """Return UpdatePlan, retaining survivors and reserving protected victims.
 
         Include plan-ready and all old reader dependencies. Honor the runtime's
         device update_enabled guard during capture/warmup without reading it on CPU.
+        An explicit policy gate is combined with that guard and latched into the
+        transaction. None uses the lifecycle guard alone for initialization.
         """
 
     @abstractmethod
@@ -401,7 +439,11 @@ class BoundMoERuntime(ABC):
 
     @abstractmethod
     def close(self):
-        """Release resources after synchronization and destruction of all graphs."""
+        """Stop/drain and release resources after destruction of all graphs.
+
+        A public close owns its drain. An internal close_after_drain may reuse
+        the owner's already completed fence, without synchronizing twice.
+        """
 
 
 class MoEBackend(ABC):

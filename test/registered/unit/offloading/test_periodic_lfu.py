@@ -76,6 +76,28 @@ class TestPeriodicLFU(unittest.TestCase):
         )
         return target.tolist()
 
+    def test_public_due_survives_finish_and_disabled_steps_clear_it(self):
+        policy = self.make_policy(update_interval=2)
+        state = policy.allocate_state(8, "cpu")
+        due = torch.tensor(False)
+        address = due.data_ptr()
+        self.assertNotEqual(address, state.update_due.data_ptr())
+        counts = torch.ones(8, dtype=torch.int64)
+        for enabled, expected_due, expected_step in (
+            (True, False, 1),
+            (False, False, 1),
+            (True, True, 0),
+            (False, False, 0),
+        ):
+            policy.observe(state, counts, torch.tensor(enabled), due)
+            self.assertEqual(bool(due), expected_due)
+            policy.finish_step(state)
+            self.assertFalse(bool(state.update_due))
+            self.assertEqual(bool(due), expected_due)
+            self.assertEqual(int(state.step_mod), expected_step)
+            self.assertEqual(due.data_ptr(), address)
+        torch.testing.assert_close(state.usage, torch.full((8,), 1.4))
+
     def test_document_example_and_tie_at_global_limit(self):
         usage = [2, 8, 5, 3, 1, 7, 2, 4]
         resident = [0, 2, 4, 7]
@@ -117,7 +139,9 @@ class TestPeriodicLFU(unittest.TestCase):
         counts = torch.tensor([0, 3, 0, 0, 0, 2, 0, 0])
         pointers = [tensor.data_ptr() for tensor in vars(state).values()]
         for step in range(1, 5):
-            policy.update_statistics(state, counts, torch.tensor(True))
+            policy.observe(
+                state, counts, torch.tensor(True), torch.empty((), dtype=torch.bool)
+            )
             self.assertEqual(state.step_mod.item(), step % 4)
             self.assertEqual(state.update_due.item(), step == 4)
             policy.select_hot_set(state, slots, target)
@@ -128,7 +152,9 @@ class TestPeriodicLFU(unittest.TestCase):
         torch.testing.assert_close(state.usage, counts.float() * 4 * 0.7)
         policy.finish_step(state)  # Does not decay twice.
         torch.testing.assert_close(state.usage, counts.float() * 4 * 0.7)
-        policy.update_statistics(state, counts, torch.tensor(True))
+        policy.observe(
+            state, counts, torch.tensor(True), torch.empty((), dtype=torch.bool)
+        )
         torch.testing.assert_close(state.usage, counts.float() * (4 * 0.7 + 1))
         self.assertEqual(state.step_mod.item(), 1)
         self.assertEqual(
@@ -139,8 +165,11 @@ class TestPeriodicLFU(unittest.TestCase):
         policy = self.make_policy()
         state = policy.allocate_state(8, "cpu")
         for _ in range(6):
-            policy.update_statistics(
-                state, torch.ones(8, dtype=torch.int64), torch.tensor(False)
+            policy.observe(
+                state,
+                torch.ones(8, dtype=torch.int64),
+                torch.tensor(False),
+                torch.empty((), dtype=torch.bool),
             )
             self.assertFalse(state.update_due.item())
             policy.finish_step(state)
@@ -148,16 +177,22 @@ class TestPeriodicLFU(unittest.TestCase):
         self.assertEqual(state.usage.sum().item(), 0)
         state.usage.fill_(10)
         for _ in range(4):
-            policy.update_statistics(
-                state, torch.zeros(8, dtype=torch.int64), torch.tensor(True)
+            policy.observe(
+                state,
+                torch.zeros(8, dtype=torch.int64),
+                torch.tensor(True),
+                torch.empty((), dtype=torch.bool),
             )
         self.assertTrue(state.update_due.item())
         policy.finish_step(state)
         torch.testing.assert_close(state.usage, torch.full((8,), 7.0))
         # A disabled call must also clear a stale due flag.
         state.update_due.fill_(True)
-        policy.update_statistics(
-            state, torch.ones(8, dtype=torch.int64), torch.tensor(False)
+        policy.observe(
+            state,
+            torch.ones(8, dtype=torch.int64),
+            torch.tensor(False),
+            torch.empty((), dtype=torch.bool),
         )
         self.assertFalse(state.update_due.item())
 
@@ -196,8 +231,11 @@ class TestPeriodicLFU(unittest.TestCase):
             state = policy.allocate_state(count, "cpu")
             state.usage.fill_(10)
             target = torch.empty(len(resident), dtype=torch.int64)
-            policy.update_statistics(
-                state, torch.zeros(count, dtype=torch.int64), torch.tensor(True)
+            policy.observe(
+                state,
+                torch.zeros(count, dtype=torch.int64),
+                torch.tensor(True),
+                torch.empty((), dtype=torch.bool),
             )
             policy.select_hot_set(state, mapping(resident, count), target)
             policy.finish_step(state)
@@ -239,7 +277,9 @@ class TestPeriodicLFU(unittest.TestCase):
                     )
                 )
             for _ in range(4):
-                policy.update_statistics(state, counts, enabled)
+                policy.observe(
+                    state, counts, enabled, torch.empty((), dtype=torch.bool)
+                )
                 policy.select_hot_set(state, slots, target)
                 policy.finish_step(state)
 
@@ -304,12 +344,12 @@ class TestTensorReplay(unittest.TestCase):
         policy = PeriodicLFUPolicy(PeriodicLFUConfig("unused.json"), catalog())
 
         class Step(torch.nn.Module):
-            def forward(self, usage, step, due, counts, enabled, slots, target):
+            def forward(self, usage, step, due, counts, enabled, slots, target, gate):
                 state = PeriodicLFUState(usage, step, due)
-                policy.update_statistics(state, counts, enabled)
+                policy.observe(state, counts, enabled, gate)
                 policy.select_hot_set(state, slots, target)
                 policy.finish_step(state)
-                return usage, step, due, target
+                return usage, step, due, target, gate
 
         state = policy.allocate_state(8, "cpu")
         counts = torch.tensor([0, 3, 0, 0, 0, 2, 0, 0])
@@ -321,6 +361,7 @@ class TestTensorReplay(unittest.TestCase):
             torch.tensor(False),
             mapping([0, 2, 4, 7]),
             torch.empty(4, dtype=torch.int64),
+            torch.tensor(False),
         )
         traced = torch.jit.trace(Step(), args, check_trace=False)
         enabled = torch.tensor(True)
@@ -329,6 +370,8 @@ class TestTensorReplay(unittest.TestCase):
             self.assertEqual(
                 result[3].tolist(), [1, 2, 5, 7] if i == 3 else [0, 2, 4, 7]
             )
+            self.assertEqual(bool(result[4]), i == 3)
+            self.assertFalse(bool(result[2]))
         torch.testing.assert_close(state.usage, counts.float() * 4 * 0.7)
         # Subsequent replay sees changed resident keys and changed route counts.
         args[5].copy_(mapping([1, 2, 5, 7]))

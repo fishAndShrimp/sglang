@@ -12,7 +12,13 @@ from threading import Condition, RLock, Thread
 
 from ..transfer import Completion, ImmediateCompletion, JoinedCompletion, TransferTicket
 from .config import ExpertWave, Phase
-from .execution import ExecutionRequest, SourcePolicy, require_prefill
+from .execution import (
+    ExecutionRequest,
+    SourcePolicy,
+    invocation_id,
+    require_prefill,
+    retain_completion,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +139,7 @@ class PrefillPipelineConfig:
 @dataclass
 class _PrefillSession:
     layer_id: int
-    context: object
+    invocation_id: object
     condition: Condition = field(default_factory=Condition)
     previous_idle: object = None
     worker: object = None
@@ -204,13 +210,17 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
         self._previous_idle = None
 
     def _key(self, layer, context):
-        return id(context), self.layer_id(layer)
+        return invocation_id(context), self.layer_id(layer)
 
     def _session(self, layer, context):
         require_prefill(context)
         with self._lock:
             session = self._sessions.get(self._key(layer, context))
-        if session is None or session.context is not context or session.closed:
+        if (
+            session is None
+            or session.invocation_id is not invocation_id(context)
+            or session.closed
+        ):
             raise RuntimeError(
                 "No active prefill layer-start session for this invocation"
             )
@@ -227,10 +237,10 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
         require_prefill(context)
         if type(layer_id) is not int or layer_id < 0:
             raise ValueError("A prefill layer needs a nonnegative integer identifier")
-        session = _PrefillSession(layer_id, context)
-        key = (id(context), layer_id)
+        session = _PrefillSession(layer_id, invocation_id(context))
+        key = (invocation_id(context), layer_id)
         with self._lock:
-            if id(context) in self._aborted:
+            if invocation_id(context) in self._aborted:
                 raise RuntimeError("Cannot restart an aborted prefill invocation")
             if key in self._sessions:
                 raise RuntimeError("Prefill layer-start was already submitted")
@@ -245,14 +255,20 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
         context.retain(session)
         session.worker = Thread(
             target=self._load_initial,
-            args=(session,),
+            args=(session, context),
             name=f"moe-prefill-{layer_id}",
             daemon=False,
         )
+        started = getattr(context, "worker_started", None)
+        if started is not None:
+            started()
         try:
             session.worker.start()
             session.worker_started = True
         except BaseException as error:
+            finished = getattr(context, "worker_finished", None)
+            if finished is not None:
+                finished()
             with session.condition:
                 session.error = error
                 session.worker_done = True
@@ -266,10 +282,8 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
             if session.waves:
                 raise RuntimeError("Prefill session was already sealed")
 
-    def _request(self, session, wave, bank_offset):
-        request = self.make_request(
-            session.layer_id, wave, bank_offset, session.context
-        )
+    def _request(self, session, wave, bank_offset, context):
+        request = self.make_request(session.layer_id, wave, bank_offset, context)
         if (
             not isinstance(request, ExecutionRequest)
             or request.layer_id != session.layer_id
@@ -280,8 +294,8 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
             raise ValueError("Prefill binding must request exactly this HOST_ONLY wave")
         return request
 
-    def _load_initial(self, session):
-        config, context = self.config, session.context
+    def _load_initial(self, session, context):
+        config = self.config
         inflight = []
         try:
             with self.worker_scope(context):
@@ -315,7 +329,7 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
                         len(session.initial_leases), start, end, config.initial_bank
                     )
                     lease = self.access.stage(
-                        self._request(session, wave, start), context
+                        self._request(session, wave, start, context), context
                     )
                     # A complete expert bundle was submitted; readiness is separate.
                     with session.condition:
@@ -328,6 +342,9 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
                 session.error = error
                 session.stop = True
         finally:
+            finished = getattr(context, "worker_finished", None)
+            if finished is not None:
+                finished()
             with session.condition:
                 session.worker_done = True
                 session.condition.notify_all()
@@ -406,7 +423,9 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
                 if previous.read_done is None:
                     raise RuntimeError("Cannot overwrite a bank without its old reader")
                 previous.read_done.completion.wait_on(context.copy_stream)
-            lease = self.access.stage(self._request(session, next_wave, 0), context)
+            lease = self.access.stage(
+                self._request(session, next_wave, 0, context), context
+            )
             session.leases[next_index] = lease
         session.next_wave += 1
         return current
@@ -424,7 +443,7 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
         ticket = self.record_copy_completion(context)
         if not isinstance(ticket, TransferTicket):
             raise TypeError("Copy-stream completion must be a TransferTicket")
-        context.retain(ticket)
+        retain_completion(context, ticket)
         return ticket
 
     def finish(self, layer, context):
@@ -440,7 +459,7 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
             JoinedCompletion(item.completion for item in tickets),
             (session, *tickets),
         )
-        context.retain(ticket)
+        retain_completion(context, ticket)
         session.closed = True
         with self._lock:
             # Keep the dependency but avoid chaining prior sessions/contexts.
@@ -452,11 +471,13 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
     def abort(self, context):
         require_prefill(context)
         with self._lock:
-            previous = self._aborted.get(id(context))
+            previous = self._aborted.get(invocation_id(context))
             if previous is not None:
-                return previous[1]
+                return previous
             sessions = [
-                item for item in self._sessions.values() if item.context is context
+                item
+                for item in self._sessions.values()
+                if item.invocation_id is invocation_id(context)
             ]
         for session in sessions:
             with session.condition:
@@ -478,10 +499,10 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
             ),
             (*sessions, *tickets),
         )
-        context.retain(ticket)
+        retain_completion(context, ticket)
         with self._lock:
             for session in sessions:
                 session.closed = True
-                self._sessions.pop((id(context), session.layer_id), None)
-            self._aborted[id(context)] = (context, ticket)
+                self._sessions.pop((invocation_id(context), session.layer_id), None)
+            self._aborted[invocation_id(context)] = ticket
         return ticket

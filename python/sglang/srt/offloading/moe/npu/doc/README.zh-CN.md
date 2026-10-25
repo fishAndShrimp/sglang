@@ -1,12 +1,18 @@
 # Ascend V4 offload 运行时装配
 
+2026-10-25：当前装配使用唯一运行栈；[重构记录](../../doc/REFACTOR_20261025.zh-CN.md)
+列出迁移与验证边界。公共生命周期已提取到 `moe/runtime.py`，模型与量化各自扩展。
+
 上级 `npu/` 目录集中放置 NPU 实现；公共框架见 [公共说明](../../doc/README.zh-CN.md)。
 
 | 文件 / 目录 | 职责 |
 | --- | --- |
-| `../config.py` / `../backend.py` / `../runtime.py` | 启动配置、资源装配与运行时生命周期 |
+| `../config.py` / `../backend.py` / `../runtime.py` | 启动配置、资源装配、NPU hooks/stream/capture 绑定 |
+| `../../runtime.py` / `../../owner.py` / `../../graph.py` | 公共 invocation、phase/forward 所有权、graph lease 与显式退休 |
+| `../../models.py` / `../../formats.py` | 模型入口适配、完整 bundle schema 与格式接口 |
 | `../transfer.py` / `../experts.py` | ACL/MemFabric 搬运、DeepEP 与原生 FFN |
-| `../storage.py` / `../v4_format.py` / `../w8a8_format.py` | 共享 host master、FP4/W8A8 有界加载与 bank |
+| `../storage.py` / `../format.py` / `../format_resolver.py` | host master、共用 ExpertLayerStorage/ExpertBank、格式解析 |
+| `../v4_format.py` / `../w8a8_format.py` | FP4/W8A8 格式行为；旧 LayerStorage 名称是共同 storage 的别名 |
 | `../native_acl.py` / `../native/` | ACL 扩展构建与 C++ 源码 |
 | `../examples/v4.json` | 每 rank 的 offload 容量配置 |
 
@@ -19,6 +25,11 @@
 host 参数分配；post-load 后装配共享 host master、hot/execution bank、固定 Tensor
 residency、离线 Top-K / 周期层内 LFU、ACL eager prefill、MemFabric decode 和现有 Ascend EP/FFN。
 本项依赖 native ACL、真实存储和 EP/FFN 三项适配一起使用。
+
+当前只装配一个兼容 schema arena，分配前拒绝混合格式/不兼容拓扑。地址目录共享
+不可变 host/hot/destination 表，wave/tail 可变 scratch 独立；一套 prefill pipeline
+拥有所有层的 A/B 读者历史。公共策略只输出 logical target_keys 与显式设备 due，
+full graph 保留 masked tail，非 due 不等于选择/规划 kernel 真早退。
 
 2026-10-22 缓存接入说明见 [周期缓存配置与验证](PERIODIC_CACHE_1022.zh-CN.md)。
 非零热池必须配置 `offline_stats_path` 与 `offline_model_id`；示例 JSON 中的 profile

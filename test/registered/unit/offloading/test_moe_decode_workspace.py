@@ -105,7 +105,7 @@ class TestDecodeWorkspace(unittest.TestCase):
                 )
                 return bindings
 
-            def wait_ready(self, lease, stream):
+            def wait_ready(self, lease, stream, *, context=None):
                 waits.append("ready")
                 return lease
 
@@ -311,7 +311,9 @@ class TestDecodeWorkspace(unittest.TestCase):
                     temporary_ref = weakref.ref(temporary)
                     protected_ref = weakref.ref(protected)
                     context.retain(temporary)
-                    context.retain(TransferTicket(completion, (protected,)))
+                    ticket = TransferTicket(completion, (protected,))
+                    context.retain(ticket)
+                    context.register_completion(ticket)
                     del temporary, protected
                 self.assertIsNone(temporary_ref())
                 self.assertIsNotNone(protected_ref())
@@ -439,7 +441,10 @@ class TestDecodeWorkspace(unittest.TestCase):
             self.assertIsNotNone(fixture.raw_refs[-1]())
             self.assertIsNotNone(fixture.output_refs[-1]())
             self.assertFalse(fixture.context._temporary_resources)
-            fixture.context.abort()
+            with self.assertRaisesRegex(RuntimeError, "Destroy the captured graph"):
+                fixture.context.abort()
+            self.assertIsNotNone(fixture.raw_refs[-1]())
+            fixture.context.dispose_after_drain(graph_destroyed=True)
             self.assertIn("drain", fixture.waits)
             self.assertIsNone(fixture.raw_refs[-1]())
             self.assertIsNone(fixture.output_refs[-1]())
@@ -513,6 +518,7 @@ class TestDecodeWorkspace(unittest.TestCase):
                         self.assertEqual(calls, ["dispatch", (0, received), (1, 0)])
                         self.assertIsNone(dispatcher.handle)
                         self.assertIsNone(program.pipeline.active_layer)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -36,7 +36,7 @@ class BoundExecutionWave:
 @dataclass
 class _Reservation:
     owner: object
-    context: object
+    invocation_id: object
     buffers: object
     prefill: bool = False
     published: bool = False
@@ -74,6 +74,7 @@ class TensorResidencyOps(ResidencyOps):
         self._owned = {}
         self._token = object()
         self._readers = {}
+        self._active_execution = {}
         self._pending_update = None
         self.device = state.key_to_slot.device
         self.num_experts = catalog.num_experts
@@ -211,7 +212,6 @@ class TensorResidencyOps(ResidencyOps):
         h = self.hot_slots
         buf = {"plan": self._plan("tail.plan", h)}
         for name in (
-            "target",
             "safe_target",
             "marks",
             "slots",
@@ -281,6 +281,8 @@ class TensorResidencyOps(ResidencyOps):
             return
         if context.phase is not Phase.DECODE:
             raise ValueError("Unsupported phase")
+        if self._active_execution or self._pending_update is not None:
+            raise RuntimeError("Retire the previous step's reservations first")
         context.retain(self)
         self.state.step_access_count.zero_()
         if self.cache_stats is not None:
@@ -306,7 +308,9 @@ class TensorResidencyOps(ResidencyOps):
                     "Prefill planner must return a host ExecutionReservation"
                 )
             context.retain(reservation)
-            token = _Reservation(self._token, context, reservation, prefill=True)
+            token = _Reservation(
+                self._token, context.invocation_id, reservation, prefill=True
+            )
             return ExecutionReservation(
                 reservation.copy_plan,
                 reservation.bindings,
@@ -333,6 +337,8 @@ class TensorResidencyOps(ResidencyOps):
                 "Post-dispatch demand must contain one count per local expert"
             )
         bound, plan = buf["bound"], buf["plan"]
+        if bound.wave.bank in self._active_execution:
+            raise RuntimeError("Retire the previous execution bank reservation first")
         reader = self._readers.get(bound.wave.bank)
         if reader is not None:
             reader.completion.wait_on(context.compute_stream)
@@ -398,12 +404,15 @@ class TensorResidencyOps(ResidencyOps):
         ].zero_()
         ready = context.record_compute_completion()
         context.retain(ready)
+        token = _Reservation(self._token, context.invocation_id, buf)
+        self._active_execution[bound.wave.bank] = token
         return ExecutionReservation(
             plan,
             bound.bindings,
             (ready.completion,),
             (self, buf, ready),
-            _Reservation(self._token, context, buf),
+            token,
+            plan_covers_compute_frontier=True,
         )
 
     def _check(self, reservation, context):
@@ -411,7 +420,7 @@ class TensorResidencyOps(ResidencyOps):
         if (
             not isinstance(token, _Reservation)
             or token.owner is not self._token
-            or token.context is not context
+            or token.invocation_id is not context.invocation_id
         ):
             raise ValueError("Foreign residency reservation or invocation")
         return token
@@ -462,6 +471,7 @@ class TensorResidencyOps(ResidencyOps):
         context.retain((reservation, read_done))
         if not token.prefill:
             self._readers[token.buffers["bound"].wave.bank] = read_done
+            del self._active_execution[token.buffers["bound"].wave.bank]
         token.retired = True
 
     def _inverse(self, keys, valid, buf):
@@ -473,7 +483,7 @@ class TensorResidencyOps(ResidencyOps):
         buf["inverse"].scatter_add_(0, buf["inverse_keys"], buf["inverse_values"])
         buf["inverse"].sub_(1)
 
-    def prepare_update(self, target_keys, context):
+    def prepare_update(self, target_keys, context, *, update_enabled=None):
         if context.phase is not Phase.DECODE:
             raise RuntimeError("Hot updates are decode-only")
         self._validate_tensor(
@@ -481,11 +491,20 @@ class TensorResidencyOps(ResidencyOps):
         )
         if self._pending_update is not None:
             raise RuntimeError("Finish the previous update before reserving another")
+        if self._active_execution:
+            raise RuntimeError("Retire execution readers before updating hot weights")
+        # A reader may finish on an auxiliary stream. Join it before touching
+        # residency and record the resulting frontier once in this transaction.
+        for reader in self._readers.values():
+            reader.completion.wait_on(context.compute_stream)
         context.retain((self, target_keys))
         b, s, h = self._tail, self.state, self.hot_slots
         p = b["plan"]
-        b["enabled"].copy_(s.update_enabled)
-        b["target"].copy_(target_keys)
+        if update_enabled is None:
+            b["enabled"].copy_(s.update_enabled)
+        else:
+            self._validate_tensor(update_enabled, (), torch.bool, "update_enabled")
+            torch.logical_and(s.update_enabled, update_enabled, out=b["enabled"])
         if h:
             # A stale invalid slot may keep its old key, but every valid slot
             # must have exactly one consistent inverse mapping.
@@ -606,10 +625,15 @@ class TensorResidencyOps(ResidencyOps):
             p.count.zero_()
         ready = context.record_compute_completion()
         context.retain(ready)
-        token = _Reservation(self._token, context, b)
+        token = _Reservation(self._token, context.invocation_id, b)
         self._pending_update = token
         return UpdatePlan(
-            p, self.update_bindings, (ready.completion,), (self, ready), token
+            p,
+            self.update_bindings,
+            (ready.completion,),
+            (self, ready),
+            token,
+            plan_covers_compute_frontier=True,
         )
 
     def commit_update(self, update_plan, weights_ready, context):

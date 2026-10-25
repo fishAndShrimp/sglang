@@ -148,6 +148,10 @@ class FakeRuntime(BoundMoERuntime):
         self.actions.append("synchronize")
 
     def close(self):
+        self.synchronize()
+        self.close_after_drain()
+
+    def close_after_drain(self):
         self.actions.append("close")
 
 
@@ -274,7 +278,7 @@ class TestLifetime(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.owner.begin_forward(Phase.DECODE, "compute")
         with self.assertRaises(RuntimeError):
-            self.owner.prefill.enter()
+            self.owner.switch_phase(Phase.PREFILL)
         with self.assertRaises(RuntimeError):
             self.owner.close()
         self.owner.finish_forward(token, completed_step())
@@ -290,7 +294,8 @@ class TestLifetime(unittest.TestCase):
         self.assertEqual(delayed.syncs, 0)
         self.owner.finish_forward(token, completed_step())
         self.owner.close()
-        self.assertEqual(delayed.syncs, 1)
+        self.assertEqual(delayed.syncs, 0)
+        self.assertIn("synchronize", self.runtime.actions)
 
     def test_transfer_retains_source_until_idle(self):
         class Source:
@@ -317,23 +322,23 @@ class TestLifetime(unittest.TestCase):
             copy.deepcopy(self.runtime.metadata),
             list(self.runtime.weights),
         )
-        self.owner.prefill.enter()
+        self.owner.switch_phase(Phase.PREFILL)
         self.runtime.metadata["slots"][:] = [-1] * 4
         self.runtime.metadata["lfu"][:] = [0] * 3
         self.runtime.weights[:] = ["temporary"] * 4
-        self.owner.prefill.enter()
+        self.owner.switch_phase(Phase.PREFILL)
         self.assertEqual(self.runtime.actions, ["snapshot", "borrow"])
-        self.owner.decode.enter()
+        self.owner.switch_phase(Phase.DECODE)
         self.assertEqual(self.runtime.metadata, metadata)
         self.assertEqual(self.runtime.weights, weights)
-        self.owner.decode.enter()
+        self.owner.switch_phase(Phase.DECODE)
         self.assertEqual(self.runtime.actions.count("restore"), 1)
 
     def test_transition_drains_inflight_forward(self):
         delayed = DelayedCompletion()
         token = self.owner.begin_forward(Phase.DECODE, None)
         self.owner.finish_forward(token, completed_step(TransferTicket(delayed)))
-        self.owner.prefill.enter()
+        self.owner.switch_phase(Phase.PREFILL)
         self.assertEqual(delayed.syncs, 1)
 
     def test_graph_lease_prevents_teardown(self):
@@ -349,10 +354,10 @@ class TestLifetime(unittest.TestCase):
         self.assertEqual(self.runtime.actions.count("close"), 1)
 
     def test_failed_restore_poisoned_until_drained_close(self):
-        self.owner.prefill.enter()
+        self.owner.switch_phase(Phase.PREFILL)
         self.runtime.fail_restore = True
         with self.assertRaises(RuntimeError):
-            self.owner.decode.enter()
+            self.owner.switch_phase(Phase.DECODE)
         self.assertIs(self.owner.state, OwnerState.FAILED)
         with self.assertRaises(RuntimeError):
             self.owner.begin_forward(Phase.PREFILL, None)
@@ -405,8 +410,11 @@ class TestLFU(unittest.TestCase):
     def test_global_popularity_counts_misses_and_preserves_resident_ties(self):
         policy = TensorLFUPolicy()
         state = policy.allocate_state(6, "cpu")
-        policy.update_statistics(
-            state, torch.tensor([1, 8, 8, 0, 9, 0]), torch.tensor(True)
+        policy.observe(
+            state,
+            torch.tensor([1, 8, 8, 0, 9, 0]),
+            torch.tensor(True),
+            torch.empty((), dtype=torch.bool),
         )
         target = torch.empty(3, dtype=torch.int64)
         policy.select_hot_set(state, torch.tensor([-1, -1, 0, -1, -1, -1]), target)
@@ -416,12 +424,27 @@ class TestLFU(unittest.TestCase):
         policy = TensorLFUPolicy(aging_interval=2)
         state = policy.allocate_state(3, "cpu")
         saved = policy.allocate_state(3, "cpu")
-        policy.update_statistics(state, torch.tensor([2, 4, 6]), torch.tensor(True))
+        policy.observe(
+            state,
+            torch.tensor([2, 4, 6]),
+            torch.tensor(True),
+            torch.empty((), dtype=torch.bool),
+        )
         policy.copy_state(state, saved)
-        policy.update_statistics(state, torch.tensor([10, 10, 10]), torch.tensor(False))
+        policy.observe(
+            state,
+            torch.tensor([10, 10, 10]),
+            torch.tensor(False),
+            torch.empty((), dtype=torch.bool),
+        )
         self.assertTrue(torch.equal(state.frequency, saved.frequency))
         self.assertTrue(torch.equal(state.steps, saved.steps))
-        policy.update_statistics(state, torch.tensor([0, 2, 0]), torch.tensor(True))
+        policy.observe(
+            state,
+            torch.tensor([0, 2, 0]),
+            torch.tensor(True),
+            torch.empty((), dtype=torch.bool),
+        )
         self.assertEqual(state.frequency.tolist(), [1, 3, 3])
         policy.copy_state(saved, state)
         self.assertEqual(state.frequency.tolist(), [2, 4, 6])
@@ -449,7 +472,9 @@ class TestLFU(unittest.TestCase):
             mapping = torch.full((13,), -1)
             for slot, key in enumerate(resident):
                 mapping[key] = slot
-            policy.update_statistics(state, accesses, torch.tensor(True))
+            policy.observe(
+                state, accesses, torch.tensor(True), torch.empty((), dtype=torch.bool)
+            )
             policy.select_hot_set(state, mapping, target)
             expected = sorted(
                 range(13), key=lambda key: (-counts[key], key not in resident, key)
@@ -462,8 +487,11 @@ class TestLFU(unittest.TestCase):
         policy = TensorLFUPolicy()
         state = policy.allocate_state(1, "cpu")
         state.frequency.fill_(torch.iinfo(torch.int64).max // 4)
-        policy.update_statistics(
-            state, torch.tensor([torch.iinfo(torch.int64).max]), torch.tensor(True)
+        policy.observe(
+            state,
+            torch.tensor([torch.iinfo(torch.int64).max]),
+            torch.tensor(True),
+            torch.empty((), dtype=torch.bool),
         )
         self.assertEqual(state.frequency.item(), torch.iinfo(torch.int64).max // 4)
 
@@ -481,8 +509,11 @@ class TestIntegration(unittest.TestCase):
             slots = torch.tensor([0, -1, 1, -1, 2, -1, -1, 3])
             # A bound runtime must use this sequence at each valid step tail.
             for _ in range(4):
-                policy.update_statistics(
-                    state, torch.tensor([0, 3, 0, 0, 0, 2, 0, 0]), torch.tensor(True)
+                policy.observe(
+                    state,
+                    torch.tensor([0, 3, 0, 0, 0, 2, 0, 0]),
+                    torch.tensor(True),
+                    torch.empty((), dtype=torch.bool),
                 )
                 policy.select_hot_set(state, slots, target)
                 policy.finish_step(state)

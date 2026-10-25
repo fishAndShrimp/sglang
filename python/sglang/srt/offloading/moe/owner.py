@@ -1,4 +1,4 @@
-"""One owner, two phase controllers, explicit graph/transfer lifetimes."""
+"""Shared phase, budget and submission ownership for all device runtimes."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from functools import wraps
 from threading import RLock
 
 from .config import Phase
-from .resources import AllocationLedger, ResourceKind, SlotLeaseManager
+from .resources import AllocationLedger, ResourceKind
 
 logger = logging.getLogger(__name__)
 
@@ -36,26 +36,6 @@ class ForwardToken:
     phase: Phase
 
 
-class PhaseController:
-    def __init__(self, owner, phase, program):
-        self.owner = owner
-        self.phase = phase
-        self.program = program
-
-    def enter(self):
-        self.owner.switch_phase(self.phase)
-
-
-class PrefillController(PhaseController):
-    def __init__(self, owner):
-        super().__init__(owner, Phase.PREFILL, owner.runtime.prefill_program)
-
-
-class DecodeController(PhaseController):
-    def __init__(self, owner):
-        super().__init__(owner, Phase.DECODE, owner.runtime.decode_program)
-
-
 class GraphLease:
     """Held by a graph bucket until its graph has been destroyed."""
 
@@ -63,10 +43,10 @@ class GraphLease:
         self.owner = owner
         self.key = key
 
-    def close(self):
+    def close(self, *, drained=False):
         if self.owner is None:
             return
-        self.owner._release_graph(self.key)
+        self.owner._release_graph(self.key, drained=drained)
         self.owner = None
 
 
@@ -115,27 +95,52 @@ class MoEOffloadOwner:
                 != self.allocation_ledger.limits[kind]
             ):
                 raise ValueError(f"{kind.value} allocation does not match slot budget")
-        self.hot_slot_leases = SlotLeaseManager(hot_slots)
-        self.execution_slot_leases = SlotLeaseManager(config.execution_slots)
         self.state = OwnerState.READY
         self.phase = Phase.DECODE
-        self.prefill = PrefillController(self)
-        self.decode = DecodeController(self)
         self._token = object()
         self._sequence = 0
         self._active = None
+        self._capture_session = None
         self._pending = []
         self._transition_ticket = None
         self._snapshot_saved = False
         self._graphs = set()
+        self._closing = False
+        self._graph_cleanups = set()
 
     def _require_ready(self):
-        if self.state is not OwnerState.READY:
+        if self.state is not OwnerState.READY or self._closing or self._graph_cleanups:
             raise RuntimeError(f"Offload owner is {self.state.value}")
 
-    def _require_no_forward(self):
-        if self._active is not None:
-            raise RuntimeError("Concurrent forwards or transitions are not allowed")
+    def _require_no_forward(self, *, capture_identity=None):
+        if self._active is not None or (
+            self._capture_session is not None
+            and self._capture_session is not capture_identity
+        ):
+            raise RuntimeError(
+                "Concurrent forwards, captures or transitions are not allowed"
+            )
+
+    @_serialized
+    def begin_capture(self, identity):
+        """Atomically prepare decode and gate submissions for the capture scope."""
+        if identity is None:
+            raise ValueError("Capture sessions require an identity")
+        self._require_ready()
+        self._require_no_forward()
+        self.switch_phase(Phase.DECODE)
+        self.wait_idle()
+        self._capture_session = identity
+
+    @_serialized
+    def end_capture(self, identity, *, failed=False):
+        if identity is not self._capture_session or identity is None:
+            raise ValueError("Foreign or already finished capture session")
+        # Poison before reopening the gate, so another thread cannot submit in
+        # the interval between a failed scope unwinding and graph cleanup.
+        if failed and self.state is not OwnerState.CLOSED:
+            self.state = OwnerState.FAILED
+        self._capture_session = None
 
     @_serialized
     def wait_idle(self):
@@ -143,6 +148,7 @@ class MoEOffloadOwner:
         try:
             for completion in self._pending:
                 completion.resources_idle.completion.synchronize()
+                completion.dispose_completed()
             self._pending.clear()
         except BaseException:
             self.state = OwnerState.FAILED
@@ -176,6 +182,9 @@ class MoEOffloadOwner:
                 self._transition_ticket = self.runtime.restore_decode_state()
                 self._transition_ticket.completion.synchronize()
                 self._snapshot_saved = False
+            retire = getattr(self.runtime, "retire_transitions", None)
+            if retire is not None:
+                retire()
             self.phase = phase
             self._transition_ticket = None
             logger.info(
@@ -197,11 +206,13 @@ class MoEOffloadOwner:
         # Host submissions may be asynchronous, but device forwards are serialized
         # by this join. Do not poll LFU/miss state or host-synchronize each step.
         try:
-            self._pending = [
-                item
-                for item in self._pending
-                if not item.resources_idle.completion.done()
-            ]
+            pending = []
+            for item in self._pending:
+                if item.resources_idle.completion.done():
+                    item.dispose_completed()
+                else:
+                    pending.append(item)
+            self._pending = pending
             if self._pending:
                 self._pending[-1].resources_idle.completion.wait_on(compute_stream)
         except BaseException:
@@ -242,24 +253,50 @@ class MoEOffloadOwner:
             self.state = OwnerState.FAILED
 
     @_serialized
-    def acquire_graph(self, key):
+    def acquire_graph(self, key, *, capture_identity=None):
         self._require_ready()
-        self._require_no_forward()
+        self._require_no_forward(capture_identity=capture_identity)
         if key in self._graphs:
             raise ValueError("Graph bucket already bound")
         self._graphs.add(key)
         return GraphLease(self, key)
 
     @_serialized
-    def _release_graph(self, key):
-        self.wait_idle()
+    def _release_graph(self, key, *, drained=False):
+        if not drained:
+            self.wait_idle()
         # Also cover capture/warmup work, which is not a serving forward ticket.
         try:
-            self.runtime.synchronize()
+            if not drained:
+                self.runtime.synchronize()
             self._graphs.remove(key)
         except BaseException:
             self.state = OwnerState.FAILED
             raise
+
+    @_serialized
+    def begin_cleanup(self):
+        """Close the submission gate before joining workers or draining devices."""
+        self._require_no_forward()
+        self._closing = True
+
+    @_serialized
+    def begin_graph_cleanup(self, identity):
+        """Temporarily gate forwards while one graph backend is being retired."""
+        self._require_no_forward()
+        self._graph_cleanups.add(identity)
+
+    @_serialized
+    def finish_graph_cleanup(self, identity):
+        # Distinct wrappers can be closed concurrently. Keep the gate until all
+        # registered cleanup transactions finish; failure also poisons state.
+        self._graph_cleanups.discard(identity)
+
+    @_serialized
+    def dispose_pending_after_drain(self):
+        for completion in self._pending:
+            completion.dispose_completed()
+        self._pending.clear()
 
     @_serialized
     def close(self):
@@ -268,12 +305,15 @@ class MoEOffloadOwner:
         self._require_no_forward()
         if self._graphs:
             raise RuntimeError("Destroy graph buckets and release graph leases first")
+        self.begin_cleanup()
         try:
             self.runtime.synchronize()
-            self.wait_idle()
-            self.hot_slot_leases.require_empty()
-            self.execution_slot_leases.require_empty()
-            self.runtime.close()
+            self.dispose_pending_after_drain()
+            close_drained = getattr(self.runtime, "close_after_drain", None)
+            if close_drained is not None:
+                close_drained()
+            else:
+                self.runtime.close()
         except BaseException:
             self.state = OwnerState.FAILED
             raise

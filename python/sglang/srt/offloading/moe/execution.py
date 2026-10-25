@@ -61,11 +61,13 @@ class MaterializationPlan:
 class ExecutionReservation(MaterializationPlan):
     # Backend-owned fixed device metadata or an eager reservation/generation.
     state: Any = None
+    plan_covers_compute_frontier: bool = False
 
 
 @dataclass(frozen=True)
 class UpdatePlan(MaterializationPlan):
     state: Any = None
+    plan_covers_compute_frontier: bool = False
 
 
 @dataclass
@@ -85,6 +87,37 @@ class LocalExecution:
 
     output: Any
     read_done: TransferTicket
+
+
+def invocation_id(context):
+    """An opaque invocation identity, never a reference to its resource owner."""
+    identity = getattr(context, "invocation_id", None)
+    if identity is None:
+        identity = object()
+        context.invocation_id = identity
+    return identity
+
+
+def retain_completion(context, dependency):
+    """Preserve transfer resources and explicitly report its completion."""
+    context.retain(dependency)
+    register = getattr(context, "register_completion", None)
+    if register is not None:
+        register(dependency)
+    return dependency
+
+
+def wait_completion(context, dependency, stream):
+    wait = getattr(context, "wait_for", None)
+    if wait is not None:
+        wait(dependency, stream)
+    else:
+        completion = (
+            dependency.completion
+            if isinstance(dependency, TransferTicket)
+            else dependency
+        )
+        completion.wait_on(stream)
 
 
 def require_prefill(context):
@@ -113,7 +146,11 @@ class ExpertWeightAccess:
         published = self.residency_ops.publish_execution(reservation, copied, context)
         ready = self._join(copied, published, context)
         lease = WeightLease(
-            (reservation,), reservation.bindings, ready, self._token, context
+            (reservation,),
+            reservation.bindings,
+            ready,
+            self._token,
+            invocation_id(context),
         )
         context.retain(lease)
         return lease
@@ -131,7 +168,7 @@ class ExpertWeightAccess:
             raise ValueError("A prefill group needs distinct nonempty leases")
         for lease in leases:
             self._check_lease(lease)
-            if lease.context_token is not context:
+            if lease.context_token is not invocation_id(context):
                 raise ValueError("Cannot combine leases from different invocations")
         ticket = TransferTicket(
             JoinedCompletion(lease.ticket.completion for lease in leases), leases
@@ -141,37 +178,48 @@ class ExpertWeightAccess:
             bindings,
             ticket,
             self._token,
-            context,
+            invocation_id(context),
         )
         context.retain(grouped)
-        context.retain(ticket)
+        retain_completion(context, ticket)
         for lease in leases:
             lease.transferred = True
         return grouped
 
-    def wait_ready(self, lease, compute_stream):
+    def wait_ready(self, lease, compute_stream, *, context=None):
         self._check_lease(lease)
-        lease.ticket.completion.wait_on(compute_stream)
+        if context is None:
+            lease.ticket.completion.wait_on(compute_stream)
+        else:
+            if lease.context_token is not invocation_id(context):
+                raise ValueError("Weight lease belongs to a different invocation")
+            wait_completion(context, lease.ticket, compute_stream)
         return lease.bindings
 
     def release_after(self, lease, read_done, context):
         self._check_lease(lease)
-        if lease.context_token is not context:
+        if lease.context_token is not invocation_id(context):
             raise ValueError("Weight lease belongs to a different invocation")
         if not isinstance(read_done, TransferTicket):
             raise TypeError("Reader completion must be a TransferTicket")
         # Retain before calling a backend which can fail after emitting work.
-        context.retain(read_done)
+        retain_completion(context, read_done)
         # A partial retirement poisons the invocation; do not submit it twice.
         lease.read_done = read_done
         for reservation in lease.reservations:
             self.residency_ops.finish_execution(reservation, read_done, context)
 
-    def apply_update(self, target_keys, context):
+    def apply_update(self, target_keys, context, *, update_enabled=None):
         if context.phase is not Phase.DECODE:
             raise RuntimeError("Hot-set updates are decode-only")
         context.retain((self, target_keys))
-        update = self.residency_ops.prepare_update(target_keys, context)
+        update = (
+            self.residency_ops.prepare_update(target_keys, context)
+            if update_enabled is None
+            else self.residency_ops.prepare_update(
+                target_keys, context, update_enabled=update_enabled
+            )
+        )
         if not isinstance(update, UpdatePlan):
             raise TypeError("prepare_update must return UpdatePlan")
         copied = self._materialize(update, context)
@@ -200,7 +248,7 @@ class ExpertWeightAccess:
             raise ValueError("Unsupported execution phase")
         if not isinstance(plan.copy_plan, expected):
             raise TypeError(f"This phase requires {expected.__name__}")
-        if context.phase is Phase.DECODE:
+        if context.phase is Phase.DECODE and not plan.plan_covers_compute_frontier:
             # Even different banks cannot prefetch a later wave during prior F.
             frontier = context.record_compute_completion()
             context.retain(frontier)
@@ -211,18 +259,21 @@ class ExpertWeightAccess:
         if not isinstance(ticket, TransferTicket):
             raise TypeError("Materialization must return TransferTicket")
         retained = TransferTicket(ticket.completion, (ticket, plan))
-        context.retain(retained)
+        retain_completion(context, retained)
         return retained
 
     @staticmethod
     def _join(copied, published, context):
         if not isinstance(published, TransferTicket):
             raise TypeError("Residency publication must return TransferTicket")
+        # publish_execution/commit_update must wait for the complete bundle.
+        # Its publication frontier therefore covers copied, while both tickets
+        # still retain every source/destination owner until retirement.
         ticket = TransferTicket(
-            JoinedCompletion((copied.completion, published.completion)),
+            published.completion,
             (copied, published),
         )
-        context.retain(ticket)
+        retain_completion(context, ticket)
         return ticket
 
 
@@ -234,30 +285,33 @@ class CacheUpdateCoordinator:
     Returned tickets describe emitted dependencies, not later replay completion.
     """
 
-    def __init__(self, policy, policy_state, residency_state, target_keys, access):
+    def __init__(
+        self, policy, policy_state, residency_state, target_keys, access, *, due_out
+    ):
         self.policy = policy
         self.policy_state = policy_state
         self.residency_state = residency_state
         self.target_keys = target_keys
         self.access = access
+        self.due_out = due_out
 
-    def emit_step_end(self, context, *, adjust=True):
+    def emit_step_end(self, context):
         if context.phase is Phase.PREFILL:
             require_prefill(context)
             return TransferTicket(ImmediateCompletion())
         if context.phase is not Phase.DECODE:
             raise ValueError("Unsupported execution phase")
         context.retain(self)
-        self.policy.update_statistics(
+        self.policy.observe(
             self.policy_state,
             self.residency_state.step_access_count,
             self.residency_state.update_enabled,
+            self.due_out,
         )
-        if adjust:
-            self.policy.select_hot_set(
-                self.policy_state, self.residency_state.key_to_slot, self.target_keys
-            )
+        self.policy.select_hot_set(
+            self.policy_state, self.residency_state.key_to_slot, self.target_keys
+        )
         self.policy.finish_step(self.policy_state)
-        if not adjust:
-            return TransferTicket(ImmediateCompletion())
-        return self.access.apply_update(self.target_keys, context)
+        return self.access.apply_update(
+            self.target_keys, context, update_enabled=self.due_out
+        )

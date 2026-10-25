@@ -1,5 +1,9 @@
 # MoE Cache 与框架适配实现总结
 
+> **历史设计快照**：正文保留当时方案与接口，其中重复缓存栈、phase controller、旧策略 API
+> 已被后续实现替换，不应据此恢复旧模块。当前接口、迁移与验证状态见
+> [2026-10-25 重构记录](doc/REFACTOR_20261025.zh-CN.md)。
+
 > 2026-10-22：本说明保留上游缓存提交的设计与验证记录。当前原生 NPU 入口复用其中的
 > `PeriodicLFUPolicy` 与 `CacheRouteStats`，通过现有 ACL/MemFabric 后端执行搬运；
 > 具体接入和当前测试方法见 [原生周期缓存](npu/doc/PERIODIC_CACHE_1022.zh-CN.md)。
@@ -300,7 +304,7 @@ offloader = MoEOffloaderV2(
 
 这是 `CacheBackend` 的组装示意。它通过三个注入回调访问权重存储：注册层时调用 `prepare_weights`，finalize 时调用 `bind_weights`，资源排空后调用 `close_weights`。收到 binding 后，创建状态、runtime、逐层 Program、模型 installer 和初始化热池均由本次新增代码完成。示例省略具体后端实例，不是独立的模型启动脚本。
 
-[CacheBackendBinding](cache_backend.py) 的全部字段：
+`CacheBackendBinding`（历史 `cache_backend.py`） 的全部字段：
 
 | 字段 | 类型 / 要求 |
 | --- | --- |
@@ -416,11 +420,11 @@ F 返回的 `read_done` 必须覆盖所有读权重的计算流，再通过 `rel
 | --- | --- |
 | [periodic_lfu.py](periodic_lfu.py) | 离线热启动与周期 LFU |
 | [cache_metadata.py](cache_metadata.py) | 路由统计、策略状态与快照 |
-| [cache_residency.py](cache_residency.py) | 设备计划、slot 分配、发布及读者保护 |
-| [cache_runtime.py](cache_runtime.py) | cache 生命周期、forward / capture 和阶段切换 |
-| [cache_backend.py](cache_backend.py) | 物理 binding 到真实 runtime / Program 的组装 |
-| [model_binding.py](model_binding.py) | DeepSeek V4 模型方法安装与恢复 |
-| [ascend_adapter.py](ascend_adapter.py) | DeepEP 布局与原生 Ascend F 适配 |
+| `cache_residency.py`（已退休） | 设备计划、slot 分配、发布及读者保护 |
+| `cache_runtime.py`（已退休） | cache 生命周期、forward / capture 和阶段切换 |
+| `cache_backend.py`（已退休） | 物理 binding 到真实 runtime / Program 的组装 |
+| `model_binding.py`（已退休） | DeepSeek V4 模型方法安装与恢复 |
+| `ascend_adapter.py`（已退休） | DeepEP 布局与原生 Ascend F 适配 |
 
 ### 7.2 已有文件的功能修改
 

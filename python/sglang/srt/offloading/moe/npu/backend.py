@@ -14,7 +14,7 @@ from ...transfer import (
     HostCopyRegion,
 )
 from ..cache_metadata import CacheRouteStats
-from ..config import ExpertLayerSpec, Phase, fixed_waves
+from ..config import Phase, fixed_waves
 from ..diagnostics import BatchDiagnostics
 from ..execution import (
     CacheUpdateCoordinator,
@@ -24,14 +24,17 @@ from ..execution import (
     SourcePolicy,
 )
 from ..interfaces import MoEBackend
+from ..models import DeepSeekV4Adapter
 from ..prefill import BoundedPrefillWeightPipeline, PrefillPipelineConfig
 from ..residency import BoundExecutionWave, TensorResidencyOps
 from ..resources import Allocation, ResourceKind
 from ..runtime import DecodeStateSnapshot
 from ..state import ResidencyState
 from .config import validate_native_environment
+from .format_resolver import resolve_npu_format
 from .runtime import NpuBoundMoERuntime, NpuDeviceRuntime
 from .transfer import (
+    MemFabricAddressCatalog,
     MemFabricCopyComponent,
     MemFabricDeviceTransferOps,
     MemFabricTransferBindings,
@@ -56,13 +59,12 @@ def _tensor_allocations(prefix, tensors, kind=ResourceKind.METADATA):
 @dataclass(frozen=True)
 class _PrefillTarget:
     binding: object
-    offset: int
 
 
 class NpuMoEBackend(MoEBackend):
     """One model/rank, fixed expert format, single immutable registered master."""
 
-    def __init__(self, settings, config, hf_config, device):
+    def __init__(self, settings, config, hf_config, device, *, model_adapter=None):
         import torch
 
         validate_native_environment()
@@ -70,52 +72,17 @@ class NpuMoEBackend(MoEBackend):
         self.device = torch.device(device)
         if self.device.type != "npu" or self.device.index is None:
             raise ValueError("Native V4 offload requires an explicit NPU device")
-        if getattr(hf_config, "model_type", "") != "deepseek_v4":
-            raise ValueError("Native MoE offload supports DeepSeek V4 only")
-        self.resident_layers = max(3, getattr(hf_config, "num_hash_layers", 0))
-        self.num_layers = hf_config.num_hidden_layers
-        self.global_experts = hf_config.n_routed_experts
-        if self.num_layers <= self.resident_layers:
-            raise ValueError("The model has no offloadable routed experts")
-        self.layer_ids = tuple(range(self.resident_layers, self.num_layers))
+        self.model_adapter = model_adapter or DeepSeekV4Adapter()
+        self.model_plan = self.model_adapter.plan_model(hf_config, config)
+        if len({s.local_experts for s in self.model_plan.offloaded_layers}) != 1:
+            raise ValueError(
+                "The native execution arena requires uniform local expert counts"
+            )
         self.format = self.host_pool = self.device_runtime = None
         self.layers = {}
         self.runtime = None
         self._unbound_resources = []
         self._closed = False
-
-    def validate_quant_method(self, layer, method):
-        """Reject unhandled expert formats before their first weight allocation."""
-        resident = layer.layer_id < self.resident_layers
-        if not resident and layer.layer_id not in self.layer_ids:
-            raise ValueError("Offloaded expert layer is outside the fixed catalog")
-        from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
-            NPUW4A8MXFP4FusedMoEMethod,
-        )
-
-        if isinstance(method, NPUW4A8MXFP4FusedMoEMethod):
-            return "fp4"
-        from sglang.srt.layers.quantization.modelslim.modelslim import (
-            ModelSlimFusedMoEMethod,
-        )
-        from sglang.srt.layers.quantization.modelslim.schemes import (
-            ModelSlimW8A8Int8MoE,
-        )
-
-        if isinstance(method, ModelSlimFusedMoEMethod) and all(
-            isinstance(getattr(layer, name, None), ModelSlimW8A8Int8MoE)
-            for name in ("w13_scheme", "w2_scheme")
-        ):
-            # The A5 offload binding uses BF16 EP payloads for resident hash
-            # layers too; INT8 quantization belongs to each W8A8 GMM input.
-            layer._moe_offload_bf16_dispatch = True
-            return "w8a8"
-        if resident:
-            return None
-        raise ValueError(
-            "V4 offload supports native MXFP4 or ModelSlim W8A8_DYNAMIC experts; "
-            f"layer {layer.layer_id} resolved {type(method).__name__}"
-        )
 
     def prepare_expert_weights(
         self,
@@ -128,33 +95,24 @@ class NpuMoEBackend(MoEBackend):
         params_dtype,
         **extra_weight_attrs,
     ):
+        from .format import ExpertLayerStorage
         from .storage import MemFabricHostPool
-        from .v4_format import NpuV4FP4Format, V4LayerStorage
-        from .w8a8_format import NpuV4W8A8Format, W8A8LayerStorage
 
         layer_id = layer.layer_id
-        if layer_id < self.resident_layers:
-            return False
         if self.runtime is not None or self._closed or layer_id in self.layers:
             raise RuntimeError("Expert storage must be registered exactly once")
-        spec = ExpertLayerSpec(
-            layer_id, self.global_experts, self.config.ep_size, self.config.ep_rank
-        )
+        spec = self.model_plan.layer(layer_id)
+        format_type = resolve_npu_format(layer, method, resident=spec.resident)
+        if spec.resident:
+            return False
         if (
-            layer_id not in self.layer_ids
-            or num_experts != spec.local_experts
+            num_experts != spec.local_experts
             or layer.moe_tp_size != 1
             or layer.num_fused_shared_experts
         ):
             raise ValueError(
                 "Native V4 storage requires unchanged local routed expert ownership"
             )
-        format_kind = self.validate_quant_method(layer, method)
-        format_type, storage_type = (
-            (NpuV4FP4Format, V4LayerStorage)
-            if format_kind == "fp4"
-            else (NpuV4W8A8Format, W8A8LayerStorage)
-        )
         dimensions = (hidden_size, intermediate_size_per_partition)
         if self.format is None:
             from .native_acl import get_native_acl
@@ -169,19 +127,21 @@ class NpuMoEBackend(MoEBackend):
                 workspace_limit_bytes=self.settings.workspace_limit_bytes,
             )
             self._dimensions = dimensions
-            self._format_kind = format_kind
-            required = len(self.layer_ids) * self.format.host_nbytes(spec.local_experts)
+            required = sum(
+                self.format.host_nbytes(s.local_experts)
+                for s in self.model_plan.offloaded_layers
+            )
             self.host_pool = MemFabricHostPool(
                 required,
                 self.device.index,
                 physical_bytes=self.settings.host_pool_gib * 1024**3,
                 native_acl=self.native_acl,
             )
-        elif dimensions != self._dimensions or format_kind != self._format_kind:
+        elif dimensions != self._dimensions or type(self.format) is not format_type:
             raise ValueError(
                 "Offloaded V4 layers must share one physical expert format"
             )
-        storage = storage_type(
+        storage = ExpertLayerStorage(
             layer, spec, self.format, self.host_pool, extra_weight_attrs
         )
         self.layers[layer_id] = storage
@@ -191,7 +151,10 @@ class NpuMoEBackend(MoEBackend):
         storage = self.layers.get(spec.layer_id)
         if (
             storage is None
-            or getattr(module.mlp.experts, "_moe_offload_storage", None) is not storage
+            or getattr(
+                self.model_adapter.expert_module(module), "_moe_offload_storage", None
+            )
+            is not storage
         ):
             raise RuntimeError("Routed weights were not intercepted before allocation")
         if storage.spec != spec:
@@ -205,6 +168,10 @@ class NpuMoEBackend(MoEBackend):
 
         if self.runtime is not None or self._closed:
             raise RuntimeError("Backend already finalized or closed")
+        if catalog != self.model_plan:
+            raise ValueError(
+                "Constructed layers differ from the pre-allocation model plan"
+            )
         if set(self.layers) != {s.layer_id for s in catalog.offloaded_layers}:
             raise ValueError("Incomplete native expert storage registration")
         for storage in self.layers.values():
@@ -231,6 +198,20 @@ class NpuMoEBackend(MoEBackend):
             )
             for name in component_names
         }
+        address_catalog = MemFabricAddressCatalog(
+            tuple(
+                MemFabricCopyComponent(
+                    hosts[name],
+                    hot.component_regions[name],
+                    (),
+                    self.format.component_nbytes[name],
+                    name,
+                )
+                for name in component_names
+            ),
+            device=self.device,
+        )
+        self._unbound_resources.append(address_catalog)
         bindings = []
 
         def bind(bank, capacity, name, valid=None):
@@ -251,6 +232,7 @@ class NpuMoEBackend(MoEBackend):
                 error_status=error,
                 device=self.device,
                 name=name,
+                address_catalog=address_catalog,
             )
             if valid is not None:
                 result.expert_bank = NPUExpertBank(bank.quant_info(), valid, error)
@@ -317,7 +299,7 @@ class NpuMoEBackend(MoEBackend):
             binding = prefill_binding(wave.bank, bank_offset, count)
             return ExecutionRequest(
                 layer_id,
-                _PrefillTarget(binding, bank_offset),
+                _PrefillTarget(binding),
                 wave,
                 Phase.PREFILL,
                 SourcePolicy.HOST_ONLY,
@@ -389,7 +371,10 @@ class NpuMoEBackend(MoEBackend):
         access = ExpertWeightAccess(ops, transfer)
         policy_state = policy.allocate_state(catalog.num_experts, self.device)
         targets = torch.full((k,), -1, dtype=torch.int64, device=self.device)
-        updates = CacheUpdateCoordinator(policy, policy_state, state, targets, access)
+        update_due = torch.zeros((), dtype=torch.bool, device=self.device)
+        updates = CacheUpdateCoordinator(
+            policy, policy_state, state, targets, access, due_out=update_due
+        )
         snapshot = DecodeStateSnapshot(state, policy, policy_state, error_status=error)
         restore_plan = DeviceCopyPlan(
             torch.full(
@@ -411,30 +396,31 @@ class NpuMoEBackend(MoEBackend):
             ready.completion.wait_on(context.copy_stream)
             return transfer.materialize_into(restore_plan, update, context.copy_stream)
 
-        programs, pipelines, program_resources = {}, [], []
+        programs, program_resources = {}, []
+        # A/B belong to the arena, so one submitter owns their complete reader
+        # history across layers. Layer identity is part of each session/request.
+        pipeline = BoundedPrefillWeightPipeline(
+            access,
+            PrefillPipelineConfig(
+                local_experts=catalog.offloaded_layers[0].local_experts,
+                initial_capacity=a.capacity,
+                group_size=group,
+                secondary_capacity=b.capacity,
+                microbatch_size=self.settings.prefill_microbatch_size,
+                max_inflight=self.settings.prefill_max_inflight,
+            ),
+            make_request=make_request,
+            combine_bindings=combine_bindings,
+            worker_scope=lambda ctx: self.device_runtime.stream_scope(ctx.copy_stream),
+            record_copy_completion=lambda ctx: self.device_runtime.record(
+                ctx.copy_stream
+            ),
+        )
+        pipelines = (pipeline,)
         shared_layout = None
         for module, spec in layers:
-            pipeline = BoundedPrefillWeightPipeline(
-                access,
-                PrefillPipelineConfig(
-                    local_experts=spec.local_experts,
-                    initial_capacity=a.capacity,
-                    group_size=group,
-                    secondary_capacity=b.capacity,
-                    microbatch_size=self.settings.prefill_microbatch_size,
-                    max_inflight=self.settings.prefill_max_inflight,
-                ),
-                make_request=make_request,
-                combine_bindings=combine_bindings,
-                worker_scope=lambda ctx: self.device_runtime.stream_scope(
-                    ctx.copy_stream
-                ),
-                record_copy_completion=lambda ctx: self.device_runtime.record(
-                    ctx.copy_stream
-                ),
-            )
             programs[spec.layer_id] = build_npu_layer_programs(
-                module.mlp.experts,
+                self.model_adapter.expert_module(module),
                 access=access,
                 residency=ops,
                 decode_waves=waves_by_layer[spec.layer_id],
@@ -443,7 +429,6 @@ class NpuMoEBackend(MoEBackend):
                 device=self.device,
                 shared_layout=shared_layout,
             )
-            pipelines.append(pipeline)
             if shared_layout is None:
                 shared_layout = programs[spec.layer_id].layout
                 program_resources.extend(programs[spec.layer_id].allocations())
@@ -460,7 +445,13 @@ class NpuMoEBackend(MoEBackend):
         )
         for binding in bindings:
             resources.extend(binding.allocations())
-        tensors = [("error", error), ("target_keys", targets)]
+        address_catalog.seal()
+        resources.extend(address_catalog.allocations())
+        tensors = [
+            ("error", error),
+            ("target_keys", targets),
+            ("update_due", update_due),
+        ]
         tensors.extend(
             ("policy." + f.name, getattr(policy_state, f.name))
             for f in fields(policy_state)
@@ -528,7 +519,6 @@ class NpuMoEBackend(MoEBackend):
             try:
                 self.runtime.initialize_hot_cache(initial_keys)
             except BaseException:
-                self.runtime.synchronize()
                 self.runtime.close()
                 self.runtime = None
                 raise
@@ -546,7 +536,6 @@ class NpuMoEBackend(MoEBackend):
         if self._closed:
             return
         if self.runtime is not None:
-            self.runtime.synchronize()
             self.runtime.close()
             self.runtime = None
             return

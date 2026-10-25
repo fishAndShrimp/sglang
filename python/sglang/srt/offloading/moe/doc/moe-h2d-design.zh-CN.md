@@ -1,5 +1,9 @@
 # MoE 权重 H2D 设计
 
+> **历史设计快照**：正文保留当时方案与接口，其中重复缓存栈、phase controller、旧策略 API
+> 已被后续实现替换，不应据此恢复旧模块。当前接口、迁移与验证状态见
+> [2026-10-25 重构记录](REFACTOR_20261025.zh-CN.md)。
+
 版本：v0.4 · 更新日期：2026 年 10 月 21 日 · 状态：公共抽象与组合程序已实现，设备后端与 A5 实机验收待完成。
 
 本设计规定两条执行路径：prefill 使用 `aclrtMemcpyBatchAsync`，在 eager 模式下实现“层首预载大组、一次 Dispatch、多组 FFN、一次 Combine”；decode 使用 MemFabric 的 device 侧复制，在完整 graph replay 中处理动态专家需求。两条路径共享权重归属、完成凭据与读写保护，缓存算法不参与搬运调度。

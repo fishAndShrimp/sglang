@@ -1,53 +1,52 @@
-# 10 月 21 日 H2D draft 实现
+# H2D 实现与资源契约（2026-10-25）
 
-本提交在 cache draft 之上实现 eager prefill 流水及两种搬运适配。
-MemFabric 语义来自用户指定的本地 `memfabric_hybrid-master`；未修改该目录。
+当前实现复用公共 `ExpertWeightAccess`、`ComposedTransferBackend` 和有界 prefill
+pipeline。重构与验证状态见 [重构记录](REFACTOR_20261025.zh-CN.md)。
 
-## 已实现
+## 存储和传输
 
-- `HostMemoryCapability`：显式保存 host 可读范围、ACL 异步读取能力、device
-  映射地址和 registration 保活。`HostExpertStore` 可接收经认证的外部分配，
-  不把 `is_pinned()` 与 MemFabric 注册混为一谈，也不分配第二份 host master。
-- `allocations()` 对共享存储只计一次，并计入外部分配器的物理保留容量。
-  `host_allocation_limit_bytes` 显式允许页对齐额外容量；默认仍使用原精确预算。
-- `AclBatchHostTransferOps`：完整校验 H2D 字节区间、目标设备、注册和重叠写，
-  按条目上限拆 batch；提交前保活所有描述符，完整 batch 后才记录 ready，
-  部分提交失败仍保留资源并尝试记录 drain 事件。
-- `MemFabricDeviceTransferOps`：固定设备计划生成源地址、压紧目标地址和 mask，
-  正确适配原生 `src[i] -> dst[j]` 语义；支持任意目标 slot、HOST/HOT_SLOT、
-  空/稀疏计划、多权重分量和有界批次。清除 packed metadata 尾部，校验
-  generation / 计数 / 索引 / 重复目标，故障通过共享错误状态阻断整个 bundle。
-- `BoundedPrefillWeightPipeline`：每趟独立 session、P/Q 有界后台提交、Dispatch
-  完成反馈封口 K、首批 A 与随后 B/a 双缓冲；保留所有专家、只做一次 D/C。
-  首批微块写不同偏移；下一 wave 和下一层覆盖 bank 前都等待旧 reader。
-  停止 worker 后记录 copy fence，失败保活纳入 invocation 生命周期。
+`HostMemoryCapability` 分开表示 host 可读区间、ACL 异步读取能力、device 映射地址
+及 registration 保活。ACL 与 MemFabric 共用一份不可变 host master；物理保留容量
+（包括对齐）由 ledger 计费，不通过额外 master 或未登记 staging 绕过预算。
 
-## 必须由目标环境提供的部分
+`AclBatchHostTransferOps` 验证完整 bundle 字节范围、设备、registration 与目标重叠，
+按条目上限拆 batch，提交前保活描述符。完整提交后产生 ready；部分提交异常保留
+资源并尝试记录 fence。native ACL 必须使用目标 CANN 编译并验证 torch_npu 队列顺序。
 
-ACL 入口必须注入**与目标 CANN 头文件编译匹配**且经过 torch_npu host 队列
-顺序验证的 `native_submit(batch, stream)` 薄封装。这里没有猜测 ctypes ABI、
-没有假设 PyACL 存在同名 batch 函数，也没有静默改成 Tensor.copy_。未提供并
-声明队列顺序验证的封装会拒绝初始化；因此本提交尚不能直接启动实际 ACL DMA。
+`MemFabricDeviceTransferOps` 从固定设备计划降低动态 HOST/HOT_SLOT 地址、目标
+和 mask；校验 generation、计数、索引与重复目标，全部分量共享 sticky error。
+完整 bundle 完成后才发布。生产路径不提供 CPU MemFabric 回退。
 
-MemFabric 默认调用本地 Python 包的 `group_pack_copy`，在 caller 的 NPU copy
-stream 上执行，事件覆盖全部分量和 batch。库构建/首次加载、映射注册和指针
-表绑定必须在 capture 前完成。搬运适配器只接受 NPU 存储，不提供 CPU 模拟模式。
-适配器本身不设置 `full_decode_graph`。
+## 地址目录与独立 scratch
 
-`MemFabricTransferBindings` 显式登记持久地址表和 metadata；Tensor lowering
-的临时表达式仍使用 PyTorch allocator，其 capture 峰值必须由具体 runtime
-计入 workspace 预算。`name=` 可显式命名多个 layer/bank 的资源登记。
+`MemFabricAddressCatalog` 每 arena 建立一次不可变 host/hot 源地址表；destination
+表与别名验证按实际物理 view 缓存。目录同时保留 allocation owner，避免地址复用
+造成缓存误命中；capture 前 `seal()`，之后不能新增物理 view。
 
-Prefill 绑定必须提供 `make_request`、`combine_bindings`、`worker_scope` 和
-`record_copy_completion`。它们分别负责 bank 偏移/物理格式、首批连续视图、
-worker device/stream 入口和真实队列完成事件；不允许新增未登记权重存储。
+各 `MemFabricTransferBindings` 共享目录中的表，但保留各自会被覆写的 lowering
+scratch、mask 和 packed metadata。目录的 `allocations()` 集中报告地址表，binding
+报告自身 scratch，ledger 按物理存储去重。共享目录不允许并发覆盖同一 scratch。
+PyTorch 临时表达式和 graph allocator 增长仍需纳入 workspace 与实机峰值检查。
 
-## 目标机验收
+## Prefill 与显式退休
 
-CPU 单测、字节复制模拟 kernel 与相关 runner 已移除。使用真实 NPU 环境验收
-稀疏 mask、非连续目标、多分量尾部、HOST/HOT 来源、generation 错误、同池覆盖、
-部分提交失败保活、动态 K、P/Q 上界和跨层 reader 保护。
+一个 arena 的所有层共用一个 `BoundedPrefillWeightPipeline`，session 以 invocation
+与 layer 标识。P/Q 限制初始提交，dispatch completion 封口 K；首批写 A 的不同偏移，
+随后 B/a 交替。下一 wave、下一层和下一 invocation 覆写 bank 前等待旧 reader。
+worker 显式进入设备/copy stream；停止并 join 后才记录最终 copy fence 和封闭 context。
 
-A5 验收还应覆盖共同 host 存储能力、ACL ABI/队列顺序、MemFabric 动态地址、
-FP4 格式/FFN、EP、完整 decode graph、显存峰值和 H2D/F 重叠时间线。
-这些硬件结果尚未在本机取得。
+`retain` 与完成依赖登记分离；`register_completion` 保留未知 transport/auxiliary
+reader 的独立完成语义，仅已证明的同流 frontier 可以归并。planner 的
+`plan_covers_compute_frontier` 能力避免多记录一次相同顺序的 compute event。
+普通提交不为资源退休新增 host synchronize；已有 done/wait 证据后显式释放保活。
+
+异常时先阻止新提交、join worker，再 drain 包括部分 native 提交的全部流；graph
+资源还须成功 reset 后才能退休。排空/reset 失败继续保留资源，不能依赖 Python GC。
+
+## 验证边界
+
+CPU 测试包含共享目录去重、独立 scratch、别名/设备/布局拒绝、完整 bundle、
+稀疏计划、读者保护和部分提交保活；测试替身不进入生产实现。
+本轮未取得真实 NPU 实测。目标机还需验证 ACL ABI/队列顺序、MemFabric 动态地址、
+跨流 full graph、FP4/W8A8 数值、多 rank EP、内存峰值及 H2D/F 时间线。
+非 due 使用 masked tail，不声称设备 kernel 已真正早退。

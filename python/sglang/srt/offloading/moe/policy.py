@@ -32,7 +32,7 @@ class TensorLFUPolicy(CachePolicy):
             torch.zeros((), dtype=torch.int64, device=device),
         )
 
-    def update_statistics(self, state, step_counts, update_enabled):
+    def observe(self, state, step_counts, update_enabled, due_out):
         import torch
 
         # Clamp before adding to prevent overflow. Every expert, including misses,
@@ -45,6 +45,7 @@ class TensorLFUPolicy(CachePolicy):
             frequency = torch.where(steps == 0, frequency // 2, frequency)
         state.frequency.copy_(torch.where(update_enabled, frequency, state.frequency))
         state.steps.copy_(torch.where(update_enabled, steps, state.steps))
+        due_out.copy_(update_enabled)
 
     def select_hot_set(self, state, key_to_slot, target_keys):
         import torch

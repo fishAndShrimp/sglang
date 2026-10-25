@@ -24,29 +24,36 @@
 `4838a071aa329233`；权重索引 `fe34647052b65127`。索引声明总字节数
 313349893880（约 291.83 GiB，含常驻部分与 draft，不等于 offload host 池大小）。
 
-## 从原框架生长
+## 当前共同格式 schema（2026-10-25）
+
+`V4LayerStorage` 与 `W8A8LayerStorage` 现在都是 `npu/format.py` 中
+`ExpertLayerStorage` 的兼容别名，不再是继承关系。完整迁移见
+[重构记录](../../doc/REFACTOR_20261025.zh-CN.md)。共同 storage 根据不可变
+`BundleSchema` / `BundleComponent` 驱动分量、shard、物理字节和有界转换；FP4/W8A8
+仅保留 checkpoint 校验、转换顺序与 quant binding 的格式行为。
 
 ```mermaid
 classDiagram
+    ExpertFormat <|-- NpuExpertFormat
     NpuExpertFormat <|-- NpuV4FP4Format
     NpuExpertFormat <|-- NpuV4W8A8Format
-    V4LayerStorage <|-- W8A8LayerStorage
-    NpuMoEBackend --> NpuExpertFormat : resolved quant scheme
-    NpuMoEBackend --> V4LayerStorage : prepare before device allocation
-    NpuExpertFormat --> V4ExpertBank : allocate fixed banks
-    V4ExpertBank --> AscendQuantInfo : format binding
-    NpuMoEBackend --> ComposedTransferBackend : existing byte transport
-    NPUExpertRunner --> AscendRunnerCore : existing F
-    AscendRunnerCore --> NPUSwigluInt8Quant : V4 clamp and requant
+    ExpertFormat --> BundleSchema
+    BundleSchema *-- BundleComponent
+    ExpertLayerStorage --> ExpertFormat
+    ExpertLayerStorage --> ExpertBank
+    NpuMoEBackend --> ExpertLayerStorage
+    ExpertBank --> AscendQuantInfo
+    NPUExpertRunner --> AscendRunnerCore
 ```
 
 FusedMoE 的权重创建入口统一调用 backend.prepare_expert_weights。
 FP4 与 ModelSlim 不再各自维护一套 offload 拦截。没有绑定该接口时沿用原来的
 quant_method.create_weights；旧 V2 与普通常驻加载保持原路径。
 
-选择依据是已解析的 quant method：原生 FP4，或 ModelSlimFusedMoEMethod 且 W13/W2
+`npu/format_resolver.py` 的 `resolve_npu_format` 函数依据已解析的 quant method 选择格式：原生 FP4，或 ModelSlimFusedMoEMethod 且 W13/W2
 均为 ModelSlimW8A8Int8MoE。其他 ModelSlim 方案不能仅凭外层类名获得支持。
-同一个 rank 的可卸载层必须具有相同格式和尺寸，继续使用统一专家 slot。
+当前一个 rank 使用一个兼容 arena；在分配前检查 schema fingerprint、尺寸及 EP 拓扑。
+混合格式不合并成统一 slot，当前直接拒绝；多 arena serving 路由仍是后续扩展。
 
 ## Slot、主机布局和加载
 
@@ -136,7 +143,7 @@ CPU 测试覆盖原生边界替身下的 typed load、gate/up 合并、实际字
 5. 同一完整 decode graph 多次改变输入/路由、多个 bucket、长时换入及 prefill/decode 交替。
 6. 初始化与 graph allocator 峰值、host 实际保留、H2D/D2D 流量和端到端性能。
 
-CPU 回归使用 Python 3.10 / PyTorch 2.9.1，通过 188 项 offloading 单元测试；
+以下是 10 月 22 日历史验证；本轮结果见重构记录。CPU 回归使用 Python 3.10 / PyTorch 2.9.1，通过 188 项 offloading 单元测试；
 测试进程仅将 sglang 顶层设为 namespace，绕过本机未安装的 serving 可选依赖。
 包含实际 Bash launcher 和 fake server 的脚本测试需要允许 /dev/fd 日志重定向。
 另外通过 bash -n、Python AST 检查和本地 metadata 的 W8A8 dry-run。

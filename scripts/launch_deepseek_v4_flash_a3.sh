@@ -209,9 +209,6 @@ PY
     unset FORCE_DRAFT_MODEL_NON_QUANT DEEP_NORMAL_MODE_USE_INT8_QUANT
     unset SGLANG_ENABLE_WAR_BARRIER SGLANG_FORCE_COARSE_WAR_BARRIER
 
-    GRAPH_BS=()
-    for ((bs=1; bs<MAX_RUNNING_REQUESTS; bs*=2)); do GRAPH_BS+=("$bs"); done
-    GRAPH_BS+=("$MAX_RUNNING_REQUESTS")
     BUILD_CMD=("$PYTHON_BIN" -m sglang.srt.offloading.moe.npu.native_acl --build-directory "$NATIVE_BUILD_DIR")
     SERVER_CMD=(
         "$PYTHON_BIN" -m sglang.launch_server

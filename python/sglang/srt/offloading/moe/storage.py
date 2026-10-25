@@ -63,7 +63,6 @@ class HostExpertStore:
     def __init__(self):
         self._components = {}
         self._capabilities = {}
-        self._registrations = []
         self._sealed = False
 
     def add(self, layer_id, name, tensor, *, capability=None):
@@ -107,11 +106,6 @@ class HostExpertStore:
                     )
         self._components[key] = tensor
         self._capabilities[key] = capability
-
-    def retain_registration(self, registration):
-        if self._sealed:
-            raise RuntimeError("Register host memory before sealing graph bindings")
-        self._registrations.append(registration)
 
     def seal(self):
         if not self._components:

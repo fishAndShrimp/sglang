@@ -5,15 +5,19 @@ and weight reloads are supplied by the binding; none of these helpers certifies
 an accelerator graph or creates another expert-weight allocation.
 """
 
+import logging
+
 from contextlib import contextmanager
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from threading import RLock, get_ident
+from weakref import ref
 
 from ..transfer import Completion, JoinedCompletion, TransferTicket
 from .config import Phase
-from .interfaces import ExecutionContext, ForwardCompletion
+from .interfaces import BoundMoERuntime, ExecutionContext, ForwardCompletion
 from .resources import Allocation, ResourceKind
-from .state import ResidencyState
+
+logger = logging.getLogger(__name__)
 
 
 class ManagedExecutionContext(ExecutionContext):
@@ -39,6 +43,7 @@ class ManagedExecutionContext(ExecutionContext):
             raise ValueError("Unsupported execution phase")
         if phase is Phase.PREFILL and capturing:
             raise ValueError("Prefill cannot be captured")
+        self._invocation_id = object()
         self.phase = phase
         self.capturing = capturing
         self.compute_stream = compute_stream
@@ -47,9 +52,15 @@ class ManagedExecutionContext(ExecutionContext):
         self._failure_drain = failure_drain
         self._lock = RLock()
         self._resources = []
+        self._resource_ids = set()
         self._temporary_resources = []
         self._submission_thread = get_ident()
-        self._dependencies = []
+        self._dependencies = {}
+        self._frontiers = {}
+        self._recorded_completions = set()
+        self._completion_streams = {}
+        self._disposed = False
+        self._workers = 0
         self._closed = False
         self._completion = None
 
@@ -59,18 +70,77 @@ class ManagedExecutionContext(ExecutionContext):
                 raise RuntimeError(
                     "Invocation already closed; join workers before finish"
                 )
-            if isinstance(resource, (TransferTicket, Completion)):
-                # Captured events and transfer keepalives outlive tensor scopes.
-                self._resources.append(resource)
-                self._dependencies.append(
-                    resource.completion
-                    if isinstance(resource, TransferTicket)
-                    else resource
-                )
-            elif self._temporary_resources and get_ident() == self._submission_thread:
+            if (
+                not isinstance(resource, (TransferTicket, Completion))
+                and self._temporary_resources
+                and get_ident() == self._submission_thread
+            ):
                 self._temporary_resources[-1].append(resource)
-            else:
+            elif id(resource) not in self._resource_ids:
+                self._resource_ids.add(id(resource))
                 self._resources.append(resource)
+
+    def register_completion(self, dependency, *, stream=None):
+        """Track dependencies without implicitly retaining arbitrary resources.
+
+        Only the recorder may supply stream: it establishes actual submission
+        order. Unknown transport/communication completions remain independent.
+        Nested joins are flattened and deduplicated by completion identity.
+        """
+        completion = (
+            dependency.completion
+            if isinstance(dependency, TransferTicket)
+            else dependency
+        )
+        if not isinstance(completion, Completion):
+            raise TypeError("Expected a recorded completion")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Invocation already closed")
+            if stream is not None:
+                self._frontiers[id(stream)] = completion
+                self._recorded_completions.add(id(completion))
+                self._completion_streams[id(completion)] = id(stream)
+            pending = [completion]
+            while pending:
+                item = pending.pop()
+                if type(item) is JoinedCompletion:
+                    pending.extend(item.completions)
+                else:
+                    self._dependencies[id(item)] = item
+        return dependency
+
+    def wait_for(self, dependency, stream):
+        """Skip only leaves already enqueued by our recorder on this stream.
+
+        Unknown transport and auxiliary-reader events retain their real waits.
+        No ordering is inferred from an event name, tensor device or graph key.
+        """
+        completion = (
+            dependency.completion
+            if isinstance(dependency, TransferTicket)
+            else dependency
+        )
+        leaves = (
+            completion.completions
+            if type(completion) is JoinedCompletion
+            else (completion,)
+        )
+        for item in leaves:
+            if self._completion_streams.get(id(item)) != id(stream):
+                item.wait_on(stream)
+
+    def worker_started(self):
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Cannot start workers after invocation seal")
+            self._workers += 1
+
+    def worker_finished(self):
+        with self._lock:
+            if self._workers <= 0:
+                raise RuntimeError("Unbalanced worker completion")
+            self._workers -= 1
 
     @contextmanager
     def temporary_scope(self):
@@ -110,6 +180,7 @@ class ManagedExecutionContext(ExecutionContext):
         if not isinstance(ticket, TransferTicket):
             raise TypeError("Completion factory must return TransferTicket")
         self.retain(ticket)
+        self.register_completion(ticket, stream=stream)
         return ticket
 
     def finish(self, *, output_ready=None, residency_ready=None):
@@ -118,58 +189,116 @@ class ManagedExecutionContext(ExecutionContext):
                 raise RuntimeError("Invocation already finished")
             if self._temporary_resources:
                 raise RuntimeError("Close temporary scopes before finishing invocation")
-            # Fresh records on *this* submission; capture-time tickets cannot
-            # establish completion of a later replay.
+            if self._workers:
+                raise RuntimeError("Stop and join workers before finishing invocation")
+            # Replay requires fresh events. When neither milestone was supplied,
+            # both describe the same compute frontier and share one record.
             output_ready = output_ready or self.record_compute_completion()
-            residency_ready = residency_ready or self.record_compute_completion()
+            residency_ready = residency_ready or output_ready
             for ticket in (output_ready, residency_ready):
                 if not isinstance(ticket, TransferTicket):
                     raise TypeError("Forward completion requires TransferTicket")
                 self.retain(ticket)
+                self.register_completion(ticket)
             copy_done = self._record_on(self.copy_stream)
             if self.capturing:
-                # CaptureEnd requires every auxiliary stream's final task to
-                # rejoin the origin stream, including this completion record.
+                # CaptureEnd must see the auxiliary stream's LAST task, including
+                # its final event, joined back onto the capture origin.
                 copy_done.completion.wait_on(self.compute_stream)
-            idle = TransferTicket(
-                JoinedCompletion(tuple(self._dependencies)),
-                tuple(self._resources),
+            dependencies = {
+                key: value
+                for key, value in self._dependencies.items()
+                if key not in self._recorded_completions
+            }
+            dependencies.update(
+                (id(value), value) for value in self._frontiers.values()
             )
-            self._completion = ForwardCompletion(output_ready, residency_ready, idle)
+            idle = TransferTicket(
+                JoinedCompletion(dependencies.values()), (self._resources,)
+            )
+            self._completion = ForwardCompletion(
+                output_ready, residency_ready, idle, self._resources, ref(self)
+            )
             self._closed = True
             return self._completion
 
-    def release_completed(self):
-        """Release a completed invocation's keepalives outside device capture.
+    def dispose_completed(self, *, graph_destroyed=False):
+        """Retire after existing completion proof; no query or device wait.
 
-        Used for eager graph warmups. Captured invocations must stay pinned until
-        their graph is destroyed. Keep every reference if completion waiting fails.
+        The owner calls this only after done()/wait succeeds. Captured contexts
+        additionally require successful graph destruction. Failed submissions use
+        dispose_after_drain because they may not have a usable completion ticket.
         """
+        with self._lock:
+            if self._disposed:
+                return
+            if not self._closed or self._completion is None:
+                raise RuntimeError("Finish the invocation before releasing resources")
+            if self.capturing and not graph_destroyed:
+                raise RuntimeError(
+                    "Destroy the captured graph before releasing resources"
+                )
+            self._dispose()
+
+    def dispose_after_drain(self, *, graph_destroyed=False):
+        """Internal teardown path after workers stop and every stream drains."""
+        with self._lock:
+            if self._disposed:
+                return
+            if self._workers:
+                raise RuntimeError("Join workers before releasing resources")
+            if self.capturing and not graph_destroyed:
+                raise RuntimeError(
+                    "Destroy the captured graph before releasing resources"
+                )
+            self._closed = True
+            self._dispose()
+
+    def _dispose(self):
+        self._resources.clear()
+        self._resource_ids.clear()
+        self._dependencies.clear()
+        self._frontiers.clear()
+        self._recorded_completions.clear()
+        self._completion_streams.clear()
+        self._completion = None
+        self._record = self._failure_drain = None
+        # These optional bindings otherwise retain the entire serving batch or
+        # captured inputs through external references to an already retired ctx.
+        self.__dict__.pop("forward_batch", None)
+        self.__dict__.pop("num_token_non_padded", None)
+        self._disposed = True
+
+    def release_completed(self):
+        """Compatibility eager wait-and-release; serving retirement never calls it."""
         with self._lock:
             if not self._closed or self._completion is None:
                 raise RuntimeError("Finish the invocation before releasing resources")
             completion = self._completion
         completion.resources_idle.completion.synchronize()
-        with self._lock:
-            self._resources.clear()
-            self._dependencies.clear()
-            # Leases can refer back to this context. Drop the completion's copy
-            # of the keepalives too, so warmup tensors do not wait for cyclic GC.
-            self._completion = None
+        # Graph warmups use capturing=True to emit exactly the capture program,
+        # but this method is called only outside actual graph capture.
+        self.dispose_completed(graph_destroyed=True)
 
     def abort(self):
-        """Drain failed submissions before releasing any retained Python object."""
+        """Drain failed eager submissions before releasing retained objects."""
         with self._lock:
             if self._closed:
                 raise RuntimeError("Invocation already finished")
-        # Do not hold _lock: a worker being joined may still call retain().
         self._failure_drain()
-        with self._lock:
-            for completion in self._dependencies:
-                completion.synchronize()
-            self._closed = True
-            self._resources.clear()
-            self._dependencies.clear()
+        for completion in tuple(self._dependencies.values()):
+            completion.synchronize()
+        self.dispose_after_drain()
+
+
+@dataclass
+class HotSnapshot:
+    """Only persistent residency belongs to the cross-phase snapshot."""
+
+    key_to_slot: object
+    slot_to_key: object
+    slot_valid: object
+    slot_generation: object
 
 
 class DecodeStateSnapshot:
@@ -194,10 +323,10 @@ class DecodeStateSnapshot:
         ):
             raise ValueError("Snapshot needs the shared scalar device error_status")
         self.error_status = error_status
-        self.saved = ResidencyState(
+        self.saved = HotSnapshot(
             **{
                 field.name: torch.empty_like(getattr(residency, field.name))
-                for field in fields(residency)
+                for field in fields(HotSnapshot)
             }
         )
         self.saved_policy = policy.allocate_state(
@@ -242,6 +371,10 @@ class DecodeStateSnapshot:
         copied.completion.wait_on(context.compute_stream)
         self._copy_residency(self.saved, self.residency)
         self.policy.copy_state(self.saved_policy, self.policy_state)
+        self.residency.execution_key.fill_(-1)
+        self.residency.execution_valid.zero_()
+        self.residency.step_access_count.zero_()
+        # update_enabled belongs to the current invocation/capture, not history.
         published = context.record_compute_completion()
         ticket = TransferTicket(
             JoinedCompletion((copied.completion, published.completion)),
@@ -257,7 +390,7 @@ class DecodeStateSnapshot:
 
     @staticmethod
     def _copy_residency(source, destination):
-        for field in fields(source):
+        for field in fields(HotSnapshot):
             getattr(destination, field.name).copy_(getattr(source, field.name))
 
     def allocations(self):
@@ -295,3 +428,175 @@ class DecodeStateSnapshot:
                     )
                 )
         return tuple(result)
+
+
+class InvocationRuntime(BoundMoERuntime):
+    """Shared invocation, transition and worker teardown for device bindings.
+
+    A binding supplies streams/events, model hooks, storage and programs. Phase
+    and pending-forward ownership remain with the single MoEOffloadOwner; this
+    class does not duplicate that state machine.
+    """
+
+    def _initialize_lifecycle(self):
+        self._context = None
+        self._step_started = False
+        self._capture = None
+        self._failed_contexts = []
+        self._transition_contexts = []
+        self._closed = False
+        self._closing = False
+        self._invocation_sequence = 0
+        self._runtime_identity = object()
+
+    def retire_transitions(self):
+        """Called only after the owner/initializer completed its existing wait."""
+        for context in self._transition_contexts:
+            context.dispose_completed()
+        self._transition_contexts.clear()
+
+    def retire_graph_resources(self, contexts):
+        """Forget only contexts disposed by their own successful graph cleanup.
+
+        A runtime may serve several graph backends. Resetting one backend is no
+        proof that another backend's failed capture can release its resources.
+        Unknown failed contexts remain pinned until their owner resets or closes.
+        """
+        retired = {
+            id(context)
+            for context in contexts
+            if context.capturing and context._disposed
+        }
+        self._failed_contexts = [
+            context for context in self._failed_contexts if id(context) not in retired
+        ]
+
+    def _new_context(self, phase, *, stream=None, capturing=False):
+        context = ManagedExecutionContext(
+            phase,
+            compute_stream=stream or self.device_runtime.current_stream(),
+            copy_stream=self.device_runtime.copy_stream,
+            record_completion=self.device_runtime.record,
+            failure_drain=self.synchronize,
+            capturing=capturing,
+        )
+        self._invocation_sequence += 1
+        context._invocation_id = (
+            self._runtime_identity,
+            self._invocation_sequence,
+            "capture" if capturing else "eager",
+        )
+        context.started_layers = set()
+        return context
+
+    def _require_open(self):
+        if self._closed or self._closing:
+            raise RuntimeError("MoE runtime is closed or closing")
+
+    @property
+    def context(self):
+        # Closing rejects new submissions, but existing workers must still pin
+        # partial native submissions until stop/join and device drain finish.
+        if self._closed:
+            raise RuntimeError("MoE runtime is closed")
+        if self._context is None:
+            raise RuntimeError("MoE execution requires a forward or capture scope")
+        return self._context
+
+    def _transition(self, operation):
+        if self._context is not None:
+            raise RuntimeError("Phase transition cannot overlap a forward")
+        # The owner drained prior work before entering this transition.
+        self.retire_transitions()
+        context = self._new_context(Phase.DECODE)
+        self._transition_contexts.append(context)
+        self._context = context
+        try:
+            with self.device_runtime.stream_scope(context.compute_stream):
+                ticket = operation(context)
+                completion = context.finish(residency_ready=ticket)
+            return completion.resources_idle
+        except BaseException:
+            self._failed_contexts.append(context)
+            raise
+        finally:
+            self._context = None
+
+    def snapshot_decode_state(self):
+        return self._transition(self.snapshot.save)
+
+    def borrow_hot_arena(self):
+        # Physical aliases are constructed before capture; no allocation/rebind.
+        self.residency.execution_valid.zero_()
+
+    def restore_decode_state(self):
+        ticket = self._transition(
+            lambda context: self.snapshot.restore(context, self.reload_weights)
+        )
+        # The owner retires the transition context immediately after its wait.
+        return ticket
+
+    def synchronize(self):
+        contexts = list(self._failed_contexts)
+        if self._context is not None:
+            contexts.append(self._context)
+        abort_error = None
+        for context in {id(item): item for item in contexts}.values():
+            if context.phase is not Phase.PREFILL or context._closed:
+                continue
+            for pipeline in self.pipelines:
+                try:
+                    ticket = pipeline.abort(context)
+                    context.retain(ticket)
+                except BaseException as error:
+                    # A failed event record can follow a successful worker join.
+                    # Still stop the other submitters and attempt a device drain;
+                    # retain all resources until a later abort succeeds as well.
+                    if abort_error is None:
+                        abort_error = error
+        self.device_runtime.synchronize()
+        if abort_error is not None:
+            raise abort_error
+
+    def close(self):
+        if self._closed:
+            return
+        if self._context is not None or self._capture is not None:
+            raise RuntimeError("Finish active host submissions before closing runtime")
+        self._closing = True
+        self.synchronize()
+        self.close_after_drain()
+
+    def close_after_drain(self):
+        """Release after the owner/close path stopped submissions and drained."""
+        if self._closed:
+            return
+        if self._context is not None or self._capture is not None:
+            raise RuntimeError("Finish active host submissions before closing runtime")
+        owner = getattr(self, "_owner", None)
+        if owner is not None and getattr(owner, "_graphs", ()):
+            raise RuntimeError("Destroy graph buckets before closing runtime")
+        self._closing = True
+        if self.diagnostics is not None:
+            try:
+                self.diagnostics.close()
+            except Exception:
+                logger.warning(
+                    "MoE offload batch logger teardown failed", exc_info=True
+                )
+        self._remove_hooks()
+        if self._release is not None:
+            self._release()
+        for context in self._failed_contexts + self._transition_contexts:
+            context.dispose_after_drain(graph_destroyed=True)
+        self._failed_contexts.clear()
+        self._transition_contexts.clear()
+        if self.snapshot is not None:
+            self.snapshot._snapshot = None
+        self.layer_programs.clear()
+        self.prefill_program = self.decode_program = None
+        self.resources = self.storage = self.pipelines = ()
+        self.snapshot = self.cache_updates = self.ops = self.residency = None
+        self.cache_stats = self.diagnostics = None
+        self.reload_weights = self._release = None
+        self._closed = True

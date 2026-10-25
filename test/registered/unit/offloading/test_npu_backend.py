@@ -253,6 +253,10 @@ class Assembly:
             max_dispatch_rows=32,
         )
         backend.config, backend.device = self.config, torch.device("cpu")
+        backend.model_plan = self.catalog
+        backend.model_adapter = SimpleNamespace(
+            expert_module=lambda layer: layer.mlp.experts
+        )
         backend.format = Format()
         backend.host_pool = HostPool(
             self.catalog.num_experts * Format.expert_nbytes, self.events
@@ -324,8 +328,17 @@ class Assembly:
         self.host = HostOps(kwargs["retain"])
         return self.host
 
-    def finalize(self):
+    def finalize(self, finalize=None):
         with ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(
+                    npu_backend,
+                    "MemFabricAddressCatalog",
+                    return_value=SimpleNamespace(
+                        allocations=lambda: (), seal=lambda: None
+                    ),
+                )
+            )
             stack.enter_context(
                 mock.patch.object(
                     npu_backend, "MemFabricTransferBindings", side_effect=self.bind
@@ -348,12 +361,26 @@ class Assembly:
                     npu_experts, "build_npu_layer_programs", side_effect=self.build
                 )
             )
+            if finalize is not None:
+                return finalize()
             return self.backend.finalize(
                 self.layers, self.catalog, self.config, self.policy
             )
 
     def close(self):
         if self.backend.runtime is not None:
+            # These tests drive planners directly, outside forward_scope. End
+            # their synthetic invocation before invoking the real close gate.
+            context = self.backend.runtime._context
+            if context is not None:
+                if context.capturing:
+                    # Only the capture flag is simulated here; this fixture
+                    # never owns an actual device graph to reset.
+                    self.backend.runtime.synchronize()
+                    context.dispose_after_drain(graph_destroyed=True)
+                elif not context._closed:
+                    context.abort()
+                self.backend.runtime._context = None
             self.backend.runtime.close()
         else:
             self.backend.close_unbound()
@@ -401,9 +428,7 @@ class NpuBackendAssemblyTests(unittest.TestCase):
                         for _, result, _ in assembly.builds
                     )
                 )
-                self.assertEqual(
-                    assembly.host_arguments["source_location"], "unregistered"
-                )
+                self.assertEqual(assembly.host_arguments["source_location"], "host")
                 self.assertIs(
                     assembly.host_arguments["module"], assembly.backend.native_acl
                 )
@@ -433,7 +458,8 @@ class NpuBackendAssemblyTests(unittest.TestCase):
                 runtime = assembly.finalize()
                 context = runtime._new_context(Phase.PREFILL)
                 runtime._context = context
-                pipeline = runtime.pipelines[1]
+                self.assertEqual(len(runtime.pipelines), 1)
+                pipeline = runtime.pipelines[0]
                 access = pipeline.access
                 leases = []
                 for expert in range(2):

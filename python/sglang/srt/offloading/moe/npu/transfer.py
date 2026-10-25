@@ -322,6 +322,145 @@ class MemFabricCopyComponent:
                 raise ValueError("Component exceeds its physical storage capacity")
 
 
+def _ranges_overlap(first, second):
+    """Check two physical interval sets once, without a Cartesian product."""
+    first = sorted(r for r in first if r[0] < r[1])
+    second = sorted(r for r in second if r[0] < r[1])
+    i = j = 0
+    while i < len(first) and j < len(second):
+        if _overlap(first[i], second[j]):
+            return True
+        if first[i][1] <= second[j][0]:
+            i += 1
+        else:
+            j += 1
+    return False
+
+
+class MemFabricAddressCatalog:
+    """Shared immutable address tables and certified allocation owners.
+
+    Source tables are uploaded once per arena. Destination tables and alias
+    validation are cached by their physical view, independently of wave scratch.
+    Finish binding before capture; allocations() reports each table exactly once.
+    """
+
+    def __init__(self, components, *, device, name="moe.addresses"):
+        import torch
+
+        self.device = torch.device(device)
+        if self.device.type != "npu" or self.device.index is None:
+            raise ValueError("MemFabric requires an explicit NPU device index")
+        self.components = tuple(components)
+        if not self.components:
+            raise ValueError("At least one complete-bundle component is required")
+        self.name = name
+        self.host_count = len(self.components[0].host_sources)
+        self.hot_count = len(self.components[0].hot_sources)
+        self._tensors = []
+        self._destinations = {}
+        self._sealed = False
+        self._host_ranges, self._hot_ranges = [], []
+        tables = []
+        for component in self.components:
+            if (len(component.host_sources), len(component.hot_sources)) != (
+                self.host_count,
+                self.hot_count,
+            ):
+                raise ValueError("Components must describe the same source counts")
+            for region in component.hot_sources:
+                if torch.device(region.device) != self.device:
+                    raise ValueError("Source region is on a different device")
+            host = [
+                s.device_pointer(s.host_address, component.nbytes)
+                for s in component.host_sources
+            ]
+            hot = [s.address for s in component.hot_sources]
+            self._host_ranges.extend(_range(p, component.nbytes) for p in host)
+            self._hot_ranges.extend(_range(p, component.nbytes) for p in hot)
+            tables.append((self._table(host), self._table(hot)))
+        self.source_tables = tuple(tables)
+
+    def _table(self, pointers):
+        import torch
+
+        # Sentinel zero makes invalid gathers safe before fault gating.
+        value = torch.tensor([0] + pointers, dtype=torch.int64, device=self.device)
+        self._tensors.append(value)
+        return value
+
+    def bind(self, components):
+        import torch
+
+        components = tuple(components)
+        if len(components) != len(self.components):
+            raise ValueError("Transfer components differ from the address catalog")
+        count = len(components[0].destinations)
+        for component, source in zip(components, self.components):
+            if (
+                component.name != source.name
+                or component.nbytes != source.nbytes
+                or component.host_sources != source.host_sources
+                or component.hot_sources != source.hot_sources
+            ):
+                raise ValueError("Transfer sources differ from the address catalog")
+            if len(component.destinations) != count:
+                raise ValueError("Components must describe the same destination count")
+            for region in component.destinations:
+                if torch.device(region.device) != self.device:
+                    raise ValueError("Destination region is on a different device")
+        # Pointers identify live allocations: the cached owners prevent address
+        # reuse, even when another bank view has a different Python identity.
+        key = tuple(
+            tuple((r.address, r.nbytes) for r in c.destinations) for c in components
+        )
+        cached = self._destinations.get(key)
+        if cached is None:
+            if self._sealed:
+                raise RuntimeError(
+                    "Address catalog is sealed; bind views before capture"
+                )
+            ranges = [
+                _range(r.address, c.nbytes) for c in components for r in c.destinations
+            ]
+            _reject_overlapping(ranges)
+            if _ranges_overlap(self._host_ranges, ranges):
+                raise ValueError("Mapped immutable host storage overlaps a destination")
+            aliases_hot = _ranges_overlap(self._hot_ranges, ranges)
+            tables = tuple(
+                self._table([r.address for r in c.destinations]) for c in components
+            )
+            # Keep destination allocation owners until all graphs are retired.
+            cached = tables, aliases_hot, components
+            self._destinations[key] = cached
+        destination_tables, aliases_hot, _ = cached
+        return (
+            tuple(
+                (host, hot, destination)
+                for (host, hot), destination in zip(
+                    self.source_tables, destination_tables
+                )
+            ),
+            aliases_hot,
+        )
+
+    def seal(self):
+        """Freeze physical table allocations before ledger creation and capture."""
+        self._sealed = True
+
+    def allocations(self):
+        return tuple(
+            Allocation(
+                f"{self.name}.{index}",
+                ResourceKind.METADATA,
+                value.untyped_storage().nbytes(),
+                (str(value.device), value.untyped_storage().data_ptr()),
+                self,
+            )
+            for index, value in enumerate(self._tensors)
+        )
+
+
 class MemFabricTransferBindings:
     """Prebind address tables and native metadata; never construct during replay.
 
@@ -340,6 +479,7 @@ class MemFabricTransferBindings:
         device,
         max_batch_entries=256,
         name=None,
+        address_catalog=None,
     ):
         import torch
 
@@ -378,43 +518,15 @@ class MemFabricTransferBindings:
             [0] * (self.destination_count + 1), torch.int64
         )
         self.mask = tensor([False] * capacity, torch.bool)
-        self.tables = []
+        self._owns_catalog = address_catalog is None
+        self.address_catalog = address_catalog or MemFabricAddressCatalog(
+            self.components, device=self.device, name=self.name + ".addresses"
+        )
+        if self.address_catalog.device != self.device:
+            raise ValueError("Address catalog is on a different device")
+        self.tables, self.hot_targets_alias = self.address_catalog.bind(self.components)
         self.batches = []
-        destination_ranges, host_ranges, hot_ranges = [], [], []
         for component in self.components:
-            if (
-                len(component.host_sources) != self.host_count
-                or len(component.hot_sources) != self.hot_count
-                or len(component.destinations) != self.destination_count
-            ):
-                raise ValueError(
-                    "All components must describe the same expert/slot counts"
-                )
-            for region in component.hot_sources + component.destinations:
-                if torch.device(region.device) != self.device:
-                    raise ValueError(
-                        "All component regions must reside on the bound device"
-                    )
-            host = [
-                s.device_pointer(s.host_address, component.nbytes)
-                for s in component.host_sources
-            ]
-            hot = [s.address for s in component.hot_sources]
-            destinations = [s.address for s in component.destinations]
-            for pointer in host + hot + destinations:
-                _range(pointer, component.nbytes)
-            host_ranges.extend(_range(p, component.nbytes) for p in host)
-            hot_ranges.extend(_range(p, component.nbytes) for p in hot)
-            destination_ranges.extend(_range(p, component.nbytes) for p in destinations)
-            # A zero sentinel supports empty source pools and invalid device indices
-            # without an out-of-bounds gather before fault gating.
-            self.tables.append(
-                (
-                    tensor([0] + host, torch.int64),
-                    tensor([0] + hot, torch.int64),
-                    tensor([0] + destinations, torch.int64),
-                )
-            )
             component_batches = []
             for begin in range(0, capacity, max_batch_entries):
                 size = min(max_batch_entries, capacity - begin)
@@ -435,14 +547,6 @@ class MemFabricTransferBindings:
                     )
                 )
             self.batches.append(tuple(component_batches))
-        _reject_overlapping(destination_ranges)
-        if any(_overlap(h, d) for h in host_ranges for d in destination_ranges):
-            raise ValueError("Mapped immutable host storage overlaps a destination")
-        # Tail hot-set updates use HOST only. If targets alias the hot arena, any
-        # HOT_SLOT copy is conservatively rejected to prevent batch copy cycles.
-        self.hot_targets_alias = any(
-            _overlap(h, d) for h in hot_ranges for d in destination_ranges
-        )
 
     def _validate_tensor(self, value, shape, dtype):
         if value.shape != shape or value.dtype != dtype or value.device != self.device:
@@ -469,7 +573,7 @@ class MemFabricTransferBindings:
 
     def allocations(self):
         """Native tables/scratch only; owners count weights and canonical state."""
-        return tuple(
+        scratch = tuple(
             Allocation(
                 f"{self.name}.metadata.{index}",
                 ResourceKind.METADATA,
@@ -479,6 +583,9 @@ class MemFabricTransferBindings:
             )
             for index, value in enumerate(self._tensors)
             if value.untyped_storage().nbytes()
+        )
+        return scratch + (
+            self.address_catalog.allocations() if self._owns_catalog else ()
         )
 
 

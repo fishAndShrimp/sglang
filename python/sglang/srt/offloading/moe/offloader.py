@@ -3,36 +3,13 @@
 import logging
 
 from ..base import BaseOffloader
-from .config import ExpertCatalog, ExpertLayerSpec
+from .config import ExpertCatalog
+from .models import DeepSeekV4Adapter
 from .owner import MoEOffloadOwner
 from .periodic_lfu import PeriodicLFUPolicy
 from .policy import TensorLFUPolicy
 
 logger = logging.getLogger(__name__)
-
-
-class DeepSeekV4Adapter:
-    def describe(self, layer):
-        mlp = getattr(layer, "mlp", None)
-        if mlp is None or not getattr(mlp, "is_deepseek_v4", False):
-            raise ValueError("Initial MoE offload adapter requires DeepSeek V4 layers")
-        experts = mlp.experts
-        if experts.moe_tp_size != 1:
-            raise ValueError("MoE TP is not supported")
-        if getattr(mlp, "is_nextn", False):
-            raise ValueError("Speculative/MTP experts are not supported")
-        if getattr(experts, "num_fused_shared_experts", 0):
-            raise ValueError("Keep shared experts separate and resident")
-        spec = ExpertLayerSpec(
-            layer_id=mlp.layer_id,
-            global_experts=experts._num_global_routed,
-            ep_size=experts.moe_ep_size,
-            ep_rank=experts.moe_ep_rank,
-            resident=mlp.layer_id < 3 or getattr(mlp, "is_hash", False),
-        )
-        if experts._num_local_routed != spec.local_experts:
-            raise ValueError("Elastic/remapped EP ownership is not supported")
-        return spec
 
 
 class MoEOffloaderV2(BaseOffloader):
@@ -49,7 +26,16 @@ class MoEOffloaderV2(BaseOffloader):
             raise ValueError("Supply either policy or periodic_lfu_config, not both")
         self.config = config
         self.backend = backend
-        self.adapter = adapter or DeepSeekV4Adapter()
+        bound_adapter = getattr(backend, "model_adapter", None)
+        if (
+            adapter is not None
+            and bound_adapter is not None
+            and adapter is not bound_adapter
+        ):
+            raise ValueError(
+                "Use the backend's model adapter for registration and loading"
+            )
+        self.adapter = adapter or bound_adapter or DeepSeekV4Adapter()
         self.policy = policy or TensorLFUPolicy()
         self.periodic_lfu_config = periodic_lfu_config
         self.owner = None
@@ -71,6 +57,7 @@ class MoEOffloaderV2(BaseOffloader):
         if submodule_accessor is not None or whitelist_param_names_creator is not None:
             raise ValueError("MoE registration uses expert formats, not V2 whitelists")
         modules, specs, offloaded = [], [], []
+        model_plan = getattr(self.backend, "model_plan", None)
         try:
             for module in all_modules_generator:
                 spec = self.adapter.describe(module)
@@ -79,6 +66,10 @@ class MoEOffloaderV2(BaseOffloader):
                     self.config.ep_rank,
                 ):
                     raise ValueError("Model and offloader EP topology disagree")
+                if model_plan is not None and model_plan.layer(spec.layer_id) != spec:
+                    raise ValueError(
+                        "Constructed expert layer differs from the model plan"
+                    )
                 if any(existing.layer_id == spec.layer_id for existing in specs):
                     raise ValueError("Duplicate expert layer")
                 specs.append(spec)
@@ -96,11 +87,16 @@ class MoEOffloaderV2(BaseOffloader):
                     offloaded.append((module, spec))
                 modules.append(module)
             self._catalog = ExpertCatalog(tuple(specs))
+            if model_plan is not None and self._catalog != model_plan:
+                raise ValueError(
+                    "Constructed expert catalog differs from the model plan"
+                )
             if not self._catalog.num_experts:
                 raise ValueError("No eligible routed experts to offload")
             self._layers = tuple(offloaded)
         except BaseException:
             self._failed = True
+            self.backend.close_unbound()
             raise
         return modules
 
@@ -138,9 +134,10 @@ class MoEOffloaderV2(BaseOffloader):
         except BaseException:
             self._failed = True
             if runtime is not None:
-                runtime.synchronize()
                 runtime.close()
                 self._runtime = None
+            else:
+                self.backend.close_unbound()
             raise
 
     def bind_model_runner(self, model_runner):
@@ -161,6 +158,10 @@ class MoEOffloaderV2(BaseOffloader):
             logger.info("MoE offload model hooks bound: rank=%s", self.config.ep_rank)
         except BaseException:
             self._failed = True
+            # Binding is part of startup. A failed hook transaction must also
+            # retire the already-finalized native resources. Failed drain keeps
+            # the owner/runtime reachable for an explicit close retry.
+            self.close()
             raise
 
     def bind_graph_backend(self, backend, graph_runner):
@@ -188,7 +189,6 @@ class MoEOffloaderV2(BaseOffloader):
         if self.owner is not None:
             self.owner.close()
         elif self._runtime is not None:
-            self._runtime.synchronize()
             self._runtime.close()
         else:
             self.backend.close_unbound()

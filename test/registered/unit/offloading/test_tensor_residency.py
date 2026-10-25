@@ -53,6 +53,7 @@ class Context:
 
     def __init__(self):
         self.calls, self.retained = [], []
+        self.invocation_id = object()
 
     def retain(self, resource):
         self.retained.append(resource)
@@ -96,6 +97,73 @@ def load_hot(state, keys):
 
 
 class TestTensorResidency(unittest.TestCase):
+    def test_policy_gate_is_latched_before_policy_reuses_due(self):
+        ops, state, _, ctx = setup()
+        state.update_enabled.fill_(True)
+        load_hot(state, [1, 5, 9])
+        due = torch.tensor(True)
+        update = ops.prepare_update(torch.tensor([1, 2, 9]), ctx, update_enabled=due)
+        due.zero_()
+        ops.commit_update(update, ctx.copied(), ctx)
+        self.assertEqual(state.slot_to_key.tolist(), [1, 2, 9])
+        self.assertEqual(state.slot_generation.tolist(), [5, 7, 7])
+
+    def test_false_policy_gate_ignores_stale_targets_and_preserves_generation(self):
+        ops, state, _, ctx = setup()
+        state.update_enabled.fill_(True)
+        load_hot(state, [1, 5, 9])
+        before = {name: value.clone() for name, value in vars(state).items()}
+        update = ops.prepare_update(
+            torch.tensor([99, 99, -2]), ctx, update_enabled=torch.tensor(False)
+        )
+        self.assertEqual(int(update.copy_plan.count), 0)
+        self.assertFalse(bool(update.copy_plan.valid.any()))
+        ops.commit_update(update, ctx.copied(), ctx)
+        for name, value in before.items():
+            torch.testing.assert_close(getattr(state, name), value)
+        self.assertEqual(int(ops.error_status), 0)
+        self.assertNotIn("tail.target", ops._owned)
+
+    def test_live_execution_bank_cannot_be_replanned_or_evicted(self):
+        # Migrated from the retired cache integration stack: native production
+        # residency must enforce exactly the same reader ownership contract.
+        ops, state, waves, ctx = setup()
+        request = ExecutionRequest(
+            3, torch.ones(7, dtype=torch.int64), waves[0], Phase.DECODE
+        )
+        reservation = ops.resolve_execution(request, ctx)
+        with self.assertRaisesRegex(RuntimeError, "Retire"):
+            ops.resolve_execution(request, ctx)
+        with self.assertRaisesRegex(RuntimeError, "Retire"):
+            ops.prepare_update(state.slot_to_key, ctx)
+        with self.assertRaisesRegex(RuntimeError, "Retire"):
+            ops.begin_step(ctx)
+        ops.publish_execution(reservation, ctx.copied(), ctx)
+        ops.finish_execution(reservation, ctx.copied(), ctx)
+        ops.begin_step(ctx)
+
+    def test_hot_update_joins_auxiliary_readers_before_invalidating_sources(self):
+        ops, state, waves, ctx = setup()
+        state.update_enabled.fill_(True)
+        load_hot(state, [1, 5, 9])
+        reservation = ops.resolve_execution(
+            ExecutionRequest(
+                3, torch.ones(7, dtype=torch.int64), waves[0], Phase.DECODE
+            ),
+            ctx,
+        )
+        ops.publish_execution(reservation, ctx.copied(), ctx)
+        ops.finish_execution(
+            reservation, TransferTicket(Fence(ctx.calls, "aux-reader")), ctx
+        )
+        before = len(ctx.calls)
+        update = ops.prepare_update(torch.tensor([1, 2, 9]), ctx)
+        self.assertEqual(ctx.calls[before], ("wait", "aux-reader", "compute"))
+        self.assertTrue(update.plan_covers_compute_frontier)
+        self.assertTrue(reservation.plan_covers_compute_frontier)
+        self.assertEqual(len(update.copy_dependencies), 1)
+        ops.commit_update(update, ctx.copied(), ctx)
+
     def test_mixed_sources_and_counts_come_from_post_dispatch(self):
         ops, state, waves, ctx = setup()
         load_hot(state, [1, 5, 9])
@@ -235,6 +303,7 @@ class TestTensorResidency(unittest.TestCase):
         ops.publish_execution(reservation, ctx.copied(), ctx)
         self.assertFalse(state.execution_valid.any())
         self.assertEqual(state.execution_key.tolist(), [-1, -1, -1])
+        ops.finish_execution(reservation, ctx.copied(), ctx)
         ops.error_status.zero_()
         update = ops.prepare_update(torch.tensor([1, 2, 9]), ctx)
         ops.error_status.fill_(1)

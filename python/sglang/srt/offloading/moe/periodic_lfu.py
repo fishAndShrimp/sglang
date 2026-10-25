@@ -109,13 +109,16 @@ class PeriodicLFUPolicy(CachePolicy):
             update_due=torch.zeros((), dtype=torch.bool, device=device),
         )
 
-    def update_statistics(self, state, step_counts, update_enabled):
+    def observe(self, state, step_counts, update_enabled, due_out):
         import torch
 
         next_step = (state.step_mod + 1).remainder(self.config.update_interval)
         state.usage.add_(torch.where(update_enabled, step_counts, 0))
         state.step_mod.copy_(torch.where(update_enabled, next_step, state.step_mod))
         state.update_due.copy_(update_enabled & (next_step == 0))
+        # The public transaction gate must survive finish_step clearing the
+        # policy's private flag; the caller owns this separate fixed address.
+        due_out.copy_(state.update_due)
 
     def select_hot_set(self, state, key_to_slot, target_keys):
         import torch

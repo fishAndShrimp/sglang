@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+from types import MappingProxyType
 from typing import Optional, Tuple
 
 
@@ -83,6 +84,10 @@ class ExpertLayerSpec:
 @dataclass(frozen=True)
 class ExpertCatalog:
     layers: Tuple[ExpertLayerSpec, ...]
+    _offloaded: tuple = field(init=False, repr=False, compare=False)
+    _by_layer: object = field(init=False, repr=False, compare=False)
+    _offsets: object = field(init=False, repr=False, compare=False)
+    _num_experts: int = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
         if len({layer.layer_id for layer in self.layers}) != len(self.layers):
@@ -92,24 +97,38 @@ class ExpertCatalog:
         object.__setattr__(
             self, "layers", tuple(sorted(self.layers, key=lambda x: x.layer_id))
         )
+        offloaded = tuple(layer for layer in self.layers if not layer.resident)
+        offsets, count = {}, 0
+        for layer in offloaded:
+            offsets[layer.layer_id] = count
+            count += layer.local_experts
+        object.__setattr__(self, "_offloaded", offloaded)
+        object.__setattr__(
+            self, "_by_layer", MappingProxyType({s.layer_id: s for s in self.layers})
+        )
+        object.__setattr__(self, "_offsets", MappingProxyType(offsets))
+        object.__setattr__(self, "_num_experts", count)
 
     @property
     def offloaded_layers(self):
-        return tuple(layer for layer in self.layers if not layer.resident)
+        return self._offloaded
 
     @property
     def num_experts(self):
-        return sum(layer.local_experts for layer in self.offloaded_layers)
+        return self._num_experts
+
+    def layer(self, layer_id):
+        try:
+            return self._by_layer[layer_id]
+        except KeyError:
+            raise ValueError("Unregistered expert layer") from None
 
     def key(self, layer_id, local_id):
-        offset = 0
-        for layer in self.offloaded_layers:
-            if layer.layer_id == layer_id:
-                if not 0 <= local_id < layer.local_experts:
-                    raise ValueError("Invalid rank-local expert ID")
-                return offset + local_id
-            offset += layer.local_experts
-        raise ValueError("Layer is resident or unregistered")
+        if layer_id not in self._offsets:
+            raise ValueError("Layer is resident or unregistered")
+        if not 0 <= local_id < self._by_layer[layer_id].local_experts:
+            raise ValueError("Invalid rank-local expert ID")
+        return self._offsets[layer_id] + local_id
 
 
 @dataclass(frozen=True)

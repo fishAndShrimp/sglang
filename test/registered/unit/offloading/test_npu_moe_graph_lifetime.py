@@ -4,6 +4,8 @@ import ast
 import sys
 import unittest
 from contextlib import nullcontext
+from functools import wraps
+from threading import RLock
 from pathlib import Path
 from types import MethodType, ModuleType, SimpleNamespace
 from unittest.mock import patch
@@ -31,6 +33,7 @@ class TestNPUMoEGraphLifetime(unittest.TestCase):
             if isinstance(n, ast.FunctionDef) and n.name == "__init__"
         )
         namespace = {
+            "RLock": RLock,
             "ThreadPoolExecutor": lambda **kwargs: None,
             "get_parallel": lambda: SimpleNamespace(tp_group=None),
             "TorchMemorySaverAdapter": SimpleNamespace(create=lambda **kwargs: None),
@@ -73,7 +76,7 @@ class TestNPUMoEGraphLifetime(unittest.TestCase):
             n
             for n in cls.body
             if isinstance(n, ast.FunctionDef)
-            and n.name in ("capture_one", "can_run", "cleanup")
+            and n.name in ("capture_one", "can_run", "cleanup", "stop_submissions")
         ]
         log = []
         graphs = {}
@@ -98,7 +101,16 @@ class TestNPUMoEGraphLifetime(unittest.TestCase):
         npu = SimpleNamespace(
             NPUGraph=Graph, graph=lambda *args, **kwargs: nullcontext()
         )
-        namespace = {"torch": SimpleNamespace(npu=npu), "empty_context": nullcontext}
+        namespace = {
+            "torch": SimpleNamespace(npu=npu),
+            "empty_context": nullcontext,
+            "wraps": wraps,
+        }
+        submission = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "_submission"
+        )
         # Postponed annotations avoid importing graph runner/typing dependencies.
         future = ast.ImportFrom(
             module="__future__", names=[ast.alias(name="annotations")], level=0
@@ -106,7 +118,7 @@ class TestNPUMoEGraphLifetime(unittest.TestCase):
         exec(
             compile(
                 ast.fix_missing_locations(
-                    ast.Module(body=[future] + methods, type_ignores=[])
+                    ast.Module(body=[future, submission] + methods, type_ignores=[])
                 ),
                 str(source),
                 "exec",
@@ -114,6 +126,8 @@ class TestNPUMoEGraphLifetime(unittest.TestCase):
             namespace,
         )
         backend = SimpleNamespace(
+            _submission_lock=RLock(),
+            _submissions_closed=False,
             _graphs=graphs,
             _pending_graphs={},
             _outputs={},
@@ -128,15 +142,15 @@ class TestNPUMoEGraphLifetime(unittest.TestCase):
             ),
         )
         for name, method in namespace.items():
-            if name in ("capture_one", "can_run", "cleanup"):
+            if name in ("capture_one", "can_run", "cleanup", "stop_submissions"):
                 setattr(backend, name, MethodType(method, backend))
         backend.capture_session = lambda stream: nullcontext()
         owner = Owner(log)
         owner.runtime.synchronize = lambda: log.append("owner_drain")
         original_acquire = owner.acquire_graph
 
-        def acquire(key):
-            original = original_acquire(key)
+        def acquire(key, *, capture_identity=None):
+            original = original_acquire(key, capture_identity=capture_identity)
             lease = Lease()
             close = lease.close
 
@@ -159,6 +173,7 @@ class TestNPUMoEGraphLifetime(unittest.TestCase):
         self.assertEqual(len(owner.graphs), 1)
         self.assertEqual(log.count("lease_close"), 0)
         wrapper.cleanup()
+        self.assertLess(log.index("shutdown"), log.index("owner_drain"))
         self.assertLess(log.index("shutdown"), log.index("graph_destroy"))
         self.assertLess(log.index("owner_drain"), log.index("graph_reset"))
         self.assertLess(log.index("graph_destroy"), log.index("lease_close"))

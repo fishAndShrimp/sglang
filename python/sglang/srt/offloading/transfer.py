@@ -64,10 +64,28 @@ class TransferTicket:
 
 
 class JoinedCompletion(Completion):
-    """Join dependencies without inventing a host-side completion signal."""
+    """Join unique completion facts without adding host synchronization.
+
+    Flatten only our own aggregates. Distinct events are preserved even when
+    they name the same stream; their submission order is not implied here.
+    """
 
     def __init__(self, completions):
-        self.completions = tuple(completions)
+        pending, unique, seen = list(reversed(tuple(completions))), [], set()
+        while pending:
+            completion = pending.pop()
+            if type(completion) is JoinedCompletion:
+                pending.extend(reversed(completion.completions))
+                continue
+            key = (
+                (EventCompletion, id(completion.event))
+                if type(completion) is EventCompletion
+                else (type(completion), id(completion))
+            )
+            if key not in seen:
+                seen.add(key)
+                unique.append(completion)
+        self.completions = tuple(unique)
 
     def wait_on(self, stream):
         for completion in self.completions:

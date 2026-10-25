@@ -45,7 +45,7 @@ class TestMoEWarmupLifetime(unittest.TestCase):
             ),
             snapshot=None,
             reload_weights=None,
-            layer_programs={3: object()},
+            layer_programs={3: SimpleNamespace(prefill=object(), decode=object())},
             resources=(),
             expert_nbytes=1,
             storage=(),
@@ -94,7 +94,6 @@ class TestMoEWarmupLifetime(unittest.TestCase):
                 )
         self.assertEqual(len(resets), 4)
         wrapper.cleanup()
-        gc.collect()
         self.assertTrue(all(ref() is None for ref in references))
 
     def test_failed_drain_keeps_warmup_and_previously_captured_resources(self):
@@ -134,7 +133,9 @@ class TestMoEWarmupLifetime(unittest.TestCase):
         reference = weakref.ref(payload)
         context.retain(payload)
         context.retain(SimpleNamespace(context=context))
-        context.retain(TransferTicket(completion))
+        ticket = TransferTicket(completion)
+        context.retain(ticket)
+        context.register_completion(ticket)
         del payload
         with self.assertRaisesRegex(RuntimeError, "Finish the invocation"):
             context.release_completed()

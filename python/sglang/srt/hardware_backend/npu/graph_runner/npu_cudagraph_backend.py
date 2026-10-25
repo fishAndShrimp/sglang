@@ -14,7 +14,8 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
-from functools import partial
+from functools import partial, wraps
+from threading import RLock
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import numpy as np
@@ -39,6 +40,17 @@ if TYPE_CHECKING:
     )
 
 
+def _submission(method):
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        with self._submission_lock:
+            if self._submissions_closed:
+                raise RuntimeError("NPU graph submissions have been stopped")
+            return method(self, *args, **kwargs)
+
+    return call
+
+
 class NPUCudaGraphBackend(BaseCudaGraphBackend):
     """One torch.npu.NPUGraph per shape; attention metadata captured
     inside the graph. replay_with_input_update substitutes fresh
@@ -51,6 +63,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         enable_memory_saver: bool = False,
     ) -> None:
         self._graphs: Dict[Any, Any] = {}
+        self._submission_lock = RLock()
+        self._submissions_closed = False
         self._pending_graphs: Dict[Any, Any] = {}
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
@@ -78,15 +92,19 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
     @contextmanager
     def capture_session(self, stream):
-        if self._pool is None:
-            self._pool = self._device_module.graph_pool_handle()
-        set_graph_pool_id(self._pool)
-        self._capture_stream = stream
-        try:
-            yield
-        finally:
-            self._capture_stream = None
+        with self._submission_lock:
+            if self._submissions_closed:
+                raise RuntimeError("NPU graph submissions have been stopped")
+            if self._pool is None:
+                self._pool = self._device_module.graph_pool_handle()
+            set_graph_pool_id(self._pool)
+            self._capture_stream = stream
+            try:
+                yield
+            finally:
+                self._capture_stream = None
 
+    @_submission
     def capture_one(
         self,
         shape_key: ShapeKey,
@@ -141,12 +159,13 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._outputs[shape_key] = out
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
-        return shape_key in self._graphs
+        return not self._submissions_closed and shape_key in self._graphs
 
     @contextmanager
     def replay_session(self):
         yield
 
+    @_submission
     def replay(
         self,
         shape_key: ShapeKey,
@@ -156,6 +175,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._graphs[shape_key].replay()
         return self._outputs[shape_key]
 
+    @_submission
     def replay_with_input_update(
         self,
         shape_key: ShapeKey,
@@ -209,8 +229,15 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             )
         self.cleanup()
 
+    def stop_submissions(self) -> None:
+        """Join host graph updates before the owner's final device drain."""
+        with self._submission_lock:
+            self._submissions_closed = True
+            # shutdown is idempotent, including cleanup/reset failure retries.
+            self._update_executor.shutdown(wait=True, cancel_futures=True)
+
     def cleanup(self) -> None:
-        self._update_executor.shutdown(wait=True, cancel_futures=True)
+        self.stop_submissions()
         for graph in (*self._graphs.values(), *self._pending_graphs.values()):
             reset = getattr(graph, "reset", None)
             if callable(reset):

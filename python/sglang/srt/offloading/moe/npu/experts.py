@@ -241,12 +241,6 @@ class NPUOffloadDispatcher(MoEDispatcher):
     @staticmethod
     def _combine_input(raw, hidden_states):
         name = _format_name(raw)
-        if name == "ascend_tp":
-            from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
-                AscendTPCombineInput,
-            )
-
-            return AscendTPCombineInput(hidden_states)
         from sglang.srt.layers.moe.token_dispatcher.deepep import (
             DeepEPLLCombineInput,
             DeepEPNormalCombineInput,
@@ -377,8 +371,6 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
             )
         elif name == "deepep_ll":
             source = raw.masked_m
-        elif name == "ascend_tp" and raw.group_list_type == 1:
-            source = raw.expert_tokens
         else:
             raise ValueError("Unsupported NPU dispatch layout or count convention")
         if (

@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
-from functools import wraps
 
 from ...transfer import EventCompletion, TransferTicket
 from ..config import Phase
-from ..interfaces import BoundMoERuntime, RuntimeCapabilities
+from ..interfaces import RuntimeCapabilities
+from ..programs import LayerProgramTable
 from ..resources import Allocation, AllocationLedger, ResourceKind
-from ..runtime import ManagedExecutionContext
+from ..runtime import InvocationRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -60,22 +60,7 @@ class NpuDeviceRuntime:
         return self.torch.npu.max_memory_allocated(self.device)
 
 
-class _LayerProgramMap:
-    def __init__(self, runtime, phase):
-        self.runtime, self.phase = runtime, phase
-
-    def layer_start(self, layer_id, context):
-        programs = self.runtime.layer_programs[layer_id]
-        program = programs.prefill if self.phase is Phase.PREFILL else programs.decode
-        program.layer_start(layer_id, context)
-
-    def run(self, layer, hidden_states, routing, context):
-        programs = self.runtime.layer_programs[layer]
-        program = programs.prefill if self.phase is Phase.PREFILL else programs.decode
-        return program.run(layer, hidden_states, routing, context)
-
-
-class NpuBoundMoERuntime(BoundMoERuntime):
+class NpuBoundMoERuntime(InvocationRuntime):
     """Concrete lifecycle around statically assembled Ascend layer programs.
 
     Capabilities describe the emitted full-graph path. Startup capture still has
@@ -119,17 +104,14 @@ class NpuBoundMoERuntime(BoundMoERuntime):
         self.storage = tuple(storage)
         self.pipelines = tuple(pipelines)
         self._release = release
-        self.prefill_program = _LayerProgramMap(self, Phase.PREFILL)
-        self.decode_program = _LayerProgramMap(self, Phase.DECODE)
-        self._context = None
-        self._step_started = False
-        self._capture = None
-        self._hooks = []
-        self._method_hooks = []
-        self._experts = []
-        self._failed_contexts = []
-        self._transition_contexts = []
-        self._closed = False
+        self.prefill_program = LayerProgramTable(
+            {layer: programs.prefill for layer, programs in self.layer_programs.items()}
+        )
+        self.decode_program = LayerProgramTable(
+            {layer: programs.decode for layer, programs in self.layer_programs.items()}
+        )
+        self._model_binding = None
+        self._initialize_lifecycle()
         self._installed = False
         self._owner = None
         self._static_allocated = None
@@ -171,7 +153,7 @@ class NpuBoundMoERuntime(BoundMoERuntime):
             raise RuntimeError(
                 "Device residency/transfer fault during cache initialization"
             )
-        self._transition_contexts.clear()
+        self.retire_transitions()
         self._cache_initialized = True
         logger.info(
             "MoE offload initial cache ready: slots=%s layers=%s",
@@ -179,64 +161,18 @@ class NpuBoundMoERuntime(BoundMoERuntime):
             len(self.layer_programs),
         )
 
-    def _new_context(self, phase, *, stream=None, capturing=False):
-        context = ManagedExecutionContext(
-            phase,
-            compute_stream=stream or self.device_runtime.current_stream(),
-            copy_stream=self.device_runtime.copy_stream,
-            record_completion=self.device_runtime.record,
-            failure_drain=self.synchronize,
-            capturing=capturing,
-        )
-        context.started_layers = set()
-        return context
-
-    def _require_open(self):
-        if self._closed:
-            raise RuntimeError("MoE runtime is closed")
-
-    @property
-    def context(self):
-        self._require_open()
-        if self._context is None:
-            raise RuntimeError("MoE execution requires a forward or capture scope")
-        return self._context
-
     def install_model_hooks(self, offloader, model_runner):
         self._require_open()
         if self._installed:
             raise RuntimeError("Model hooks are already installed")
         self._owner = offloader.owner
-        found = {}
-        # register_forward_pre_hook runs before Router, allowing eager H2D/D
-        # overlap. Routed experts enter through FusedMoE.forward_impl below.
         try:
-            for module in model_runner.model.modules():
-                mlp = getattr(module, "mlp", None)
-                layer_id = getattr(mlp, "layer_id", None)
-                experts = getattr(mlp, "experts", None)
-                if layer_id not in self.layer_programs or experts is None:
-                    continue
-                if not getattr(mlp, "is_deepseek_v4", False):
-                    continue
-                if layer_id in found:
-                    raise ValueError("Duplicate V4 MoE layer hooks")
-                if getattr(experts, "_moe_offload_runtime", None) is not None:
-                    raise ValueError("Experts already belong to another offloader")
-                found[layer_id] = module
-                direct = getattr(module, "forward_hc_pre_from_prev", None)
-                if direct is not None:
-                    self._wrap_direct_layer_entry(module, layer_id, direct)
-                experts._moe_offload_runtime = self
-                self._experts.append(experts)
-                self._hooks.append(
-                    module.register_forward_pre_hook(self._layer_start_hook(layer_id))
-                )
-            if set(found) != set(self.layer_programs):
-                raise ValueError("Model does not contain every bound V4 MoE layer")
+            self._model_binding = offloader.adapter.bind_entries(
+                self, offloader._layers
+            )
+            self._runner = model_runner
             model_runner.capture_head_hooks.append(self._capture_head)
             model_runner.capture_tail_hooks.append(self._capture_tail)
-            self._runner = model_runner
             self._installed = True
         except BaseException:
             self._remove_hooks()
@@ -248,29 +184,6 @@ class NpuBoundMoERuntime(BoundMoERuntime):
         if layer_id not in context.started_layers:
             self.emit_layer_start(layer_id, context)
             context.started_layers.add(layer_id)
-
-    def _layer_start_hook(self, layer_id):
-        def hook(module, args):
-            self._enter_layer(layer_id)
-
-        return hook
-
-    def _wrap_direct_layer_entry(self, module, layer_id, original):
-        # NPU V4 calls this method directly, bypassing nn.Module.__call__ hooks.
-        # Keep the signature and restore the original instance/class lookup at
-        # teardown. The per-context set prevents duplicate starts if __call__
-        # delegates to the same method on another model path.
-        name = "forward_hc_pre_from_prev"
-        had_instance = name in module.__dict__
-        previous = module.__dict__.get(name)
-
-        @wraps(original)
-        def wrapped(*args, **kwargs):
-            self._enter_layer(layer_id)
-            return original(*args, **kwargs)
-
-        self._method_hooks.append((module, name, had_instance, previous))
-        setattr(module, name, wrapped)
 
     def _ensure_step(self):
         context = self.context
@@ -403,9 +316,11 @@ class NpuBoundMoERuntime(BoundMoERuntime):
                         phase,
                         token.sequence,
                         forward_batch,
-                        bucket=getattr(runner, "bs", None)
-                        if phase is Phase.DECODE
-                        else None,
+                        bucket=(
+                            getattr(runner, "bs", None)
+                            if phase is Phase.DECODE
+                            else None
+                        ),
                     )
                     context.retain(record)
                 except Exception:
@@ -502,7 +417,7 @@ class NpuBoundMoERuntime(BoundMoERuntime):
         # next warmup/capture. Older entries may belong to captured graph buckets.
         context = self._capture[-1]
         self.synchronize()  # Includes native EP streams and partially queued work.
-        context.release_completed()
+        context.dispose_after_drain(graph_destroyed=True)
         self._capture.pop()
 
     def _account_capture_workspace(self, owner):
@@ -523,76 +438,10 @@ class NpuBoundMoERuntime(BoundMoERuntime):
         ledger = AllocationLedger(owner.allocation_ledger.limits, allocations)
         owner.allocation_ledger = ledger
 
-    def _transition(self, operation):
-        if self._context is not None:
-            raise RuntimeError("Phase transition cannot overlap a forward")
-        # The owner drained prior work before entering this transition.
-        self._transition_contexts.clear()
-        context = self._new_context(Phase.DECODE)
-        self._transition_contexts.append(context)
-        self._context = context
-        try:
-            with self.device_runtime.stream_scope(context.compute_stream):
-                ticket = operation(context)
-                completion = context.finish(residency_ready=ticket)
-            return completion.resources_idle
-        except BaseException:
-            self._failed_contexts.append(context)
-            raise
-        finally:
-            self._context = None
-
-    def snapshot_decode_state(self):
-        return self._transition(self.snapshot.save)
-
-    def borrow_hot_arena(self):
-        # Physical aliases are constructed before capture; no allocation/rebind.
-        self.residency.execution_valid.zero_()
-
-    def restore_decode_state(self):
-        ticket = self._transition(
-            lambda context: self.snapshot.restore(context, self.reload_weights)
-        )
-        # Transition tickets are synchronized by the owner. Retain their context
-        # until that fence, then release at the next transition or teardown.
-        return ticket
-
-    def synchronize(self):
-        contexts = list(self._failed_contexts)
-        if self._context is not None:
-            contexts.append(self._context)
-        abort_error = None
-        for context in {id(item): item for item in contexts}.values():
-            if context.phase is not Phase.PREFILL or context._closed:
-                continue
-            for pipeline in self.pipelines:
-                try:
-                    ticket = pipeline.abort(context)
-                    context.retain(ticket)
-                except BaseException as error:
-                    # A failed event record can follow a successful worker join.
-                    # Still stop the other submitters and attempt a device drain;
-                    # retain all resources until a later abort succeeds as well.
-                    if abort_error is None:
-                        abort_error = error
-        self.device_runtime.synchronize()
-        if abort_error is not None:
-            raise abort_error
-
     def _remove_hooks(self):
-        for hook in self._hooks:
-            hook.remove()
-        self._hooks.clear()
-        for module, name, had_instance, previous in self._method_hooks:
-            if had_instance:
-                setattr(module, name, previous)
-            else:
-                delattr(module, name)
-        self._method_hooks.clear()
-        for experts in self._experts:
-            if getattr(experts, "_moe_offload_runtime", None) is self:
-                del experts._moe_offload_runtime
-        self._experts.clear()
+        if self._model_binding is not None:
+            self._model_binding.close()
+            self._model_binding = None
         runner = getattr(self, "_runner", None)
         if runner is not None:
             for hooks, callback in (
@@ -601,26 +450,4 @@ class NpuBoundMoERuntime(BoundMoERuntime):
             ):
                 if callback in hooks:
                     hooks.remove(callback)
-
-    def close(self):
-        if self._closed:
-            return
-        self.synchronize()
-        if self.diagnostics is not None:
-            try:
-                self.diagnostics.close()
-            except Exception:
-                logger.warning(
-                    "MoE offload batch logger teardown failed", exc_info=True
-                )
-        self._remove_hooks()
-        if self._release is not None:
-            self._release()
-        self._failed_contexts.clear()
-        self._transition_contexts.clear()
-        self.layer_programs.clear()
-        self.resources = self.storage = self.pipelines = ()
-        self.snapshot = self.cache_updates = self.ops = self.residency = None
-        self.cache_stats = self.diagnostics = None
-        self.reload_weights = self._release = None
-        self._closed = True
+            self._runner = None
