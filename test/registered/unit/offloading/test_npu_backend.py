@@ -27,13 +27,21 @@ from sglang.srt.offloading.moe.npu import native_acl
 from sglang.srt.offloading.moe.npu.backend import NpuMoEBackend
 from sglang.srt.offloading.moe.npu.transfer import (
     DeviceMemoryRegion,
+    MemFabricAddressCatalog,
     MemFabricDeviceTransferOps,
+    MemFabricTransferBindings,
+    TransferSubmissionError,
 )
 from sglang.srt.offloading.moe.owner import MoEOffloadOwner
 from sglang.srt.offloading.moe.policy import TensorLFUPolicy
 from sglang.srt.offloading.moe.resources import Allocation, ResourceKind
-from sglang.srt.offloading.moe.storage import HostExpertStore, HostMemoryCapability
-from sglang.srt.offloading.transfer import ImmediateCompletion, TransferTicket
+from sglang.srt.offloading.moe.storage import HostMemoryCapability
+from sglang.srt.offloading.transfer import (
+    HostCopyPlan,
+    HostCopyRegion,
+    ImmediateCompletion,
+    TransferTicket,
+)
 
 
 @dataclass
@@ -92,6 +100,9 @@ class Format:
         "w13_weight_scale_inv": 4,
         "w2_weight_scale_inv": 4,
     }
+    layouts = {
+        name: SimpleNamespace(nbytes=size) for name, size in component_nbytes.items()
+    }
     expert_nbytes = sum(component_nbytes.values())
 
     def __init__(self):
@@ -136,13 +147,10 @@ class HostPool:
 class Storage:
     def __init__(self, spec, pool, offset, events):
         self.spec, self.events = spec, events
-        self.host_store = HostExpertStore()
+        self._sealed = True
         self.component_capabilities = {}
         for component, nbytes in Format.component_nbytes.items():
             view = pool.tensor.narrow(0, offset, spec.local_experts * nbytes)
-            self.host_store.add(
-                spec.layer_id, component, view, capability=pool.capability
-            )
             capabilities = []
             for local in range(spec.local_experts):
                 # Distinct complete expert bytes make incorrect layer flattening
@@ -156,8 +164,11 @@ class Storage:
                 )
             self.component_capabilities[component] = tuple(capabilities)
             offset += view.numel()
-        self.host_store.seal()
         self.end = offset
+
+    def require_sealed(self):
+        if not self._sealed:
+            raise RuntimeError("Seal host storage before binding device access")
 
     def close(self):
         self.events.append(f"storage.{self.spec.layer_id}.close")
@@ -278,12 +289,31 @@ class Assembly:
         self.shared_workspace = torch.zeros(32, dtype=torch.uint8)
         self.fail_layer = None
 
-    def bind(self, *args, **kwargs):
-        components = tuple(args[0])
+    def address_catalog(self, hosts, hot, sizes, **kwargs):
+        return SimpleNamespace(
+            hosts=hosts,
+            hot=hot,
+            sizes=sizes,
+            allocations=lambda: (),
+            seal=lambda: None,
+            **kwargs,
+        )
+
+    def bind(self, catalog, destinations, **kwargs):
+        components = tuple(
+            SimpleNamespace(
+                host_sources=catalog.hosts[name],
+                hot_sources=catalog.hot[name],
+                destinations=destinations[name],
+                nbytes=size,
+            )
+            for name, size in catalog.sizes.items()
+        )
         first = components[0]
         result = SimpleNamespace(
             **kwargs,
             components=components,
+            address_catalog=catalog,
             host_count=len(first.host_sources),
             hot_count=len(first.hot_sources),
             destination_count=len(first.destinations),
@@ -323,9 +353,9 @@ class Assembly:
         self.builds.append((experts.layer_id, result, shared))
         return result
 
-    def host_ops(self, **kwargs):
-        self.host_arguments = kwargs
-        self.host = HostOps(kwargs["retain"])
+    def host_ops(self, module, retain, **kwargs):
+        self.host_arguments = dict(module=module, retain=retain, **kwargs)
+        self.host = HostOps(retain)
         return self.host
 
     def finalize(self, finalize=None):
@@ -334,9 +364,7 @@ class Assembly:
                 mock.patch.object(
                     npu_backend,
                     "MemFabricAddressCatalog",
-                    return_value=SimpleNamespace(
-                        allocations=lambda: (), seal=lambda: None
-                    ),
+                    side_effect=self.address_catalog,
                 )
             )
             stack.enter_context(
@@ -353,7 +381,7 @@ class Assembly:
             )
             stack.enter_context(
                 mock.patch.object(
-                    native_acl, "make_acl_host_ops", side_effect=self.host_ops
+                    native_acl, "AclHostTransferOps", side_effect=self.host_ops
                 )
             )
             stack.enter_context(
@@ -379,7 +407,8 @@ class Assembly:
                     self.backend.runtime.synchronize()
                     context.dispose_after_drain(graph_destroyed=True)
                 elif not context._closed:
-                    context.abort()
+                    self.backend.runtime.synchronize()
+                    context.dispose_after_drain()
                 self.backend.runtime._context = None
             self.backend.runtime.close()
         else:
@@ -559,7 +588,7 @@ class NpuBackendAssemblyTests(unittest.TestCase):
             assembly.finalize()
         self.assertEqual(assembly.backend.format.banks, [])
         assembly.backend.layers[5] = removed
-        removed.host_store._sealed = False
+        removed._sealed = False
         with self.assertRaisesRegex(RuntimeError, "Seal"):
             assembly.finalize()
         self.assertEqual(assembly.backend.format.banks, [])
@@ -611,6 +640,248 @@ class NpuBackendAssemblyTests(unittest.TestCase):
         self.assertTrue(
             all(bool(torch.all(tensor == 199)) for tensor in hot.tensors.values())
         )
+
+
+@dataclass(frozen=True)
+class SimulatedNpuDevice:
+    index: int = 0
+    type: str = "npu"
+
+    def __str__(self):
+        return f"npu:{self.index}"
+
+
+class TestAddressCatalogMetadata(unittest.TestCase):
+    """Real metadata storage and validation, replacing only the NPU allocator."""
+
+    def setUp(self):
+        self.device = SimulatedNpuDevice()
+        self.owner = object()
+        original_device, original_tensor = torch.device, torch.tensor
+
+        def device(value):
+            return (
+                value
+                if isinstance(value, SimulatedNpuDevice)
+                else original_device(value)
+            )
+
+        def tensor(*args, **kwargs):
+            kwargs["device"] = "cpu"
+            return original_tensor(*args, **kwargs)
+
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(mock.patch.object(torch, "device", side_effect=device))
+        stack.enter_context(mock.patch.object(torch, "tensor", side_effect=tensor))
+        stack.enter_context(
+            mock.patch.object(torch.Tensor, "device", property(lambda _: self.device))
+        )
+        self.sizes = {"weight": 64, "scale": 128}
+        self.hosts = {
+            name: tuple(
+                HostMemoryCapability(
+                    100000 + c * 4096 + i * 128,
+                    size,
+                    True,
+                    1000 + c * 4096 + i * 128,
+                    self.owner,
+                )
+                for i in range(3)
+            )
+            for c, (name, size) in enumerate(self.sizes.items())
+        }
+        self.hot = self.regions(10000, 2)
+        self.destinations = self.regions(20000, 2)
+        self.catalog = MemFabricAddressCatalog(
+            self.hosts, self.hot, self.sizes, device=self.device
+        )
+        self.generations = torch.tensor([0, 0], dtype=torch.int64)
+        self.error = torch.tensor(0, dtype=torch.int32)
+
+    def regions(self, base, count):
+        return {
+            name: tuple(
+                DeviceMemoryRegion(
+                    base + c * 4096 + i * 128, size, self.device, self.owner
+                )
+                for i in range(count)
+            )
+            for c, (name, size) in enumerate(self.sizes.items())
+        }
+
+    def bind(self, destinations=None):
+        return MemFabricTransferBindings(
+            self.catalog,
+            self.destinations if destinations is None else destinations,
+            capacity=3,
+            hot_generations=self.generations,
+            error_status=self.error,
+        )
+
+    def test_shared_readonly_tables_and_independent_mutable_scratch(self):
+        first, second = self.bind(), self.bind()
+        for a, b in zip(first.tables, second.tables):
+            self.assertEqual([t.data_ptr() for t in a], [t.data_ptr() for t in b])
+        for c, (name, _) in enumerate(self.sizes.items()):
+            self.assertEqual(
+                first.tables[c][0].tolist(),
+                [0] + [source.device_address for source in self.hosts[name]],
+            )
+            self.assertEqual(
+                first.tables[c][2].tolist(),
+                [0] + [region.address for region in self.destinations[name]],
+            )
+        first_scratch = {a.storage_key for a in first.allocations()}
+        second_scratch = {a.storage_key for a in second.allocations()}
+        self.assertTrue(first_scratch.isdisjoint(second_scratch))
+        catalog_allocations = self.catalog.allocations()
+        self.assertEqual(
+            sum(a.nbytes for a in catalog_allocations), 2 * (4 + 3 + 3) * 8
+        )
+        self.assertEqual(len({a.storage_key for a in catalog_allocations}), 6)
+        self.assertTrue(
+            first_scratch.isdisjoint(a.storage_key for a in catalog_allocations)
+        )
+        first.batches[0][0][2].fill_(987)
+        self.assertTrue(torch.all(second.batches[0][0][2] == 0))
+        self.assertIs(first.hot_generations, second.hot_generations)
+        self.assertIs(first.error_status, second.error_status)
+
+    def test_seal_allows_existing_views_and_rejects_new_physical_tables(self):
+        before = self.bind()
+        self.catalog.seal()
+        after = self.bind()
+        self.assertEqual(before.tables[0][2].data_ptr(), after.tables[0][2].data_ptr())
+        with self.assertRaisesRegex(RuntimeError, "sealed"):
+            self.bind(self.regions(30000, 2))
+
+    def test_destination_validation_precedes_table_allocation(self):
+        before = len(self.catalog.allocations())
+        invalid = dict(self.destinations)
+        invalid["weight"] = (self.destinations["weight"][0],) * 2
+        with self.assertRaisesRegex(ValueError, "overlap"):
+            self.bind(invalid)
+        source = self.hosts["weight"][0]
+        invalid["weight"] = (
+            DeviceMemoryRegion(source.device_address, 64, self.device, self.owner),
+            self.destinations["weight"][1],
+        )
+        with self.assertRaisesRegex(ValueError, "immutable host"):
+            self.bind(invalid)
+        invalid = dict(self.destinations)
+        invalid["scale"] = invalid["scale"][:1]
+        with self.assertRaisesRegex(ValueError, "same destination count"):
+            self.bind(invalid)
+        self.assertEqual(len(self.catalog.allocations()), before)
+        self.assertTrue(self.bind(self.hot).hot_targets_alias)
+
+    def test_source_schema_and_mapping_validation_are_not_repeated_per_binding(self):
+        with self.assertRaisesRegex(ValueError, "component schema"):
+            MemFabricAddressCatalog({}, self.hot, self.sizes, device=self.device)
+        hosts = dict(self.hosts)
+        hosts["weight"] = (HostMemoryCapability(1000, 64, True, None, self.owner),) * 3
+        with self.assertRaisesRegex(ValueError, "no certified device mapping"):
+            MemFabricAddressCatalog(hosts, self.hot, self.sizes, device=self.device)
+        self.bind()
+        with mock.patch.object(
+            HostMemoryCapability,
+            "device_pointer",
+            side_effect=AssertionError("source validation repeated"),
+        ):
+            self.bind()
+
+
+class TestAclHostTransfer(unittest.TestCase):
+    def setUp(self):
+        self.device = SimulatedNpuDevice()
+        self.retained = []
+        self.module = SimpleNamespace(
+            api_info=lambda: {
+                "queue_ordering": "torch_npu_stream_flush",
+                "device_synchronize": False,
+            },
+            Batch=mock.Mock(side_effect=lambda *args: SimpleNamespace(arguments=args)),
+            submit=mock.Mock(),
+        )
+        self.ops = native_acl.AclHostTransferOps(
+            self.module, self.retained.append, max_batch_entries=1
+        )
+        self.stream = SimpleNamespace(device=self.device, stream_id=19)
+        self.owner = object()
+        self.source = HostMemoryCapability(1000, 256, True, 10000, self.owner)
+        self.destination = DeviceMemoryRegion(20000, 256, self.device, self.owner)
+        self.plan = HostCopyPlan(
+            tuple(
+                HostCopyRegion(self.source, self.destination, i, i, 64) for i in (0, 64)
+            )
+        )
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(
+            mock.patch.object(
+                native_acl, "_npu_stream_context", side_effect=lambda _: nullcontext()
+            )
+        )
+        self.completion = stack.enter_context(
+            mock.patch.object(
+                native_acl, "_npu_completion", return_value=ImmediateCompletion()
+            )
+        )
+
+    def test_native_descriptor_capacity_is_derived_from_physical_region(self):
+        ticket = self.ops.materialize_into(self.plan, None, self.stream)
+        self.assertIsInstance(ticket, TransferTicket)
+        self.assertEqual(
+            self.module.Batch.call_args_list[1].args,
+            ((1064,), (20064,), (64,), (192,), 0, "host", 0),
+        )
+        self.assertEqual(self.module.submit.call_count, 2)
+        self.assertIs(self.retained[0][0], self.plan)
+        self.assertIs(self.retained[-1], ticket)
+        with self.assertRaisesRegex(ValueError, "source allocation"):
+            HostCopyRegion(self.source, self.destination, 250, 0, 64)
+
+    def test_partial_submission_retains_complete_plan_and_native_batches(self):
+        self.module.submit.side_effect = [None, RuntimeError("submit failed")]
+        with self.assertRaises(TransferSubmissionError) as raised:
+            self.ops.materialize_into(self.plan, None, self.stream)
+        resources = self.retained[0]
+        self.assertIs(resources[0], self.plan)
+        self.assertEqual(len(resources[2]), 2)
+        self.assertIs(raised.exception.completion_ticket, self.retained[-1])
+        self.assertIs(resources[0].regions[0].source.registration, self.owner)
+
+    def test_failed_completion_record_keeps_presubmission_retention(self):
+        self.module.submit.side_effect = RuntimeError("submit failed")
+        self.completion.side_effect = RuntimeError("stream poisoned")
+        with self.assertRaises(TransferSubmissionError) as raised:
+            self.ops.materialize_into(self.plan, None, self.stream)
+        self.assertIsNone(raised.exception.completion_ticket)
+        self.assertEqual(len(self.retained), 1)
+        self.assertIs(self.retained[0][0], self.plan)
+
+    def test_invalid_aliases_and_stream_are_rejected_before_submission(self):
+        for destination in (
+            self.destination,
+            DeviceMemoryRegion(10000, 256, self.device, self.owner),
+        ):
+            regions = (HostCopyRegion(self.source, destination, 0, 0, 64),) * 2
+            with self.assertRaisesRegex(ValueError, "overlap"):
+                self.ops.materialize_into(HostCopyPlan(regions), None, self.stream)
+        mapped = DeviceMemoryRegion(10000, 256, self.device, self.owner)
+        with self.assertRaisesRegex(ValueError, "immutable host"):
+            self.ops.materialize_into(
+                HostCopyPlan((HostCopyRegion(self.source, mapped, 0, 0, 64),)),
+                None,
+                self.stream,
+            )
+        with self.assertRaisesRegex(ValueError, "managed NPU stream"):
+            self.ops.materialize_into(
+                self.plan, None, SimpleNamespace(device=self.device)
+            )
+        self.assertEqual(self.module.submit.call_count, 0)
+        self.assertEqual(self.retained, [])
 
 
 class TestNPUDispatchBytePacking(unittest.TestCase):

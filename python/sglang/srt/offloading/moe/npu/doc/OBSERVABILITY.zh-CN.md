@@ -14,7 +14,7 @@ dispatch 后本 rank 收到的有效 token-expert 路由。重复使用同一专
 常驻 routed/shared experts、padding、warmup/capture 不计入服务批次。多个 rank 的全局
 命中率需先分别求和分子和分母，不能平均百分比。
 
-prefill 采用 HOST_ONLY，三个命中计数字段及命中率显示 N/A；decode 无有效需求时
+prefill 固定读取 host master，三个命中计数字段及命中率显示 N/A；decode 无有效需求时
 命中率显示 N/A。非零 `error` 使用 ERROR 级别并将命中率显示为 N/A，不把故障屏蔽后
 的计数当成健康命中率。故障仍由原有 runtime/owner 路径处理，日志不会清除错误标记。
 

@@ -1,5 +1,7 @@
 # MoE-Offload 三人开发分工与任务计划
 
+> 历史记录：本文保留当时的设计与验证结果。2026-10-25 后续精简已调整部分接口；当前 API、迁移映射与验证见[精简记录](SIMPLIFICATION_20261025.zh-CN.md)及 [README](README.zh-CN.md)。
+
 更新日期：2026-10-20  
 适用分支：`moe-offload-proto-v1`  
 实现基线：`65e5c53ebb`；文档基线：`8f415f44c6`

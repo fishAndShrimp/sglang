@@ -4,12 +4,10 @@ import contextlib
 import gc
 import unittest
 import weakref
-from types import SimpleNamespace
 
 from sglang.srt.offloading.base import BaseOffloader
 from sglang.srt.offloading.moe.config import Phase
 from sglang.srt.offloading.moe.graph import GraphLeaseBackend
-from sglang.srt.offloading.moe.interfaces import BoundMoERuntime
 from sglang.srt.offloading.moe.offloader import MoEOffloaderV2
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -17,7 +15,8 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class CaptureResources:
-    pass
+    def dispose_after_drain(self, *, graph_destroyed):
+        assert graph_destroyed
 
 
 class Runtime:
@@ -34,10 +33,16 @@ class Runtime:
         resources = CaptureResources()
         self.resource_ref = weakref.ref(resources)
         try:
-            yield resources
+            yield [resources]
         finally:
             self.calls.append(("scope_exit",))
             self.update_enabled = True
+
+    def after_graph_warmup(self):
+        pass
+
+    def retire_graph_resources(self, contexts):
+        pass
 
     def synchronize(self):
         self.calls.append(("drain",))
@@ -74,11 +79,18 @@ class Owner:
         self.graphs.add(key)
         self.calls.append(("lease", key[1]))
 
-        def close():
-            self.calls.append(("release", key[1]))
-            self.graphs.remove(key)
+    def _release_graph(self, key):
+        self.calls.append(("release", key[1]))
+        self.graphs.remove(key)
 
-        return SimpleNamespace(close=close)
+    def begin_graph_cleanup(self, identity):
+        pass
+
+    def finish_graph_cleanup(self, identity):
+        pass
+
+    def dispose_pending_after_drain(self):
+        pass
 
 
 class Backend:
@@ -265,17 +277,6 @@ class TestGraphLeaseBackend(unittest.TestCase):
                 wrapper.capture_one(1, lambda: None)
         self.assertEqual(len(owner.graphs), 1)
         wrapper.cleanup()
-
-    def test_runtime_must_explicitly_bind_capture_scope(self):
-        wrapper, owner, backend, calls = self.make_wrapper()
-        owner.runtime.capture_scope = lambda *args: BoundMoERuntime.capture_scope(
-            owner.runtime, *args
-        )
-        with self.assertRaises(NotImplementedError):
-            with wrapper.capture_session("stream"):
-                self.fail("Unbound runtime entered capture")
-        self.assertTrue(owner.failed)
-        self.assertEqual(owner.graphs, set())
 
     def test_missing_capture_keepalive_is_rejected(self):
         wrapper, owner, backend, calls = self.make_wrapper()

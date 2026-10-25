@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib
 import importlib.machinery
 import importlib.util
+import logging
 import os
 import shlex
 import subprocess
@@ -17,12 +18,20 @@ import tempfile
 from pathlib import Path
 from threading import RLock
 
+from ...transfer import HostCopyPlan, HostTransferOps
+from ..storage import HostMemoryCapability
 from .transfer import (
-    AclBatchHostTransferOps,
     DeviceMemoryRegion,
     _npu_completion,
     _npu_stream_context,
+    _range,
+    _ranges_overlap,
+    _reject_overlapping,
+    _submission_failure,
+    _ticket,
 )
+
+logger = logging.getLogger(__name__)
 
 _MODULE_NAME = "_sglang_moe_acl"
 _NATIVE = Path(__file__).with_name("native")
@@ -174,23 +183,31 @@ def _load_native_acl(directory):
     return module
 
 
-class NativeAclBatchSubmitter:
-    """Bridge AclCopyBatch to owning native descriptors before any async writes.
+class AclHostTransferOps(HostTransferOps):
+    """Validate eager bundles and retain native descriptors through queued H2D.
 
-    source_location describes the original allocator: ``host`` for ACL host
-    allocations, ``unregistered`` for externally allocated memory (which still
-    requires a successful pinned-memory registration), or ``host_numa`` for the
-    documented host NUMA allocation type. It is not a pinning inference.
-    Runtime/pipeline grants this stream one submitting thread at a time.
+    The module certifies torch_npu host-queue ordering, not device completion.
+    Source location describes the allocator, independently of its registration.
+    Runtime/pipeline grants the stream one submitting thread at a time.
     """
 
-    def __init__(self, module, retain, *, source_location="host", source_location_id=0):
+    def __init__(
+        self,
+        module,
+        retain,
+        *,
+        source_location="host",
+        source_location_id=0,
+        max_batch_entries=256,
+    ):
         if not callable(retain):
             raise TypeError("A durable runtime retention callback is required")
         if source_location not in ("host", "host_numa", "unregistered"):
             raise ValueError("Unsupported ACL source allocation location")
         if type(source_location_id) is not int or not 0 <= source_location_id < 2**32:
             raise ValueError("ACL source location ID must fit uint32")
+        if type(max_batch_entries) is not int or max_batch_entries <= 0:
+            raise ValueError("ACL batch capacity must be positive")
         info = module.api_info()
         if info.get("queue_ordering") != "torch_npu_stream_flush" or info.get(
             "device_synchronize"
@@ -203,74 +220,100 @@ class NativeAclBatchSubmitter:
             source_location,
             source_location_id,
         )
+        self.max_batch_entries = max_batch_entries
 
-    def __call__(self, batch, stream):
-        device = getattr(stream, "device", None)
-        device_index = getattr(device, "index", None)
-        stream_id = getattr(stream, "stream_id", None)
-        if getattr(device, "type", None) != "npu" or type(device_index) is not int:
-            raise ValueError(
-                "Native ACL requires a managed NPU stream with an explicit device"
-            )
-        if type(stream_id) is not int or not 0 <= device_index <= 127:
-            raise ValueError("Invalid torch_npu stream ID/device")
-        if batch.direction != "host_to_device":
-            raise ValueError("The native prefill shim accepts H2D only")
-        if len(batch.keepalive) != len(batch.sizes):
-            raise ValueError("ACL batch must retain each source/destination region")
-        for owners in batch.keepalive:
-            if not isinstance(owners, tuple) or len(owners) != 2:
-                raise ValueError("ACL batch must retain source/destination pairs")
-            destination = owners[1]
+    def _lower(self, plan, device):
+        entries, destinations, mapped_sources = [], [], []
+        for region in plan.regions:
+            source, destination = region.source, region.destination
+            if (
+                not isinstance(source, HostMemoryCapability)
+                or not source.acl_async_readable
+            ):
+                raise ValueError(
+                    "ACL source requires certified asynchronous host reads"
+                )
             if (
                 not isinstance(destination, DeviceMemoryRegion)
-                or getattr(destination.device, "type", None) != "npu"
-                or getattr(destination.device, "index", None) != device_index
+                or destination.device != device
             ):
                 raise ValueError(
                     "ACL destination must belong to the submitting stream device"
                 )
-        # No raw aclrtStream is obtained through Python. C++ reads and validates
-        # the current managed stream after entering torch.npu.stream(stream).
-        native = self.module.Batch(
-            batch.source_addresses,
-            batch.destination_addresses,
-            batch.sizes,
-            batch.destination_capacities,
-            device_index,
-            self.source_location,
-            self.source_location_id,
+            src = source.host_address + region.source_offset
+            dst = destination.address + region.destination_offset
+            # Region construction checked immutable capacities; registration and
+            # address ABI certification belong to this concrete transport.
+            source.validate_range(src, region.nbytes)
+            _range(src, region.nbytes)
+            destinations.append(_range(dst, region.nbytes))
+            if source.device_address is not None:
+                mapped_sources.append(
+                    _range(source.device_pointer(src, region.nbytes), region.nbytes)
+                )
+            if region.nbytes:
+                entries.append(
+                    (
+                        src,
+                        dst,
+                        region.nbytes,
+                        destination.nbytes - region.destination_offset,
+                    )
+                )
+        _reject_overlapping(destinations)
+        if _ranges_overlap(mapped_sources, destinations):
+            raise ValueError("Copy destination overlaps mapped immutable host storage")
+        batches = []
+        for begin in range(0, len(entries), self.max_batch_entries):
+            chunk = entries[begin : begin + self.max_batch_entries]
+            batches.append(
+                self.module.Batch(
+                    *(tuple(entry[index] for entry in chunk) for index in range(4)),
+                    device.index,
+                    self.source_location,
+                    self.source_location_id,
+                )
+            )
+        return tuple(batches)
+
+    def materialize_into(self, plan, bindings, stream):
+        if not isinstance(plan, HostCopyPlan):
+            raise TypeError("ACL transfers require HostCopyPlan")
+        device = getattr(stream, "device", None)
+        index, stream_id = getattr(device, "index", None), getattr(
+            stream, "stream_id", None
         )
-        self.retain((native, batch, stream, self))
-        self.module.submit(native, stream_id)
-        return 0
-
-
-def make_acl_host_ops(
-    *,
-    retain,
-    module=None,
-    build_directory=None,
-    source_location="host",
-    source_location_id=0,
-    max_batch_entries=256,
-):
-    """Construct the existing ACL backend with real SDK calls and NPU events."""
-    module = get_native_acl(build_directory) if module is None else module
-    submitter = NativeAclBatchSubmitter(
-        module,
-        retain,
-        source_location=source_location,
-        source_location_id=source_location_id,
-    )
-    return AclBatchHostTransferOps(
-        native_submit=submitter,
-        record_completion=_npu_completion,
-        retain=retain,
-        queue_ordering_verified=True,
-        stream_context=_npu_stream_context,
-        max_batch_entries=max_batch_entries,
-    )
+        if (
+            getattr(device, "type", None) != "npu"
+            or type(index) is not int
+            or not 0 <= index <= 127
+            or type(stream_id) is not int
+        ):
+            raise ValueError(
+                "Native ACL requires a managed NPU stream with an explicit device"
+            )
+        batches = self._lower(plan, device)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "MoE offload acl.submit: batches=%s regions=%s bytes=%s stream=%s",
+                len(batches),
+                len(plan.regions),
+                sum(region.nbytes for region in plan.regions),
+                stream_id,
+            )
+        # Each region owns both allocations. Native descriptors and the complete
+        # plan survive even a partial submission that raises without a ticket.
+        resources = (plan, bindings, batches, stream, self)
+        self.retain(resources)
+        with _npu_stream_context(stream):
+            try:
+                for batch in batches:
+                    self.module.submit(batch, stream_id)
+                return _ticket(_npu_completion, stream, resources, self.retain)
+            except Exception as error:
+                raise _submission_failure(
+                    error, _npu_completion, stream, resources, self.retain
+                ) from error
 
 
 if __name__ == "__main__":

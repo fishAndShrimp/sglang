@@ -3,7 +3,8 @@
 English | [中文](README.zh-CN.md)
 
 Updated 2026-10-25. The implementation now has one residency and execution stack.
-See the [refactor record](REFACTOR_20261025.zh-CN.md), [cache contract](CACHE_IMPLEMENTATION.zh-CN.md),
+See the [simplification record](SIMPLIFICATION_20261025.zh-CN.md),
+[earlier refactor record](REFACTOR_20261025.zh-CN.md), [cache contract](CACHE_IMPLEMENTATION.zh-CN.md),
 [H2D contract](H2D_IMPLEMENTATION.zh-CN.md), and [Ascend startup guide](../npu/doc/README.zh-CN.md).
 Historical design documents describe earlier revisions, not the current API.
 
@@ -25,7 +26,7 @@ the same routed weights.
 | Quantization format | `ExpertFormat`, immutable `BundleSchema` and `BundleComponent` in [formats.py](../formats.py): checkpoint validation, bounded conversion and complete native banks. |
 | Device | `MoEBackend` assembles device storage, event bindings and execution; `NpuMoEBackend` is the current native implementation. |
 | Cache algorithm | `CachePolicy.observe(..., due_out)`, `select_hot_set(..., target_keys)`, `finish_step`, and `copy_state`; both LFU policies use this contract. |
-| H2D | `HostTransferOps` and `DeviceTransferOps` behind `ComposedTransferBackend`; native ACL for eager plans, MemFabric for device-selected graph plans. |
+| H2D | `HostTransferOps` and `DeviceTransferOps` bound directly by `ExpertWeightAccess`; native ACL for eager plans, MemFabric for device-selected graph plans. |
 
 The current NPU assembly accepts one storage-compatible format arena and rejects
 mixed formats/shapes/topologies before allocation. Multiple format arenas are an
@@ -36,16 +37,19 @@ classDiagram
     MoEOffloaderV2 --> ModelAdapter
     MoEOffloaderV2 --> MoEBackend
     MoEOffloaderV2 *-- MoEOffloadOwner
-    MoEOffloadOwner --> InvocationRuntime
-    InvocationRuntime <|-- NpuBoundMoERuntime
-    NpuBoundMoERuntime --> LayerProgramTable
+    MoEOffloadOwner --> BoundMoERuntime
+    BoundMoERuntime --> ExecutionContext
+    BoundMoERuntime --> NpuDeviceRuntime
+    BoundMoERuntime --> NPULayerPrograms
     NpuMoEBackend --> ExpertFormat
     ExpertFormat --> BundleSchema
     BundleSchema *-- BundleComponent
     CacheUpdateCoordinator --> CachePolicy
     CacheUpdateCoordinator --> ExpertWeightAccess
     ExpertWeightAccess --> TensorResidencyOps
-    ExpertWeightAccess --> ComposedTransferBackend
+    ExpertWeightAccess --> MaterializationPlan
+    ExpertWeightAccess --> HostTransferOps
+    ExpertWeightAccess --> DeviceTransferOps
 ```
 
 ## One execution stack
@@ -59,8 +63,10 @@ classDiagram
 
 The duplicate `CacheBackend`, `CacheRuntime`, `CacheResidencyOps`, model binding
 and Ascend adapter stack has been retired. The owner no longer has phase-controller
-wrappers or duplicate slot lease managers. `LayerProgramTable` contains immutable
-phase-specific programs without a runtime back-reference.
+wrappers or duplicate slot lease managers. `NPULayerPrograms` holds the two phase-specific programs and their shared dispatch
+layout without a runtime back-reference. `MaterializationPlan` is the common data
+contract for execution fills and cache updates. Decode planner readiness always
+covers the preceding compute frontier; no optional dependency flag remains.
 
 ## Cache and lifetime rules
 
@@ -101,7 +107,7 @@ All complete expert components and native padding count toward their budgets.
 CPU tests are present under `test/registered/unit/offloading/`; they exercise the
 production planner and assembly using test-only native boundaries. See the
 [documented runner](../npu/doc/PERIODIC_CACHE_1022.zh-CN.md) and current
-[validation record](REFACTOR_20261025.zh-CN.md).
+[validation record](SIMPLIFICATION_20261025.zh-CN.md).
 
 Target hardware acceptance must cover ACL queue ordering, MemFabric dynamic
 addresses, native formats, numerical parity, multi-rank EP, empty ranks, repeated

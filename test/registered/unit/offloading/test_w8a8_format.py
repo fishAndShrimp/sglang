@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from sglang.srt.hardware_backend.npu.moe.w8a8 import NPUSwigluInt8Quant
 from sglang.srt.offloading.moe.config import ExpertLayerSpec
 from sglang.srt.offloading.moe.npu import v4_format, w8a8_format
+from sglang.srt.offloading.moe.npu.format import ExpertLayerStorage
 from sglang.srt.offloading.moe.resources import ResourceKind
 from sglang.srt.offloading.moe.storage import HostMemoryCapability
 
@@ -92,7 +93,7 @@ class TestW8A8Format(unittest.TestCase):
         self.pool = HostPool(self.format.host_nbytes(self.spec.local_experts))
         self.layer = torch.nn.Module()
         self.layer.dispatcher = SimpleNamespace(set_quant_config=mock.Mock())
-        self.storage = w8a8_format.W8A8LayerStorage(
+        self.storage = ExpertLayerStorage(
             self.layer, self.spec, self.format, self.pool, {}
         )
         self.addCleanup(self.storage.close)
@@ -157,7 +158,7 @@ class TestW8A8Format(unittest.TestCase):
         for name, tensor in view.tensors.items():
             self.assertEqual(
                 tensor.data_ptr() - bank.tensors[name].data_ptr(),
-                self.format.component_nbytes[name],
+                self.format.layouts[name].nbytes,
             )
         self.assertEqual(
             sum(x.nbytes for x in bank.allocations()), 2 * self.format.expert_nbytes
@@ -176,13 +177,13 @@ class TestW8A8Format(unittest.TestCase):
     def test_host_padding_is_charged_and_distinct_from_runtime_scale_extent(self):
         name = "w13_weight_scale"
         self.assertEqual(
-            self.format.host_component_nbytes[name],
-            2 * self.format.component_nbytes[name],
+            self.format.layouts[name].host_nbytes,
+            2 * self.format.layouts[name].nbytes,
         )
         regions = self.storage.component_capabilities[name]
         self.assertEqual(
             regions[1].host_address - regions[0].host_address,
-            self.format.host_component_nbytes[name],
+            self.format.layouts[name].host_nbytes,
         )
         self.assertGreater(self.format.host_nbytes(2), 2 * self.format.expert_nbytes)
 
@@ -301,8 +302,26 @@ class TestW8A8Format(unittest.TestCase):
                 gc.enable()
 
     def test_too_small_loader_budget_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "workspace"):
-            w8a8_format.NpuV4W8A8Format(64, 128, "cpu", workspace_limit_bytes=1)
+        with mock.patch.object(
+            FormatAdapter,
+            "to_device",
+            side_effect=AssertionError("allocation before budget check"),
+        ):
+            with self.assertRaisesRegex(ValueError, "workspace"):
+                w8a8_format.NpuV4W8A8Format(64, 128, "cpu", workspace_limit_bytes=1)
+
+    def test_probe_rejects_unbudgeted_copy_of_offset_metadata(self):
+        original = FormatAdapter.prepare
+
+        def copy_offset(adapter, *inputs):
+            weight, scale, offset = original(adapter, *inputs)
+            return weight, scale, offset.clone()
+
+        with mock.patch.object(FormatAdapter, "prepare", copy_offset):
+            with self.assertRaisesRegex(
+                RuntimeError, "metadata view unexpectedly copied"
+            ):
+                w8a8_format.NpuV4W8A8Format(64, 128, "cpu", workspace_limit_bytes=2**20)
 
     def test_quant_info_binds_every_runtime_component(self):
         bank = self.format.allocate_bank(2, ResourceKind.HOT_WEIGHTS, "hot")
@@ -337,7 +356,7 @@ class TestFP4FormatRegression(unittest.TestCase):
             )
         pool = HostPool(format.host_nbytes(2))
         layer = torch.nn.Module()
-        storage = v4_format.V4LayerStorage(
+        storage = ExpertLayerStorage(
             layer, ExpertLayerSpec(3, 2, 1, 0), format, pool, {}
         )
         self.addCleanup(storage.close)
@@ -374,7 +393,7 @@ class TestFP4FormatRegression(unittest.TestCase):
         for name, tensor in bank.view(1, 1).tensors.items():
             self.assertEqual(
                 tensor.data_ptr() - bank.tensors[name].data_ptr(),
-                format.component_nbytes[name],
+                format.layouts[name].nbytes,
             )
         self.assertEqual(layer.w13_weight_scale_inv.quant_method, "block")
 

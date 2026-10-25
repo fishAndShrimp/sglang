@@ -1,5 +1,7 @@
 # MoE Cache 与框架适配实现总结
 
+> 历史设计：当前 API 与后续简化见[精简记录](doc/SIMPLIFICATION_20261025.zh-CN.md)和[缓存契约](doc/CACHE_IMPLEMENTATION.zh-CN.md)。
+
 > **历史设计快照**：正文保留当时方案与接口，其中重复缓存栈、phase controller、旧策略 API
 > 已被后续实现替换，不应据此恢复旧模块。当前接口、迁移与验证状态见
 > [2026-10-25 重构记录](doc/REFACTOR_20261025.zh-CN.md)。

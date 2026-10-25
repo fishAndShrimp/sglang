@@ -4,7 +4,7 @@ import logging
 from contextlib import contextmanager
 from threading import RLock
 
-from .owner import GraphLease, _serialized
+from .owner import _serialized
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ class GraphLeaseBackend:
         self._rank = getattr(getattr(owner, "config", None), "ep_rank", None)
         self.graph_runner = graph_runner
         self._identity = object()
-        self._leases = {}
+        self._leases = set()
         self._capture_resources = []
         self._capturing = False
         self._failed = False
@@ -105,19 +105,16 @@ class GraphLeaseBackend:
         logger.info(
             "MoE offload graph.capture.begin: rank=%s bucket=%s", self._rank, shape_key
         )
-        lease = self.owner.acquire_graph(
+        self.owner.acquire_graph(
             (self._identity, shape_key), capture_identity=self._identity
         )
-        self._leases[shape_key] = lease
+        self._leases.add(shape_key)
         try:
-            warmup_hook = post_warmup_hook
-            retire_warmup = getattr(self.owner.runtime, "after_graph_warmup", None)
-            if retire_warmup is not None:
 
-                def warmup_hook():
-                    if post_warmup_hook is not None:
-                        post_warmup_hook()
-                    retire_warmup()
+            def warmup_hook():
+                if post_warmup_hook is not None:
+                    post_warmup_hook()
+                self.owner.runtime.after_graph_warmup()
 
             result = self.backend.capture_one(
                 shape_key,
@@ -176,11 +173,7 @@ class GraphLeaseBackend:
             return
         # Block new submissions before stopping host workers. A failed cleanup
         # stays closed to replay and can be retried without freeing graph storage.
-        begin_cleanup = getattr(self.owner, "begin_graph_cleanup", None)
-        if begin_cleanup is not None:
-            begin_cleanup(self._identity)
-        else:
-            self.owner.wait_idle()
+        self.owner.begin_graph_cleanup(self._identity)
         self._closing = True
         try:
             stop = getattr(self.backend, "stop_submissions", None)
@@ -196,30 +189,18 @@ class GraphLeaseBackend:
             # partial reset failure leaves all leases and resources pinned.
             retired_contexts = []
             for resources in self._capture_resources:
-                if isinstance(resources, (list, tuple)):
-                    for context in resources:
-                        retire = getattr(context, "dispose_after_drain", None)
-                        if retire is not None:
-                            retire(graph_destroyed=True)
-                            retired_contexts.append(context)
-            retired = getattr(self.owner.runtime, "retire_graph_resources", None)
-            if retired is not None:
-                retired(retired_contexts)
-            for key, lease in tuple(self._leases.items()):
-                if isinstance(lease, GraphLease):
-                    lease.close(drained=True)
-                else:
-                    lease.close()
-                del self._leases[key]
-            dispose = getattr(self.owner, "dispose_pending_after_drain", None)
-            if dispose is not None:
-                dispose()
+                for context in resources:
+                    context.dispose_after_drain(graph_destroyed=True)
+                    retired_contexts.append(context)
+            self.owner.runtime.retire_graph_resources(retired_contexts)
+            for key in tuple(self._leases):
+                self.owner._release_graph((self._identity, key))
+                self._leases.remove(key)
+            self.owner.dispose_pending_after_drain()
         except BaseException:
             self._failed = True
             self.owner.fail_graph_capture()
             raise
         self._capture_resources.clear()
         self._closed = True
-        finish_cleanup = getattr(self.owner, "finish_graph_cleanup", None)
-        if finish_cleanup is not None:
-            finish_cleanup(self._identity)
+        self.owner.finish_graph_cleanup(self._identity)

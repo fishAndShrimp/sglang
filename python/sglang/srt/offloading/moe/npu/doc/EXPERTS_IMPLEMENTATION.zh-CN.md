@@ -21,7 +21,8 @@ routed scaling 仍由外层 DeepSeek MLP 执行；返回值包含原 `FusedMoE.f
    factory 只登记一次物理 allocation。
 5. 每个 lease 的 `bindings.expert_bank` 包含 `AscendQuantInfo` 原生权重视图、
    `execution_valid` 与 canonical `error_status`。FFN 不重绑模型 Parameter，不转换
-   FP4 精度；尾 wave 的权重组件与 group counts 均缩至实际 expert 数。
+   FP4 精度。绑定时所有 quant 分量的专家维必须等于 validity 长度；runner 只接受
+   相同宽度的 group counts，尾 wave 使用已构造好的精确视图。
 6. 直接调用现有 `AscendRunnerCore`，保留 V4 `swiglu_limit` 所要求的非融合 GMM1 /
    clamp activation / GMM2 路径。任何有需求却无有效权重的 lane 都锁存错误，整组
    counts 归零；未写 padding 用 `where` 清零，避免 `NaN * 0`。
@@ -46,7 +47,8 @@ routed scaling 仍由外层 DeepSeek MLP 执行；返回值包含原 `FusedMoE.f
 
 ## 目标机验收
 
-CPU 数值模拟、随机参考差分及 native operator 替代代码已移除。在目标机验证
+既有 CPU 契约测试覆盖字节打包、padding 和绑定宽度；native/device 替身只存在
+于测试目录，不能证明原生算子的数值或图行为。在目标机验证
 全零 counts 的 grouped matmul 不读取无效 lane；byte gather / where / prefix-sum
 的 torch_npu graph 支持；不同 padding 下 native `-1` D/C；MXFP8 scale / NZ
 weight views；多 rank 单层参考一致性；整模型 graph replay、模式切换和故障 drain。

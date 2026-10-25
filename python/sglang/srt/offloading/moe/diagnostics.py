@@ -37,7 +37,8 @@ class BatchDiagnostics:
 
     The runtime must call close() only AFTER its existing device drain. Slots
     stay owned until their completion, including partial copy/query failures.
-    host_buffer/device_scope are injectable for CPU contract tests only.
+    device_scope selects the worker's device context; host_buffer permits CPU
+    contract tests to supply an ordinary buffer instead of pinned memory.
     """
 
     def __init__(
@@ -60,7 +61,7 @@ class BatchDiagnostics:
             raise ValueError("batch_log_capacity must be a positive integer")
         self.stats, self.error_status = stats, error_status
         self.rank, self.device = rank, str(device)
-        self.interval, self.capacity = interval, capacity
+        self.interval = interval
         self._device_scope = device_scope
         self._host = None
         self._errors = None

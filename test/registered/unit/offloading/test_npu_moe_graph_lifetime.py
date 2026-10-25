@@ -88,16 +88,6 @@ class TestNPUMoEGraphLifetime(unittest.TestCase):
             def __del__(self):
                 log.append("graph_destroy")
 
-        class Lease:
-            def close(self):
-                self_test.assertFalse(graphs)
-                self_test.assertFalse(backend._pending_graphs)
-                # A failed capture's traceback may retain its Python object;
-                # explicit reset already destroys the device graph bindings.
-                self_test.assertIn("graph_reset", log)
-                log.append("lease_close")
-
-        self_test = self
         npu = SimpleNamespace(
             NPUGraph=Graph, graph=lambda *args, **kwargs: nullcontext()
         )
@@ -147,20 +137,16 @@ class TestNPUMoEGraphLifetime(unittest.TestCase):
         backend.capture_session = lambda stream: nullcontext()
         owner = Owner(log)
         owner.runtime.synchronize = lambda: log.append("owner_drain")
-        original_acquire = owner.acquire_graph
+        original_release = owner._release_graph
 
-        def acquire(key, *, capture_identity=None):
-            original = original_acquire(key, capture_identity=capture_identity)
-            lease = Lease()
-            close = lease.close
+        def release(key):
+            self.assertFalse(graphs)
+            self.assertFalse(backend._pending_graphs)
+            self.assertIn("graph_reset", log)
+            log.append("lease_close")
+            original_release(key)
 
-            def release():
-                close()
-                original.close()
-
-            return SimpleNamespace(close=release)
-
-        owner.acquire_graph = acquire
+        owner._release_graph = release
         wrapper = GraphLeaseBackend(backend, owner, object())
         return wrapper, backend, owner, log
 
@@ -208,13 +194,13 @@ class TestNPUMoEGraphLifetime(unittest.TestCase):
             with wrapper.capture_session("capture"):
                 wrapper.capture_one("bucket", lambda: None)
                 original_graph = backend._graphs["bucket"]
-                original_lease = wrapper._leases["bucket"]
+                original_keys = set(wrapper._leases)
                 with self.assertRaisesRegex(ValueError, "existing MoE graph"):
                     wrapper.capture_one(
                         "bucket", lambda: self.fail("Unexpected warmup")
                     )
                 self.assertIs(backend._graphs["bucket"], original_graph)
-                self.assertIs(wrapper._leases["bucket"], original_lease)
+                self.assertEqual(wrapper._leases, original_keys)
         del original_graph
         wrapper.cleanup()
         self.assertFalse(owner.graphs)

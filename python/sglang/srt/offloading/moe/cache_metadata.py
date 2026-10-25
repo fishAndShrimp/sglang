@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, fields
 
-from .resources import Allocation, ResourceKind
+from .resources import tensor_allocations
 
 
 @dataclass
@@ -40,17 +40,7 @@ class CacheRouteStats:
         self.misses.add_(torch.where(enabled, accesses - hits, 0))
 
     def allocations(self):
-        result = []
-        for field in fields(self):
-            tensor = getattr(self, field.name)
-            storage = tensor.untyped_storage()
-            result.append(
-                Allocation(
-                    "cache_stats." + field.name,
-                    ResourceKind.METADATA,
-                    storage.nbytes(),
-                    (str(tensor.device), storage.data_ptr()),
-                    tensor,
-                )
-            )
-        return tuple(result)
+        return tensor_allocations(
+            "cache_stats.",
+            ((field.name, getattr(self, field.name)) for field in fields(self)),
+        )

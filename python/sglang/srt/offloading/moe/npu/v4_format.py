@@ -9,17 +9,8 @@ dtype is not a claim about numeric precision: the native GMM interprets FP4.
 
 from __future__ import annotations
 
-import math
-
-from .format import (
-    ExpertBank as V4ExpertBank,
-    ExpertLayerStorage as V4LayerStorage,
-    NpuExpertFormat,
-    TorchNpuFormatAdapter,
-    _Layout,
-)
-
-__all__ = ["NpuV4FP4Format", "NpuExpertFormat", "V4ExpertBank", "V4LayerStorage"]
+from ..formats import CheckpointComponent
+from .format import NpuExpertFormat, TorchNpuFormatAdapter
 
 _WEIGHTS = ("w13_weight", "w2_weight")
 _SCALES = ("w13_weight_scale_inv", "w2_weight_scale_inv")
@@ -95,78 +86,38 @@ class NpuV4FP4Format(NpuExpertFormat):
         self.device = device
         self.adapter = _TorchNpuFormatAdapter(device, native_acl)
         self.workspace_limit_bytes = workspace_limit_bytes
-        raw_shapes = {
-            _WEIGHTS[0]: (1, 2 * intermediate_size, hidden_size // 2),
-            _WEIGHTS[1]: (1, hidden_size, intermediate_size // 2),
-            _SCALES[0]: (1, 2 * intermediate_size, hidden_size // 32),
-            _SCALES[1]: (1, hidden_size, intermediate_size // 32),
-        }
-        # Reject impossible budgets before even the first H2D input allocation.
-        input_peak = max(
-            math.prod(raw_shapes[w]) + math.prod(raw_shapes[s])
-            for w, s in zip(_WEIGHTS, _SCALES)
-        )
-        if workspace_limit_bytes is not None and input_peak > workspace_limit_bytes:
-            raise ValueError("One-expert V4 input exceeds the loader workspace budget")
-        self.layouts = {}
-        self.workspace_nbytes = 0
-        for weight_name, scale_name in zip(_WEIGHTS, _SCALES):
-            baseline = self.adapter.begin_workspace()
-            raw_weight = torch.zeros(
-                raw_shapes[weight_name], dtype=torch.uint8, device="cpu"
-            )
-            raw_scale = torch.zeros(
-                raw_shapes[scale_name], dtype=torch.uint8, device="cpu"
-            )
-            device_weight = self.adapter.to_device(raw_weight)
-            device_scale = self.adapter.to_device(raw_scale)
-            weight, scale = self.adapter.prepare(device_weight, device_scale)
-            self.adapter.synchronize()
-            self._record_layout(weight_name, raw_shapes[weight_name], weight)
-            self._record_layout(scale_name, raw_shapes[scale_name], scale)
-            if (
-                scale.untyped_storage().data_ptr()
-                != device_scale.untyped_storage().data_ptr()
-            ):
-                raise RuntimeError(
-                    "Native V4 scale reshape unexpectedly copied storage"
+        groups = []
+        minimum = []
+        for weight_name, scale_name, n, k in (
+            (_WEIGHTS[0], _SCALES[0], 2 * intermediate_size, hidden_size),
+            (_WEIGHTS[1], _SCALES[1], hidden_size, intermediate_size),
+        ):
+            shards = ("w1", "w3") if weight_name == _WEIGHTS[0] else ("w2",)
+            groups.append(
+                (
+                    CheckpointComponent(
+                        weight_name, (1, n, k // 2), torch.uint8, shards, weight_name
+                    ),
+                    CheckpointComponent(
+                        scale_name,
+                        (1, n, k // 32),
+                        torch.uint8,
+                        shards,
+                        scale_name.removesuffix("_inv"),
+                        (("quant_method", "block"), ("format_ue8m0", False)),
+                    ),
                 )
-            peak = (
-                math.prod(raw_shapes[weight_name])
-                + math.prod(raw_shapes[scale_name])
-                + self.layouts[weight_name].nbytes
             )
-            self._check_workspace(baseline, peak)
-            del weight, scale, device_weight, device_scale, raw_weight, raw_scale
-        self._bind_schema(
+            minimum.append(n * (k // 2 + k // 32))
+        self._probe(
             "ascend.v4.mxfp4.nz.v1",
-            checkpoint_dtypes={name: torch.uint8 for name in self.layouts},
-            shards={
-                name: (("w1", "w3") if name.startswith("w13_") else ("w2",))
-                for name in self.layouts
-            },
-            conversion_groups=tuple(zip(_WEIGHTS, _SCALES)),
+            groups,
+            minimum_workspace=minimum,
             new_outputs=_WEIGHTS,
-            runtime_names=dict(zip(_SCALES, ("w13_weight_scale", "w2_weight_scale"))),
             dispatch_config={
                 "normal_dispatcher_output_dtype": "bf16",
                 "low_latency_dispatcher_output_dtype": "mxfp8",
             },
-        )
-
-    def _record_layout(self, name, raw_shape, tensor):
-        nbytes = self.adapter.physical_nbytes(tensor)
-        if nbytes < math.prod(raw_shape) or nbytes % 64:
-            raise RuntimeError(
-                "Native component cannot hold the aligned checkpoint bytes"
-            )
-        self.layouts[name] = _Layout(
-            raw_shape, tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype, nbytes
-        )
-
-    def checkpoint_attributes(self, name):
-        return (
-            {"quant_method": "block", "format_ue8m0": False} if name in _SCALES else {}
         )
 
     def validate_master(self, raw_components):

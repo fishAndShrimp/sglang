@@ -31,23 +31,7 @@ class OwnerState(Enum):
 
 @dataclass(frozen=True)
 class ForwardToken:
-    owner_token: object
     sequence: int
-    phase: Phase
-
-
-class GraphLease:
-    """Held by a graph bucket until its graph has been destroyed."""
-
-    def __init__(self, owner, key):
-        self.owner = owner
-        self.key = key
-
-    def close(self, *, drained=False):
-        if self.owner is None:
-            return
-        self.owner._release_graph(self.key, drained=drained)
-        self.owner = None
 
 
 class MoEOffloadOwner:
@@ -97,13 +81,10 @@ class MoEOffloadOwner:
                 raise ValueError(f"{kind.value} allocation does not match slot budget")
         self.state = OwnerState.READY
         self.phase = Phase.DECODE
-        self._token = object()
         self._sequence = 0
         self._active = None
         self._capture_session = None
         self._pending = []
-        self._transition_ticket = None
-        self._snapshot_saved = False
         self._graphs = set()
         self._closing = False
         self._graph_cleanups = set()
@@ -172,21 +153,11 @@ class MoEOffloadOwner:
         self.wait_idle()
         try:
             if phase is Phase.PREFILL:
-                self._transition_ticket = self.runtime.snapshot_decode_state()
-                self._transition_ticket.completion.synchronize()
-                self._snapshot_saved = True
+                self.runtime.snapshot_decode_state()
                 self.runtime.borrow_hot_arena()
             else:
-                if not self._snapshot_saved:
-                    raise RuntimeError("Cannot restore decode without a snapshot")
-                self._transition_ticket = self.runtime.restore_decode_state()
-                self._transition_ticket.completion.synchronize()
-                self._snapshot_saved = False
-            retire = getattr(self.runtime, "retire_transitions", None)
-            if retire is not None:
-                retire()
+                self.runtime.restore_decode_state()
             self.phase = phase
-            self._transition_ticket = None
             logger.info(
                 "MoE offload phase.ready: rank=%s phase=%s",
                 self.config.ep_rank,
@@ -219,16 +190,12 @@ class MoEOffloadOwner:
             self.state = OwnerState.FAILED
             raise
         self._sequence += 1
-        token = ForwardToken(self._token, self._sequence, phase)
+        token = ForwardToken(self._sequence)
         self._active = token
         return token
 
     def _check_token(self, token):
-        if (
-            token is None
-            or token is not self._active
-            or token.owner_token is not self._token
-        ):
+        if token is None or token is not self._active:
             raise ValueError("Foreign, stale or already finished forward token")
 
     @_serialized
@@ -259,20 +226,12 @@ class MoEOffloadOwner:
         if key in self._graphs:
             raise ValueError("Graph bucket already bound")
         self._graphs.add(key)
-        return GraphLease(self, key)
 
     @_serialized
-    def _release_graph(self, key, *, drained=False):
-        if not drained:
-            self.wait_idle()
-        # Also cover capture/warmup work, which is not a serving forward ticket.
-        try:
-            if not drained:
-                self.runtime.synchronize()
-            self._graphs.remove(key)
-        except BaseException:
-            self.state = OwnerState.FAILED
-            raise
+    def _release_graph(self, key):
+        """Remove a registration after its wrapper successfully drains and resets."""
+        self._require_no_forward()
+        self._graphs.remove(key)
 
     @_serialized
     def begin_cleanup(self):
@@ -309,15 +268,10 @@ class MoEOffloadOwner:
         try:
             self.runtime.synchronize()
             self.dispose_pending_after_drain()
-            close_drained = getattr(self.runtime, "close_after_drain", None)
-            if close_drained is not None:
-                close_drained()
-            else:
-                self.runtime.close()
+            self.runtime.close_after_drain()
         except BaseException:
             self.state = OwnerState.FAILED
             raise
-        self._transition_ticket = None
         # Release allocation keepalives only after the backend is quiescent.
         self.allocation_ledger = None
         self.state = OwnerState.CLOSED

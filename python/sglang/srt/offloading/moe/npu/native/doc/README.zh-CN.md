@@ -1,6 +1,7 @@
 # ACL batch 原生适配
 
-`../../native_acl.py` 将 `AclBatchHostTransferOps` 接到上级目录的 C++ 扩展。
+`../../native_acl.py` 的 `AclHostTransferOps` 直接验证 host 计划、建立原生
+描述符并提交上级目录的 C++ 扩展，不再经过独立 submitter 或工厂转发。
 扩展直接包含目标机的 `acl/acl.h`、torch_npu 的 `NPUStream.h` 和
 `NPUGuard.h`；不复制 ACL 结构布局、不使用 ctypes 调用真实运行库，
 也不把 Python raw stream handle 当作已经排空的 torch_npu 提交队列。
@@ -21,13 +22,13 @@ Python 环境的 torch_npu。此目录绑定该编译环境，不是可跨 CANN/
 版本复制的通用二进制。源码由项目现有 `srt/**/*` package-data 配置打包。
 
 ```python
-from sglang.srt.offloading.moe.npu.native_acl import get_native_acl, make_acl_host_ops
+from sglang.srt.offloading.moe.npu.native_acl import AclHostTransferOps, get_native_acl
 
 native = get_native_acl("/absolute/path/to/moe-acl-build")
-host_ops = make_acl_host_ops(
-    module=native,
-    retain=context.retain,
-    source_location="unregistered",  # 外部 MemFabric 分配，再经 ACL 注册锁页
+host_ops = AclHostTransferOps(
+    native,
+    context.retain,
+    source_location="host",  # 与当前 NpuMoEBackend 装配一致
     max_batch_entries=256,
 )
 ```
@@ -35,10 +36,10 @@ host_ops = make_acl_host_ops(
 同一进程按规范化构建目录缓存扩展加载，多个 layer/runtime 可以复用模块。
 加载不自动编译；模块不存在时启动失败，不退回 Torch 权重复制。
 
-`source_location="host"` 用于 ACL 分配的 host 内存；`unregistered` 表达
-原始分配并非来自 ACL API；`host_numa` 需要匹配分配所在 NUMA ID。
-这些位置属性不证明锁页。所有路径仍需 `HostMemoryCapability` 的独立锁页
-认证。对 MemFabric 的外部分配，应先成功调用以下注册接口，再建立能力描述。
+适配器接受 `host`、`host_numa`、`unregistered` 位置属性，当前生产装配传入
+`host`；具体属性与分配器的兼容性须在目标 SDK 上验证。位置属性不证明锁页，
+所有路径仍需 `HostMemoryCapability` 的独立认证。MemFabric 外部分配成功注册
+后才建立异步读取能力；目标容量直接由 `DeviceMemoryRegion` 派生。
 
 ## SDK 签名和提交顺序
 
@@ -50,9 +51,9 @@ host_ops = make_acl_host_ops(
 
 提交顺序为：
 
-1. Python 在正确 `torch.npu.stream(copy_stream)` 上下文内创建 C++ `Batch`；
-   在原生调用前，将 Batch、原始描述符和所有 storage/registration owner 交给
-   runtime 的 `retain`。
+1. Python 校验完整计划并建立 C++ `Batch`，在第一次提交前将完整计划、所有
+   Batch、stream 及 storage/registration owner 交给 runtime 的 `retain`，
+   再进入正确 `torch.npu.stream(copy_stream)` 上下文。
 2. C++ 设置调用设备，核对当前 `NPUStream.id()` 与调用者的 `stream_id`，
    调用 `stream(true)` 将先前 host task queue 工作下发到设备流。
 3. 检查取得的实际 stream 非空，再调用 `aclrtMemcpyBatchAsync`。
@@ -98,8 +99,9 @@ torch_npu host queue 中的算子。调用方应先记录并等待对应算子�
 
 ## 目标机验收
 
-CPU fake-SDK 测试与独立 smoke 脚本已移除。ACL 构建入口保留：SDK 签名探测是
-匹配生产 CANN ABI 的必要步骤，不是测试后备路径。
+2026-10-25 的既有 `test_npu_backend.py` 使用原生模块替身验证描述符容量、
+别名拒绝、部分提交保活和记录事件失败；不编译或替代真实 CANN ABI。
+ACL 构建入口的 SDK 签名探测仍是匹配生产 CANN ABI 的必要步骤。
 
 在目标 A5 上验收实际编译/链接、非默认流 wait → batch → event、后台提交与
 计算并行、HostRegisterV2 与 MemFabric 同一 allocation 的兼容性、完整 bundle

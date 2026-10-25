@@ -7,13 +7,13 @@
 
 | 文件 / 目录 | 职责 |
 | --- | --- |
-| `../config.py` / `../backend.py` / `../runtime.py` | 启动配置、资源装配、NPU hooks/stream/capture 绑定 |
+| `../config.py` / `../backend.py` / `../runtime.py` | 启动配置、资源装配、NPU stream/event/allocator 操作 |
 | `../../runtime.py` / `../../owner.py` / `../../graph.py` | 公共 invocation、phase/forward 所有权、graph lease 与显式退休 |
 | `../../models.py` / `../../formats.py` | 模型入口适配、完整 bundle schema 与格式接口 |
-| `../transfer.py` / `../experts.py` | ACL/MemFabric 搬运、DeepEP 与原生 FFN |
+| `../transfer.py` / `../experts.py` | MemFabric 搬运、DeepEP 与原生 FFN |
 | `../storage.py` / `../format.py` / `../format_resolver.py` | host master、共用 ExpertLayerStorage/ExpertBank、格式解析 |
-| `../v4_format.py` / `../w8a8_format.py` | FP4/W8A8 格式行为；旧 LayerStorage 名称是共同 storage 的别名 |
-| `../native_acl.py` / `../native/` | ACL 扩展构建与 C++ 源码 |
+| `../v4_format.py` / `../w8a8_format.py` | FP4/W8A8 recipe、checkpoint 校验和原生转换行为 |
+| `../native_acl.py` / `../native/` | ACL host 计划验证/提交、扩展构建与 C++ 源码 |
 | `../examples/v4.json` | 每 rank 的 offload 容量配置 |
 
 实现说明：[存储](V4_STORAGE.md)、[EP/FFN](EXPERTS_IMPLEMENTATION.zh-CN.md)、
@@ -27,7 +27,7 @@ residency、离线 Top-K / 周期层内 LFU、ACL eager prefill、MemFabric deco
 本项依赖 native ACL、真实存储和 EP/FFN 三项适配一起使用。
 
 当前只装配一个兼容 schema arena，分配前拒绝混合格式/不兼容拓扑。地址目录共享
-不可变 host/hot/destination 表，wave/tail 可变 scratch 独立；一套 prefill pipeline
+不可变 host/hot/destination 表，binding 只描述目标，wave/tail 可变 scratch 独立；一套 prefill pipeline
 拥有所有层的 A/B 读者历史。公共策略只输出 logical target_keys 与显式设备 due，
 full graph 保留 masked tail，非 due 不等于选择/规划 kernel 真早退。
 
@@ -35,7 +35,7 @@ full graph 保留 masked tail，非 due 不等于选择/规划 kernel 真早退�
 非零热池必须配置 `offline_stats_path` 与 `offline_model_id`；示例 JSON 中的 profile
 路径需要替换为真实离线统计文件。在线各层缓存配额由离线初始化确定。
 
-`NpuBoundMoERuntime` 在 decoder 层首启动 prefill worker，在 FusedMoE.forward_impl
+公共 `BoundMoERuntime` 在 decoder 层首启动 prefill worker，在 FusedMoE.forward_impl
 进入 routed program，外层原有 shared experts 与缩放保持原路径。层间、forward
 间复用 A/B 前会把前一个 compute reader frontier 接到 copy stream。激活打包
 workspace 在串行层之间共用。Dispatch 后真实本地计数进入 residency；设备

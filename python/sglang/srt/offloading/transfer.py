@@ -112,24 +112,16 @@ class HostCopyRegion:
     source_offset: int
     destination_offset: int
     nbytes: int
-    source_capacity: int
-    destination_capacity: int
 
     def __post_init__(self):
-        if (
-            min(
-                self.source_offset,
-                self.destination_offset,
-                self.nbytes,
-                self.source_capacity,
-                self.destination_capacity,
-            )
-            < 0
-        ):
+        values = (self.source_offset, self.destination_offset, self.nbytes)
+        if any(type(value) is not int for value in values):
+            raise TypeError("Copy byte ranges must be integers")
+        if min(values) < 0:
             raise ValueError("Copy byte ranges must be nonnegative")
-        if self.source_offset + self.nbytes > self.source_capacity:
+        if self.source_offset + self.nbytes > self.source.nbytes:
             raise ValueError("Copy exceeds source allocation")
-        if self.destination_offset + self.nbytes > self.destination_capacity:
+        if self.destination_offset + self.nbytes > self.destination.nbytes:
             raise ValueError("Copy exceeds destination allocation")
 
 
@@ -142,6 +134,8 @@ class HostCopyPlan:
 
     def __post_init__(self):
         object.__setattr__(self, "regions", tuple(self.regions))
+        if any(type(region) is not HostCopyRegion for region in self.regions):
+            raise TypeError("Host plans require immutable HostCopyRegion entries")
         object.__setattr__(self, "keepalive", tuple(self.keepalive))
 
 
@@ -191,102 +185,3 @@ class DeviceTransferOps(ABC):
     @abstractmethod
     def materialize_into(self, plan, bindings, stream) -> TransferTicket:
         """Emit graph operations. No .item(), .tolist() or CPU route decisions."""
-
-
-class WeightTransferBackend(ABC):
-    def materialize_host_into(self, plan, bindings, stream) -> TransferTicket:
-        """Optional eager entry point; existing device-only backends stay valid."""
-        raise NotImplementedError("Host-planned transfers require HostTransferOps")
-
-    @property
-    @abstractmethod
-    def supports_device_plans(self) -> bool:
-        pass
-
-    @abstractmethod
-    def materialize_into(self, plan, bindings, stream) -> TransferTicket:
-        pass
-
-
-class ComposedTransferBackend(WeightTransferBackend):
-    """Independent host/device implementations sharing fixed-storage semantics.
-
-    Having device ops does not certify full graph support. The runtime must
-    validate that separately. Neither entry point allocates expert storage.
-    """
-
-    def __init__(self, *, host_ops=None, device_ops=None):
-        self.host_ops = host_ops
-        self.device_ops = device_ops
-
-    @property
-    def supports_device_plans(self):
-        return self.device_ops is not None
-
-    def materialize_host_into(self, plan, bindings, stream):
-        if not isinstance(plan, HostCopyPlan):
-            raise TypeError("Host transfers require HostCopyPlan")
-        return self._materialize(self.host_ops, plan, bindings, stream)
-
-    def materialize_into(self, plan, bindings, stream):
-        if not isinstance(plan, DeviceCopyPlan):
-            raise TypeError("Device transfers require DeviceCopyPlan")
-        return self._materialize(self.device_ops, plan, bindings, stream)
-
-    @staticmethod
-    def _materialize(ops, plan, bindings, stream):
-        if ops is None:
-            raise NotImplementedError(
-                "The requested transfer implementation is unbound"
-            )
-        ticket = ops.materialize_into(plan, bindings, stream)
-        if not isinstance(ticket, TransferTicket):
-            raise TypeError("Transfer implementations must return TransferTicket")
-        return TransferTicket(ticket.completion, (ticket, plan, bindings, ops))
-
-
-class TorchTransferBackend(WeightTransferBackend):
-    """Ordinary PyTorch copies, optionally extended with device-plan lowering.
-
-    The copy stream and event are caller-owned. A supplied lowering must retain
-    any host registration handle in its ticket; pinning alone is not registration.
-    """
-
-    def __init__(self, device_ops=None):
-        self.device_ops = device_ops
-
-    @property
-    def supports_device_plans(self):
-        return self.device_ops is not None
-
-    def materialize_into(self, plan, bindings, stream):
-        if self.device_ops is None:
-            raise NotImplementedError(
-                "Dynamic graph H2D requires DeviceTransferOps; static copy_ is "
-                "not a decode fallback."
-            )
-        return self.device_ops.materialize_into(plan, bindings, stream)
-
-    @staticmethod
-    def allocate_and_copy(source, device):
-        """Legacy V2 whole-parameter API; allocation is explicit at this boundary."""
-        return source.to(device=device, non_blocking=True)
-
-    @staticmethod
-    def copy_into(copies, *, device_module, stream, event):
-        """Copy host-planned (source, destination) tensor pairs into fixed storage.
-
-        Callers establish prior-reader dependencies on stream before calling.
-        Do not use this host loop to choose dynamic replay sources.
-        """
-        copies = tuple(copies)
-        for source, destination in copies:
-            if source.shape != destination.shape or source.dtype != destination.dtype:
-                raise ValueError("Weight transfers must preserve shape and dtype")
-            if source.device.type == "cpu" and not source.is_pinned():
-                raise ValueError("Asynchronous H2D requires pinned host weights")
-        with device_module.stream(stream):
-            for source, destination in copies:
-                destination.copy_(source, non_blocking=True)
-            event.record(stream)
-        return TransferTicket(EventCompletion(event), (copies,))

@@ -2,23 +2,13 @@
 
 import math
 import threading
-from dataclasses import dataclass
 from types import MappingProxyType
 
 from ..formats import BundleComponent, BundleSchema, ExpertFormat
-from ..resources import Allocation, ResourceKind
-from ..storage import HostExpertStore, HostMemoryCapability
+from ..resources import ResourceKind, tensor_allocations
+from ..storage import HostMemoryCapability
 from .storage import _align
 from .transfer import DeviceMemoryRegion
-
-
-@dataclass(frozen=True)
-class _Layout:
-    raw_shape: tuple
-    runtime_shape: tuple
-    runtime_stride: tuple
-    dtype: object
-    nbytes: int
 
 
 class TorchNpuFormatAdapter:
@@ -80,48 +70,102 @@ class TorchNpuFormatAdapter:
 class NpuExpertFormat(ExpertFormat):
     """Fixed bank allocation and byte budgets shared by FP4 and INT8 formats."""
 
-    host_component_nbytes = {}
-
-    def _bind_schema(
-        self,
-        format_id,
-        *,
-        checkpoint_dtypes,
-        shards,
-        conversion_groups,
-        new_outputs,
-        runtime_names,
-        dispatch_config,
+    def _probe(
+        self, format_id, groups, *, minimum_workspace, new_outputs, dispatch_config
     ):
-        components = tuple(
-            BundleComponent(
-                name,
-                layout.raw_shape,
-                layout.runtime_shape,
-                layout.runtime_stride,
-                layout.dtype,
-                layout.nbytes,
-                checkpoint_dtypes[name],
-                self.host_component_nbytes.get(name, layout.nbytes),
-                tuple(shards[name]),
-                runtime_names.get(name, name),
-                tuple(self.checkpoint_attributes(name).items()),
+        """Probe each projection once; retain descriptors, never probe tensors."""
+        import torch
+
+        if (
+            not groups
+            or len(groups) != len(minimum_workspace)
+            or any(not g for g in groups)
+        ):
+            raise ValueError("Conversion groups require matching workspace bounds")
+        if (
+            self.workspace_limit_bytes is not None
+            and max(minimum_workspace) > self.workspace_limit_bytes
+        ):
+            raise ValueError(
+                "One-expert conversion exceeds the loader workspace budget"
             )
-            for name, layout in self.layouts.items()
-        )
+        components = []
+        self.workspace_nbytes = 0
+        for recipes, minimum in zip(groups, minimum_workspace):
+            baseline = self.adapter.begin_workspace()
+            inputs = tuple(
+                self.adapter.to_device(
+                    torch.full(
+                        recipe.shape,
+                        recipe.initial_value,
+                        dtype=recipe.dtype,
+                        device="cpu",
+                    )
+                )
+                for recipe in recipes
+            )
+            converted = self.adapter.prepare(*inputs)
+            self.adapter.synchronize()
+            if len(converted) != len(recipes):
+                raise RuntimeError(
+                    "Native conversion returned an incomplete projection"
+                )
+            output_bytes = 0
+            for recipe, raw, value in zip(recipes, inputs, converted):
+                nbytes = self.adapter.physical_nbytes(value)
+                raw_bytes = raw.numel() * raw.element_size()
+                if (
+                    nbytes < value.numel() * value.element_size()
+                    or nbytes % 64
+                    or (raw.dtype == value.dtype and nbytes < raw_bytes)
+                ):
+                    raise RuntimeError(
+                        "Native component has an invalid physical extent"
+                    )
+                if recipe.name in new_outputs:
+                    output_bytes += nbytes
+                elif (
+                    value.untyped_storage().data_ptr()
+                    != raw.untyped_storage().data_ptr()
+                ):
+                    raise RuntimeError(
+                        "Native metadata view unexpectedly copied storage"
+                    )
+                components.append(
+                    BundleComponent(
+                        recipe.name,
+                        tuple(raw.shape),
+                        tuple(value.shape),
+                        tuple(value.stride()),
+                        value.dtype,
+                        nbytes,
+                        raw.dtype,
+                        max(nbytes, _align(raw_bytes, 64)),
+                        recipe.shards,
+                        recipe.runtime_name,
+                        recipe.attributes,
+                    )
+                )
+            known = (
+                sum(value.numel() * value.element_size() for value in inputs)
+                + output_bytes
+            )
+            self._check_workspace(baseline, max(minimum, known))
+            del inputs, converted, raw, value
         self.schema = BundleSchema(
             format_id,
-            components,
-            tuple(conversion_groups),
+            tuple(components),
+            tuple(tuple(recipe.name for recipe in group) for group in groups),
             tuple(new_outputs),
             tuple(dispatch_config.items()),
         )
-        self.layouts = MappingProxyType({c.name: c for c in components})
-        self.component_nbytes = MappingProxyType({c.name: c.nbytes for c in components})
-        self.host_component_nbytes = MappingProxyType(
-            {c.name: c.host_nbytes for c in components}
+        self.layouts = MappingProxyType(
+            {component.name: component for component in components}
         )
-        self.expert_nbytes = self.schema.expert_nbytes
+
+    @property
+    def expert_nbytes(self):
+        return self.schema.expert_nbytes
 
     def checkpoint_view(self, allocation, name, experts):
         import torch
@@ -202,10 +246,6 @@ class NpuExpertFormat(ExpertFormat):
             for name, layout in self.layouts.items()
         )
 
-    def allocations(self):
-        # Transient loader peak, accounted separately from persistent graph HBM.
-        return ()
-
     def allocate_bank(self, capacity, kind, name):
         if type(capacity) is not int or capacity < 0:
             raise ValueError("Bank capacity must be a nonnegative integer")
@@ -232,15 +272,13 @@ class NpuExpertFormat(ExpertFormat):
 
 
 class ExpertBank:
-    def __init__(self, format, tensors, capacity, kind, name, *, owner=None, start=0):
+    def __init__(self, format, tensors, capacity, kind, name, *, owner=None):
         self.format, self.tensors, self.capacity = format, tensors, capacity
         self.kind, self.name = kind, name
-        self._owner, self._start = owner, start
-        self.expert_nbytes = format.expert_nbytes
+        self._owner = owner
         self.component_regions = {}
         for component, tensor in tensors.items():
-            setattr(self, component, tensor)
-            extent = format.component_nbytes[component]
+            extent = format.layouts[component].nbytes
             self.component_regions[component] = tuple(
                 DeviceMemoryRegion(
                     tensor.data_ptr() + index * extent, extent, tensor.device, tensor
@@ -263,18 +301,13 @@ class ExpertBank:
                 value.untyped_storage().data_ptr()
                 != tensor.untyped_storage().data_ptr()
                 or value.data_ptr()
-                != tensor.data_ptr() + start * self.format.component_nbytes[name]
+                != tensor.data_ptr() + start * self.format.layouts[name].nbytes
             ):
                 raise RuntimeError(
                     "Native expert slicing did not preserve physical byte extents"
                 )
             tensors[name] = value
-        return ExpertBank(
-            self.format, tensors, count, self.kind, self.name, owner=self, start=start
-        )
-
-    def slice(self, start, end):
-        return self.view(start, end - start)
+        return ExpertBank(self.format, tensors, count, self.kind, self.name, owner=self)
 
     def quant_info(self):
         return self.format.quant_info(self.tensors)
@@ -282,17 +315,7 @@ class ExpertBank:
     def allocations(self):
         if self._owner is not None:
             return ()
-        return tuple(
-            Allocation(
-                f"{self.name}.{name}",
-                self.kind,
-                tensor.untyped_storage().nbytes(),
-                (str(tensor.device), tensor.untyped_storage().data_ptr()),
-                self,
-            )
-            for name, tensor in self.tensors.items()
-            if tensor.numel()
-        )
+        return tensor_allocations(self.name + ".", self.tensors.items(), self.kind)
 
 
 def _sealed_loader(*args, **kwargs):
@@ -314,8 +337,6 @@ class ExpertLayerStorage:
             format,
             host_pool,
         )
-        self.expert_nbytes = format.expert_nbytes
-        self.host_store = HostExpertStore()
         self.component_capabilities, self.raw_components = {}, {}
         self._loaded, self._checkpoint_state = set(), {}
         self._parameter_names = []
@@ -325,9 +346,20 @@ class ExpertLayerStorage:
             raise ValueError("Expert parameters already exist before host interception")
         try:
             for name, layout in format.layouts.items():
-                host_extent = format.host_component_nbytes.get(name, layout.nbytes)
+                host_extent = layout.host_nbytes
                 allocation = host_pool.allocate(
                     host_extent * spec.local_experts, alignment=layout.alignment
+                )
+                if (
+                    allocation.tensor.device.type != "cpu"
+                    or not isinstance(allocation.capability, HostMemoryCapability)
+                    or not allocation.capability.acl_async_readable
+                ):
+                    raise ValueError(
+                        "Host weights require certified asynchronous CPU storage"
+                    )
+                allocation.capability.validate_range(
+                    allocation.tensor.data_ptr(), host_extent * spec.local_experts
                 )
                 allocation.tensor.zero_()
                 raw = format.checkpoint_view(
@@ -343,12 +375,6 @@ class ExpertLayerStorage:
                 layer.register_parameter(name, parameter)
                 self._parameter_names.append(name)
                 self.raw_components[name] = raw
-                self.host_store.add(
-                    spec.layer_id,
-                    name,
-                    allocation.tensor,
-                    capability=allocation.capability,
-                )
                 self.component_capabilities[name] = tuple(
                     HostMemoryCapability(
                         raw.data_ptr() + index * host_extent,
@@ -435,8 +461,6 @@ class ExpertLayerStorage:
                     self.format.repack_into(
                         self.raw_components, expert, self.component_capabilities
                     )
-                self.host_store.seal()
-                self.host_store.require_device_access()
                 if hasattr(self.layer, "dispatcher"):
                     self.layer.dispatcher.set_quant_config(
                         dict(self.format.schema.dispatch_config)
@@ -451,9 +475,9 @@ class ExpertLayerStorage:
             self._loaded = self._checkpoint_state = None
             self.raw_components.clear()
 
-    def allocations(self):
-        # The model-wide pool reports its physical reservation once.
-        return ()
+    def require_sealed(self):
+        if self._state != "sealed":
+            raise RuntimeError("Seal host storage before binding device access")
 
     def close(self):
         """Retire module-visible host views before the caller frees the drained pool."""
@@ -473,5 +497,5 @@ class ExpertLayerStorage:
             self.raw_components.clear()
             self.component_capabilities.clear()
             self._loaded = self._checkpoint_state = None
-            self.host_store = self.host_pool = self.layer = None
+            self.host_pool = self.layer = None
             self._state = "closed"

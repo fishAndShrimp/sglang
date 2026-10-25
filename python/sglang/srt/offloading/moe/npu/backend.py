@@ -7,7 +7,6 @@ from dataclasses import dataclass, fields
 from types import SimpleNamespace
 
 from ...transfer import (
-    ComposedTransferBackend,
     CopySourceKind,
     DeviceCopyPlan,
     HostCopyPlan,
@@ -19,41 +18,26 @@ from ..diagnostics import BatchDiagnostics
 from ..execution import (
     CacheUpdateCoordinator,
     ExecutionRequest,
-    ExecutionReservation,
+    MaterializationPlan,
     ExpertWeightAccess,
-    SourcePolicy,
 )
 from ..interfaces import MoEBackend
 from ..models import DeepSeekV4Adapter
 from ..prefill import BoundedPrefillWeightPipeline, PrefillPipelineConfig
 from ..residency import BoundExecutionWave, TensorResidencyOps
-from ..resources import Allocation, ResourceKind
-from ..runtime import DecodeStateSnapshot
+from ..resources import ResourceKind, tensor_allocations
+from ..runtime import BoundMoERuntime, DecodeStateSnapshot
 from ..state import ResidencyState
 from .config import validate_native_environment
 from .format_resolver import resolve_npu_format
-from .runtime import NpuBoundMoERuntime, NpuDeviceRuntime
+from .runtime import NpuDeviceRuntime
 from .transfer import (
     MemFabricAddressCatalog,
-    MemFabricCopyComponent,
     MemFabricDeviceTransferOps,
     MemFabricTransferBindings,
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _tensor_allocations(prefix, tensors, kind=ResourceKind.METADATA):
-    result, seen = [], set()
-    for name, tensor in tensors:
-        storage = tensor.untyped_storage()
-        key = (str(tensor.device), storage.data_ptr())
-        if storage.nbytes() and key not in seen:
-            seen.add(key)
-            result.append(
-                Allocation(prefix + name, kind, storage.nbytes(), key, tensor)
-            )
-    return tuple(result)
 
 
 @dataclass(frozen=True)
@@ -68,7 +52,7 @@ class NpuMoEBackend(MoEBackend):
         import torch
 
         validate_native_environment()
-        self.settings, self.config, self.hf_config = settings, config, hf_config
+        self.settings = settings
         self.device = torch.device(device)
         if self.device.type != "npu" or self.device.index is None:
             raise ValueError("Native V4 offload requires an explicit NPU device")
@@ -164,7 +148,7 @@ class NpuMoEBackend(MoEBackend):
         import torch
 
         from .experts import NPUExpertBank, build_npu_layer_programs
-        from .native_acl import make_acl_host_ops
+        from .native_acl import AclHostTransferOps
 
         if self.runtime is not None or self._closed:
             raise RuntimeError("Backend already finalized or closed")
@@ -175,7 +159,7 @@ class NpuMoEBackend(MoEBackend):
         if set(self.layers) != {s.layer_id for s in catalog.offloaded_layers}:
             raise ValueError("Incomplete native expert storage registration")
         for storage in self.layers.values():
-            storage.host_store.require_device_access()
+            storage.require_sealed()
         k = config.hot_slots(catalog)
         initial_keys = policy.initial_keys(
             k, getattr(self.settings, "offline_model_id", None)
@@ -189,7 +173,7 @@ class NpuMoEBackend(MoEBackend):
             config.execution_slots, ResourceKind.EXECUTION_WEIGHTS, "execution"
         )
         self._unbound_resources.extend((hot, execution))
-        component_names = tuple(self.format.component_nbytes)
+        component_names = tuple(self.format.layouts)
         hosts = {
             name: tuple(
                 cap
@@ -199,40 +183,22 @@ class NpuMoEBackend(MoEBackend):
             for name in component_names
         }
         address_catalog = MemFabricAddressCatalog(
-            tuple(
-                MemFabricCopyComponent(
-                    hosts[name],
-                    hot.component_regions[name],
-                    (),
-                    self.format.component_nbytes[name],
-                    name,
-                )
-                for name in component_names
-            ),
+            hosts,
+            hot.component_regions,
+            {name: self.format.layouts[name].nbytes for name in component_names},
             device=self.device,
         )
         self._unbound_resources.append(address_catalog)
         bindings = []
 
         def bind(bank, capacity, name, valid=None):
-            components = tuple(
-                MemFabricCopyComponent(
-                    hosts[key],
-                    hot.component_regions[key],
-                    bank.component_regions[key],
-                    self.format.component_nbytes[key],
-                    key,
-                )
-                for key in component_names
-            )
             result = MemFabricTransferBindings(
-                components,
+                address_catalog,
+                bank.component_regions,
                 capacity=capacity,
                 hot_generations=state.slot_generation,
                 error_status=error,
-                device=self.device,
                 name=name,
-                address_catalog=address_catalog,
             )
             if valid is not None:
                 result.expert_bank = NPUExpertBank(bank.quant_info(), valid, error)
@@ -302,7 +268,6 @@ class NpuMoEBackend(MoEBackend):
                 _PrefillTarget(binding),
                 wave,
                 Phase.PREFILL,
-                SourcePolicy.HOST_ONLY,
             )
 
         def prepare_prefill(request, context):
@@ -318,7 +283,7 @@ class NpuMoEBackend(MoEBackend):
                 ):
                     source = storage.component_capabilities[name][expert]
                     destination = bank.component_regions[name][lane]
-                    nbytes = self.format.component_nbytes[name]
+                    nbytes = self.format.layouts[name].nbytes
                     regions.append(
                         HostCopyRegion(
                             source,
@@ -326,11 +291,9 @@ class NpuMoEBackend(MoEBackend):
                             0,
                             0,
                             nbytes,
-                            source.nbytes,
-                            destination.nbytes,
                         )
                     )
-            return ExecutionReservation(
+            return MaterializationPlan(
                 HostCopyPlan(tuple(regions), (storage, bank)), target.binding
             )
 
@@ -363,12 +326,9 @@ class NpuMoEBackend(MoEBackend):
         def retain(resource):
             self.runtime.context.retain(resource)
 
-        host_ops = make_acl_host_ops(
-            retain=retain, module=self.native_acl, source_location="host"
-        )
+        host_ops = AclHostTransferOps(self.native_acl, retain, source_location="host")
         device_ops = MemFabricDeviceTransferOps(retain=retain)
-        transfer = ComposedTransferBackend(host_ops=host_ops, device_ops=device_ops)
-        access = ExpertWeightAccess(ops, transfer)
+        access = ExpertWeightAccess(ops, host_ops=host_ops, device_ops=device_ops)
         policy_state = policy.allocate_state(catalog.num_experts, self.device)
         targets = torch.full((k,), -1, dtype=torch.int64, device=self.device)
         update_due = torch.zeros((), dtype=torch.bool, device=self.device)
@@ -394,7 +354,9 @@ class NpuMoEBackend(MoEBackend):
             restore_plan.count.copy_(restore_plan.valid.sum(dtype=torch.int32))
             ready = context.record_compute_completion()
             ready.completion.wait_on(context.copy_stream)
-            return transfer.materialize_into(restore_plan, update, context.copy_stream)
+            return device_ops.materialize_into(
+                restore_plan, update, context.copy_stream
+            )
 
         programs, program_resources = {}, []
         # A/B belong to the arena, so one submitter owns their complete reader
@@ -464,7 +426,7 @@ class NpuMoEBackend(MoEBackend):
         tensors.extend(
             (f"prefill.valid.{key}", tensor) for key, tensor in prefill_valid.items()
         )
-        resources.extend(_tensor_allocations("npu.", tensors))
+        resources.extend(tensor_allocations("npu.", tensors))
         resources.extend(program_resources)
         diagnostics = None
         if self.device.type == "npu" and getattr(
@@ -499,7 +461,7 @@ class NpuMoEBackend(MoEBackend):
             group,
             getattr(self.settings, "batch_log_interval", 1) if diagnostics else 0,
         )
-        self.runtime = NpuBoundMoERuntime(
+        self.runtime = BoundMoERuntime(
             device_runtime=self.device_runtime,
             residency=state,
             residency_ops=ops,

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from types import MappingProxyType
 
 from ...transfer import (
     Completion,
@@ -23,11 +24,9 @@ from ...transfer import (
     DeviceCopyPlan,
     DeviceTransferOps,
     EventCompletion,
-    HostCopyPlan,
-    HostTransferOps,
     TransferTicket,
 )
-from ..resources import Allocation, ResourceKind
+from ..resources import tensor_allocations
 from ..storage import HostMemoryCapability
 
 _UINT32_MAX = 2**32 - 1
@@ -90,23 +89,6 @@ class DeviceMemoryRegion:
         return cls(tensor.data_ptr(), logical_bytes, tensor.device, tensor)
 
 
-@dataclass(frozen=True)
-class AclCopyBatch:
-    """Native shim input: H2D only, one HOST/DEVICE location pair per entry.
-
-    The compiled shim translates these Python-owned tuples to its SDK's arrays
-    and location attributes, covering every entry with increasing indices.
-    It owns the translated arrays until its queued task and DMA have completed.
-    """
-
-    source_addresses: tuple
-    destination_addresses: tuple
-    sizes: tuple
-    destination_capacities: tuple
-    keepalive: tuple
-    direction: str = "host_to_device"
-
-
 class TransferSubmissionError(RuntimeError):
     """Submission may be partial. Retained resources require a stream drain."""
 
@@ -137,191 +119,6 @@ def _submission_failure(error, record_completion, stream, resources, retain):
     )
 
 
-class AclBatchHostTransferOps(HostTransferOps):
-    """Validate, bound and submit eager ACL batches without weight staging.
-
-    native_submit(batch, stream) returns None/0 on success or raises/returns a
-    nonzero status on failure. The explicit queue_ordering_verified declaration
-    is the binder's assertion that its SDK-specific shim preserves host queue
-    order; this class cannot establish that property from a raw ACL handle.
-    retain must remain valid after exceptions and be thread-safe for prefetch.
-    """
-
-    def __init__(
-        self,
-        *,
-        native_submit,
-        record_completion,
-        retain,
-        queue_ordering_verified=False,
-        stream_context=None,
-        max_batch_entries=256,
-    ):
-        if not queue_ordering_verified:
-            raise ValueError("ACL requires a verified torch_npu queue-ordered shim")
-        if type(max_batch_entries) is not int or max_batch_entries <= 0:
-            raise ValueError("ACL batch capacity must be positive")
-        for callback in (native_submit, record_completion, retain):
-            if not callable(callback):
-                raise TypeError("ACL submission/lifetime callbacks are required")
-        self.native_submit = native_submit
-        self.record_completion = record_completion
-        self.retain = retain
-        self.stream_context = stream_context or _npu_stream_context
-        self.max_batch_entries = max_batch_entries
-
-    def _lower(self, plan):
-        entries, destinations, mapped_sources = [], [], []
-        destination_device = None
-        for region in plan.regions:
-            if any(
-                type(value) is not int
-                for value in (
-                    region.source_offset,
-                    region.destination_offset,
-                    region.nbytes,
-                    region.source_capacity,
-                    region.destination_capacity,
-                )
-            ):
-                raise TypeError("ACL byte ranges and capacities must be integers")
-            source, destination = region.source, region.destination
-            if not isinstance(source, HostMemoryCapability):
-                raise TypeError("ACL source requires a HostMemoryCapability")
-            if not source.acl_async_readable:
-                raise ValueError(
-                    "Host registration does not permit asynchronous ACL reads"
-                )
-            if not isinstance(destination, DeviceMemoryRegion):
-                raise TypeError("ACL destination requires a DeviceMemoryRegion")
-            if (
-                getattr(
-                    destination.device, "type", str(destination.device).split(":")[0]
-                )
-                != "npu"
-            ):
-                raise ValueError("ACL prefill supports host-to-NPU copies only")
-            if (
-                destination_device is not None
-                and destination.device != destination_device
-            ):
-                raise ValueError("An ACL batch must target a single device")
-            destination_device = destination.device
-            if region.source_capacity > source.nbytes:
-                raise ValueError("Declared source capacity exceeds registered storage")
-            if region.destination_capacity > destination.nbytes:
-                raise ValueError("Declared destination capacity exceeds storage")
-            # Revalidate even when a caller constructed a mutable/foreign plan.
-            if min(region.source_offset, region.destination_offset, region.nbytes) < 0:
-                raise ValueError("Copy ranges must be nonnegative")
-            if region.source_offset + region.nbytes > region.source_capacity:
-                raise ValueError("Copy exceeds registered source capacity")
-            if region.destination_offset + region.nbytes > region.destination_capacity:
-                raise ValueError("Copy exceeds destination capacity")
-            src = source.host_address + region.source_offset
-            dst = destination.address + region.destination_offset
-            _range(src, region.nbytes)
-            if source.device_address is not None:
-                mapped_sources.append(
-                    _range(source.device_pointer(src, region.nbytes), region.nbytes)
-                )
-            destinations.append(_range(dst, region.nbytes))
-            if region.nbytes:
-                entries.append(
-                    (
-                        src,
-                        dst,
-                        region.nbytes,
-                        region.destination_capacity - region.destination_offset,
-                        source,
-                        destination,
-                    )
-                )
-        _reject_overlapping(destinations)
-        if any(
-            _overlap(source, destination)
-            for source in mapped_sources
-            for destination in destinations
-        ):
-            raise ValueError("Copy destination overlaps mapped immutable host storage")
-        batches = []
-        for begin in range(0, len(entries), self.max_batch_entries):
-            chunk = entries[begin : begin + self.max_batch_entries]
-            batches.append(
-                AclCopyBatch(
-                    tuple(e[0] for e in chunk),
-                    tuple(e[1] for e in chunk),
-                    tuple(e[2] for e in chunk),
-                    tuple(e[3] for e in chunk),
-                    tuple((e[4], e[5]) for e in chunk),
-                )
-            )
-        return tuple(batches)
-
-    def materialize_into(self, plan, bindings, stream):
-        if not isinstance(plan, HostCopyPlan):
-            raise TypeError("ACL transfers require a HostCopyPlan")
-        batches = self._lower(plan)
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "MoE offload acl.submit: batches=%s regions=%s bytes=%s stream=%s",
-                len(batches),
-                len(plan.regions),
-                sum(region.nbytes for region in plan.regions),
-                getattr(stream, "stream_id", None),
-            )
-        resources = (plan, bindings, batches, self)
-        # This happens before the first native call, including a call that throws
-        # after submitting a partial batch and never returns a completion ticket.
-        self.retain(resources)
-        with self.stream_context(stream):
-            try:
-                for batch in batches:
-                    status = self.native_submit(batch, stream)
-                    if status is not None and status != 0:
-                        raise RuntimeError(f"ACL batch failed with status {status}")
-                return _ticket(self.record_completion, stream, resources, self.retain)
-            except Exception as error:
-                raise _submission_failure(
-                    error, self.record_completion, stream, resources, self.retain
-                ) from error
-
-
-@dataclass(frozen=True)
-class MemFabricCopyComponent:
-    """One physical component per expert, with equal byte extent across experts.
-
-    Include separate components for all weights, quantization scales and padding.
-    Each source/destination region starts at that expert's component; no implicit
-    contiguous expert stride or dtype conversion is assumed.
-    """
-
-    host_sources: tuple
-    hot_sources: tuple
-    destinations: tuple
-    nbytes: int
-    name: str = "weights"
-
-    def __post_init__(self):
-        for field in ("host_sources", "hot_sources", "destinations"):
-            object.__setattr__(self, field, tuple(getattr(self, field)))
-        if type(self.nbytes) is not int or not 0 <= self.nbytes <= _UINT32_MAX:
-            raise ValueError("MemFabric component size must fit uint32 bytes")
-        for source in self.host_sources:
-            if not isinstance(source, HostMemoryCapability):
-                raise TypeError("Mapped host sources require HostMemoryCapability")
-            if not source.acl_async_readable:
-                raise ValueError(
-                    "Shared host master must also support asynchronous ACL reads"
-                )
-            source.device_pointer(source.host_address, self.nbytes)
-        for region in self.hot_sources + self.destinations:
-            if not isinstance(region, DeviceMemoryRegion):
-                raise TypeError("Device sources/targets require DeviceMemoryRegion")
-            if self.nbytes > region.nbytes:
-                raise ValueError("Component exceeds its physical storage capacity")
-
-
 def _ranges_overlap(first, second):
     """Check two physical interval sets once, without a Cartesian product."""
     first = sorted(r for r in first if r[0] < r[1])
@@ -338,48 +135,73 @@ def _ranges_overlap(first, second):
 
 
 class MemFabricAddressCatalog:
-    """Shared immutable address tables and certified allocation owners.
+    """One certified source catalog; bindings supply only physical destinations."""
 
-    Source tables are uploaded once per arena. Destination tables and alias
-    validation are cached by their physical view, independently of wave scratch.
-    Finish binding before capture; allocations() reports each table exactly once.
-    """
-
-    def __init__(self, components, *, device, name="moe.addresses"):
+    def __init__(
+        self,
+        host_sources,
+        hot_sources,
+        component_nbytes,
+        *,
+        device,
+        name="moe.addresses",
+    ):
         import torch
 
         self.device = torch.device(device)
         if self.device.type != "npu" or self.device.index is None:
             raise ValueError("MemFabric requires an explicit NPU device index")
-        self.components = tuple(components)
-        if not self.components:
-            raise ValueError("At least one complete-bundle component is required")
-        self.name = name
-        self.host_count = len(self.components[0].host_sources)
-        self.hot_count = len(self.components[0].hot_sources)
-        self._tensors = []
-        self._destinations = {}
+        if (
+            not component_nbytes
+            or set(host_sources) != set(component_nbytes)
+            or set(hot_sources) != set(component_nbytes)
+        ):
+            raise ValueError("Complete source bundles must match the component schema")
+        self.component_nbytes = MappingProxyType(dict(component_nbytes))
+        self.host_sources = tuple(
+            tuple(host_sources[name]) for name in component_nbytes
+        )
+        self.hot_sources = tuple(tuple(hot_sources[name]) for name in component_nbytes)
+        self.host_count, self.hot_count = len(self.host_sources[0]), len(
+            self.hot_sources[0]
+        )
+        self.name, self._tensors, self._destinations = name, [], {}
         self._sealed = False
         self._host_ranges, self._hot_ranges = [], []
         tables = []
-        for component in self.components:
-            if (len(component.host_sources), len(component.hot_sources)) != (
-                self.host_count,
-                self.hot_count,
-            ):
+        for nbytes, hosts, hot in zip(
+            self.component_nbytes.values(), self.host_sources, self.hot_sources
+        ):
+            if type(nbytes) is not int or not 0 <= nbytes <= _UINT32_MAX:
+                raise ValueError("MemFabric component size must fit uint32 bytes")
+            if (len(hosts), len(hot)) != (self.host_count, self.hot_count):
                 raise ValueError("Components must describe the same source counts")
-            for region in component.hot_sources:
-                if torch.device(region.device) != self.device:
-                    raise ValueError("Source region is on a different device")
-            host = [
-                s.device_pointer(s.host_address, component.nbytes)
-                for s in component.host_sources
-            ]
-            hot = [s.address for s in component.hot_sources]
-            self._host_ranges.extend(_range(p, component.nbytes) for p in host)
-            self._hot_ranges.extend(_range(p, component.nbytes) for p in hot)
-            tables.append((self._table(host), self._table(hot)))
+            pointers = []
+            for source in hosts:
+                if (
+                    not isinstance(source, HostMemoryCapability)
+                    or not source.acl_async_readable
+                ):
+                    raise ValueError(
+                        "Host sources require certified asynchronous reads"
+                    )
+                pointers.append(source.device_pointer(source.host_address, nbytes))
+            self._validate_device_regions(hot, nbytes)
+            self._host_ranges.extend(_range(p, nbytes) for p in pointers)
+            self._hot_ranges.extend(_range(r.address, nbytes) for r in hot)
+            tables.append(
+                (self._table(pointers), self._table([r.address for r in hot]))
+            )
         self.source_tables = tuple(tables)
+
+    def _validate_device_regions(self, regions, nbytes):
+        import torch
+
+        for region in regions:
+            if not isinstance(region, DeviceMemoryRegion):
+                raise TypeError("Device storage requires DeviceMemoryRegion")
+            if torch.device(region.device) != self.device or nbytes > region.nbytes:
+                raise ValueError("Device region has an incompatible device or capacity")
 
     def _table(self, pointers):
         import torch
@@ -389,30 +211,18 @@ class MemFabricAddressCatalog:
         self._tensors.append(value)
         return value
 
-    def bind(self, components):
-        import torch
-
-        components = tuple(components)
-        if len(components) != len(self.components):
-            raise ValueError("Transfer components differ from the address catalog")
-        count = len(components[0].destinations)
-        for component, source in zip(components, self.components):
-            if (
-                component.name != source.name
-                or component.nbytes != source.nbytes
-                or component.host_sources != source.host_sources
-                or component.hot_sources != source.hot_sources
-            ):
-                raise ValueError("Transfer sources differ from the address catalog")
-            if len(component.destinations) != count:
+    def bind(self, destinations):
+        if set(destinations) != set(self.component_nbytes):
+            raise ValueError("Destination bundle differs from the address catalog")
+        regions = tuple(tuple(destinations[name]) for name in self.component_nbytes)
+        count = len(regions[0])
+        for nbytes, component in zip(self.component_nbytes.values(), regions):
+            if len(component) != count:
                 raise ValueError("Components must describe the same destination count")
-            for region in component.destinations:
-                if torch.device(region.device) != self.device:
-                    raise ValueError("Destination region is on a different device")
-        # Pointers identify live allocations: the cached owners prevent address
-        # reuse, even when another bank view has a different Python identity.
+            self._validate_device_regions(component, nbytes)
+        # Retained owners make physical view identity safe against address reuse.
         key = tuple(
-            tuple((r.address, r.nbytes) for r in c.destinations) for c in components
+            tuple((r.address, r.nbytes) for r in component) for component in regions
         )
         cached = self._destinations.get(key)
         if cached is None:
@@ -421,27 +231,26 @@ class MemFabricAddressCatalog:
                     "Address catalog is sealed; bind views before capture"
                 )
             ranges = [
-                _range(r.address, c.nbytes) for c in components for r in c.destinations
+                _range(r.address, nbytes)
+                for nbytes, component in zip(self.component_nbytes.values(), regions)
+                for r in component
             ]
             _reject_overlapping(ranges)
             if _ranges_overlap(self._host_ranges, ranges):
                 raise ValueError("Mapped immutable host storage overlaps a destination")
-            aliases_hot = _ranges_overlap(self._hot_ranges, ranges)
             tables = tuple(
-                self._table([r.address for r in c.destinations]) for c in components
+                self._table([r.address for r in component]) for component in regions
             )
-            # Keep destination allocation owners until all graphs are retired.
-            cached = tables, aliases_hot, components
+            cached = tables, _ranges_overlap(self._hot_ranges, ranges), regions
             self._destinations[key] = cached
         destination_tables, aliases_hot, _ = cached
         return (
             tuple(
-                (host, hot, destination)
-                for (host, hot), destination in zip(
-                    self.source_tables, destination_tables
-                )
+                (*sources, target)
+                for sources, target in zip(self.source_tables, destination_tables)
             ),
             aliases_hot,
+            count,
         )
 
     def seal(self):
@@ -449,15 +258,8 @@ class MemFabricAddressCatalog:
         self._sealed = True
 
     def allocations(self):
-        return tuple(
-            Allocation(
-                f"{self.name}.{index}",
-                ResourceKind.METADATA,
-                value.untyped_storage().nbytes(),
-                (str(value.device), value.untyped_storage().data_ptr()),
-                self,
-            )
-            for index, value in enumerate(self._tensors)
+        return tensor_allocations(
+            self.name + ".", ((str(i), value) for i, value in enumerate(self._tensors))
         )
 
 
@@ -471,21 +273,17 @@ class MemFabricTransferBindings:
 
     def __init__(
         self,
-        components,
+        address_catalog,
+        destinations,
         *,
         capacity,
         hot_generations,
         error_status,
-        device,
         max_batch_entries=256,
         name=None,
-        address_catalog=None,
     ):
         import torch
 
-        self.components = tuple(components)
-        if not self.components:
-            raise ValueError("At least one complete-bundle component is required")
         if type(capacity) is not int or capacity < 0:
             raise ValueError("Plan capacity must be nonnegative")
         if (
@@ -493,17 +291,17 @@ class MemFabricTransferBindings:
             or not 0 < max_batch_entries <= _MAX_GROUP_ENTRIES
         ):
             raise ValueError("MemFabric batch capacity must be in [1, 256]")
-        self.device = torch.device(device)
-        if self.device.type != "npu":
-            raise ValueError("MemFabric requires NPU storage")
-        if self.device.type == "npu" and self.device.index is None:
-            raise ValueError("Bind MemFabric to an explicit NPU device index")
+        self.address_catalog = address_catalog
+        self.device = address_catalog.device
         self.name = name if name is not None else f"memfabric.{id(self):x}"
         self.capacity, self.max_batch_entries = capacity, max_batch_entries
-        first = self.components[0]
-        self.host_count = len(first.host_sources)
-        self.hot_count = len(first.hot_sources)
-        self.destination_count = len(first.destinations)
+        self.host_count, self.hot_count = (
+            address_catalog.host_count,
+            address_catalog.hot_count,
+        )
+        self.tables, self.hot_targets_alias, self.destination_count = (
+            address_catalog.bind(destinations)
+        )
         self.hot_generations, self.error_status = hot_generations, error_status
         self._validate_tensor(hot_generations, (self.hot_count,), torch.int64)
         self._validate_tensor(error_status, (), torch.int32)
@@ -518,15 +316,8 @@ class MemFabricTransferBindings:
             [0] * (self.destination_count + 1), torch.int64
         )
         self.mask = tensor([False] * capacity, torch.bool)
-        self._owns_catalog = address_catalog is None
-        self.address_catalog = address_catalog or MemFabricAddressCatalog(
-            self.components, device=self.device, name=self.name + ".addresses"
-        )
-        if self.address_catalog.device != self.device:
-            raise ValueError("Address catalog is on a different device")
-        self.tables, self.hot_targets_alias = self.address_catalog.bind(self.components)
         self.batches = []
-        for component in self.components:
+        for nbytes in address_catalog.component_nbytes.values():
             component_batches = []
             for begin in range(0, capacity, max_batch_entries):
                 size = min(max_batch_entries, capacity - begin)
@@ -538,7 +329,7 @@ class MemFabricTransferBindings:
                             [0] * size, torch.int64
                         ),  # source pointers, uncompressed
                         tensor([0] * size, torch.int64),  # packed destination pointers
-                        tensor([component.nbytes] * size, torch.uint32),
+                        tensor([nbytes] * size, torch.uint32),
                         tensor(size, torch.uint32),  # fixed native scan length
                         tensor([0] * size, torch.int64),  # native group mask
                         tensor(
@@ -572,20 +363,10 @@ class MemFabricTransferBindings:
         self._validate_tensor(plan.count, (), torch.int32)
 
     def allocations(self):
-        """Native tables/scratch only; owners count weights and canonical state."""
-        scratch = tuple(
-            Allocation(
-                f"{self.name}.metadata.{index}",
-                ResourceKind.METADATA,
-                value.untyped_storage().nbytes(),
-                (str(value.device), value.untyped_storage().data_ptr()),
-                value,
-            )
-            for index, value in enumerate(self._tensors)
-            if value.untyped_storage().nbytes()
-        )
-        return scratch + (
-            self.address_catalog.allocations() if self._owns_catalog else ()
+        """Only mutable scratch: the arena counts the shared catalog once."""
+        return tensor_allocations(
+            self.name + ".metadata.",
+            ((str(i), value) for i, value in enumerate(self._tensors)),
         )
 
 
@@ -683,7 +464,7 @@ class MemFabricDeviceTransferOps(DeviceTransferOps):
             "components=%s stream=%s",
             bindings.name,
             plan.capacity,
-            len(bindings.components),
+            len(bindings.address_catalog.component_nbytes),
             getattr(stream, "stream_id", None),
         )
         resources = (plan, bindings, self)

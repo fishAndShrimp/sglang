@@ -1,6 +1,6 @@
 # DeepSeek V4 Flash ModelSlim W8A8 主模型适配
 
-日期：2026-10-22。适配基线：`feat/moe-offload-dev-1022` 的 NPU offload 框架。
+初始适配日期：2026-10-22；共同接口更新于 2026-10-25。初始适配基线：`feat/moe-offload-dev-1022` 的 NPU offload 框架。
 本次范围是普通 prefill/decode 主模型；DSpark、draft/verify 和并发 forward 保持不支持。
 完整 decode graph 仍是硬件验收要求，没有 eager decode 退路。
 
@@ -26,11 +26,12 @@
 
 ## 当前共同格式 schema（2026-10-25）
 
-`V4LayerStorage` 与 `W8A8LayerStorage` 现在都是 `npu/format.py` 中
-`ExpertLayerStorage` 的兼容别名，不再是继承关系。完整迁移见
+FP4/W8A8 直接使用 `npu/format.py` 中的 `ExpertLayerStorage`，旧量化专属
+storage 别名已移除。完整迁移见
 [重构记录](../../doc/REFACTOR_20261025.zh-CN.md)。共同 storage 根据不可变
-`BundleSchema` / `BundleComponent` 驱动分量、shard、物理字节和有界转换；FP4/W8A8
-仅保留 checkpoint 校验、转换顺序与 quant binding 的格式行为。
+`BundleSchema` / `BundleComponent` 驱动分量、shard、物理字节和有界转换。
+FP4/W8A8 的 `CheckpointComponent` recipe 共用 probe、布局记录及预算检查；
+各自保留 checkpoint 校验和原生转换/分配顺序。
 
 ```mermaid
 classDiagram
@@ -40,8 +41,11 @@ classDiagram
     ExpertFormat --> BundleSchema
     BundleSchema *-- BundleComponent
     ExpertLayerStorage --> ExpertFormat
-    ExpertLayerStorage --> ExpertBank
+    ExpertLayerStorage --> BundleSchema
+    NpuExpertFormat --> CheckpointComponent
+    NpuExpertFormat --> ExpertBank
     NpuMoEBackend --> ExpertLayerStorage
+    NpuMoEBackend --> ExpertBank
     ExpertBank --> AscendQuantInfo
     NPUExpertRunner --> AscendRunnerCore
 ```
@@ -52,7 +56,8 @@ quant_method.create_weights；旧 V2 与普通常驻加载保持原路径。
 
 `npu/format_resolver.py` 的 `resolve_npu_format` 函数依据已解析的 quant method 选择格式：原生 FP4，或 ModelSlimFusedMoEMethod 且 W13/W2
 均为 ModelSlimW8A8Int8MoE。其他 ModelSlim 方案不能仅凭外层类名获得支持。
-当前一个 rank 使用一个兼容 arena；在分配前检查 schema fingerprint、尺寸及 EP 拓扑。
+当前一个 rank 使用一个兼容 arena；模型计划先验证 EP 拓扑，后续 offloaded 层
+分配前校验格式类同一性与尺寸。共同 probe 的 schema 保存实际物理布局。
 混合格式不合并成统一 slot，当前直接拒绝；多 arena serving 路由仍是后续扩展。
 
 ## Slot、主机布局和加载
@@ -89,7 +94,8 @@ loader 接受 INT8 [out,in] 权重及 FP32/BF16/FP16 的通道 scale/offset，�
 
 每个本地专家九项全部加载后才能 finalize；重复项、非法 ID、缺失项和不兼容 shape
 报错，其他 EP rank 的专家跳过。格式转换失败使 master 进入不可重试状态，防止把
-已转换的 NZ/BF16 内容重新解释成 checkpoint 数据。finalize 成功后冻结 host master。
+已转换的 NZ/BF16 内容重新解释成 checkpoint 数据。finalize 成功后冻结 host master，
+退休 shard bookkeeping/raw views 并替换 parameter loader；加载状态只有共同 storage 一份。
 
 ## 执行与 graph
 

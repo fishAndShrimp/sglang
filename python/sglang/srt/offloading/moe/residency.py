@@ -13,9 +13,9 @@ import torch
 
 from ..transfer import CopySourceKind, DeviceCopyPlan, HostCopyPlan, TransferTicket
 from .config import ExpertWave, Phase
-from .execution import ExecutionReservation, SourcePolicy, UpdatePlan, require_prefill
+from .execution import MaterializationPlan, require_prefill
 from .interfaces import ResidencyOps
-from .resources import Allocation, ResourceKind
+from .resources import tensor_allocations
 
 
 @dataclass(frozen=True)
@@ -51,7 +51,7 @@ class TensorResidencyOps(ResidencyOps):
     exactly once. Temporary execution never admits experts into the hot pool.
 
     prepare_prefill(request, context), when supplied, returns an eager
-    ExecutionReservation with a HostCopyPlan and protected bank bindings. It owns
+    MaterializationPlan with a HostCopyPlan and protected bank bindings. It owns
     dynamic A/B/a offsets and old-reader dependencies. Prefill never changes the
     decode residency metadata or statistics.
     """
@@ -79,7 +79,7 @@ class TensorResidencyOps(ResidencyOps):
         self.device = state.key_to_slot.device
         self.num_experts = catalog.num_experts
         self.hot_slots = state.slot_to_key.numel()
-        self.execution_slots = state.execution_key.numel()
+        self.execution_slots = state.execution_valid.numel()
         self._validate_state()
         self.error_status = (
             self._tensor("error_status", (), torch.int32)
@@ -140,7 +140,6 @@ class TensorResidencyOps(ResidencyOps):
             ("slot_to_key", (self.hot_slots,), torch.int64),
             ("slot_valid", (self.hot_slots,), torch.bool),
             ("slot_generation", (self.hot_slots,), torch.int64),
-            ("execution_key", (self.execution_slots,), torch.int64),
             ("execution_valid", (self.execution_slots,), torch.bool),
             ("step_access_count", (self.num_experts,), torch.int64),
             ("update_enabled", (), torch.bool),
@@ -253,27 +252,19 @@ class TensorResidencyOps(ResidencyOps):
         return buf
 
     def allocations(self):
-        """All owned metadata/scratch; external state/bindings are reported separately."""
-        return tuple(
-            Allocation(
-                "tensor_residency." + name,
-                ResourceKind.METADATA,
-                tensor.untyped_storage().nbytes(),
-                (str(tensor.device), tensor.untyped_storage().data_ptr()),
-                tensor,
-            )
-            for name, tensor in self._owned.items()
-            if tensor.numel()
-        )
-
-    @property
-    def metadata_nbytes(self):
-        return sum(item.nbytes for item in self.allocations())
+        """Owned scratch only; external state/bindings are reported separately."""
+        return tensor_allocations("tensor_residency.", self._owned.items())
 
     def _latch(self, bad):
         self._error_code.copy_(bad)
         self.error_status.bitwise_or_(self._error_code)
         torch.eq(self.error_status, 0, out=self._healthy)
+
+    def _fault_if_any(self, mask, enabled=None):
+        torch.any(mask, out=self._bad)
+        if enabled is not None:
+            torch.logical_and(self._bad, enabled, out=self._bad)
+        self._latch(self._bad)
 
     def begin_step(self, context):
         if context.phase is Phase.PREFILL:
@@ -301,28 +292,25 @@ class TensorResidencyOps(ResidencyOps):
                     "Bind the eager host-bank planner for prefill"
                 )
             reservation = self.prepare_prefill(request, context)
-            if not isinstance(reservation, ExecutionReservation) or not isinstance(
+            if not isinstance(reservation, MaterializationPlan) or not isinstance(
                 reservation.copy_plan, HostCopyPlan
             ):
                 raise TypeError(
-                    "Prefill planner must return a host ExecutionReservation"
+                    "Prefill planner must return a host MaterializationPlan"
                 )
             context.retain(reservation)
             token = _Reservation(
                 self._token, context.invocation_id, reservation, prefill=True
             )
-            return ExecutionReservation(
+            return MaterializationPlan(
                 reservation.copy_plan,
                 reservation.bindings,
                 reservation.copy_dependencies,
                 (reservation,),
                 token,
             )
-        if (
-            request.phase is not Phase.DECODE
-            or request.source_policy is not SourcePolicy.PREFER_RESIDENT
-        ):
-            raise ValueError("Decode requires resident-preferred device planning")
+        if request.phase is not Phase.DECODE:
+            raise ValueError("Decode requires device planning")
         buf = self._waves.get((request.layer_id, request.wave))
         if buf is None:
             raise ValueError("Bind every decode wave before capture")
@@ -352,8 +340,7 @@ class TensorResidencyOps(ResidencyOps):
             torch.ge(buf["slots"], self.hot_slots, out=buf["flag"])
             torch.lt(buf["slots"], -1, out=buf["flag2"])
             torch.logical_or(buf["flag"], buf["flag2"], out=buf["flag"])
-            torch.any(buf["flag"], out=self._bad)
-            self._latch(self._bad)
+            self._fault_if_any(buf["flag"])
             torch.clamp(buf["slots"], 0, self.hot_slots - 1, out=buf["safe_slots"])
             torch.index_select(
                 self.state.slot_valid, 0, buf["safe_slots"], out=buf["flag"]
@@ -365,8 +352,7 @@ class TensorResidencyOps(ResidencyOps):
             torch.logical_and(buf["flag"], buf["flag2"], out=buf["flag"])
             torch.logical_not(buf["flag"], out=buf["flag2"])
             torch.logical_and(buf["hit"], buf["flag2"], out=buf["flag2"])
-            torch.any(buf["flag2"], out=self._bad)
-            self._latch(self._bad)
+            self._fault_if_any(buf["flag2"])
             torch.logical_and(buf["hit"], buf["flag"], out=buf["hit"])
             torch.index_select(
                 self.state.slot_generation,
@@ -376,8 +362,7 @@ class TensorResidencyOps(ResidencyOps):
             )
         else:
             torch.ne(buf["slots"], -1, out=buf["flag"])
-            torch.any(buf["flag"], out=self._bad)
-            self._latch(self._bad)
+            self._fault_if_any(buf["flag"])
             buf["hit"].zero_()
             plan.expected_generation.fill_(-1)
         torch.logical_and(buf["needed"], self._healthy, out=plan.valid)
@@ -406,13 +391,12 @@ class TensorResidencyOps(ResidencyOps):
         context.retain(ready)
         token = _Reservation(self._token, context.invocation_id, buf)
         self._active_execution[bound.wave.bank] = token
-        return ExecutionReservation(
+        return MaterializationPlan(
             plan,
             bound.bindings,
             (ready.completion,),
             (self, buf, ready),
             token,
-            plan_covers_compute_frontier=True,
         )
 
     def _check(self, reservation, context):
@@ -443,20 +427,13 @@ class TensorResidencyOps(ResidencyOps):
             context.retain(ticket)
             return ticket
         weights_ready.completion.wait_on(context.compute_stream)
-        if not token.prefill:
-            buf, plan = token.buffers, reservation.copy_plan
-            torch.eq(self.error_status, 0, out=self._healthy)
-            torch.logical_and(plan.valid, self._healthy, out=buf["published_valid"])
-            first = buf["bound"].execution_start
-            torch.where(
-                buf["published_valid"],
-                buf["keys"],
-                self._invalid,
-                out=self.state.execution_key[first : first + plan.capacity],
-            )
-            self.state.execution_valid[first : first + plan.capacity].copy_(
-                buf["published_valid"]
-            )
+        buf, plan = token.buffers, reservation.copy_plan
+        torch.eq(self.error_status, 0, out=self._healthy)
+        torch.logical_and(plan.valid, self._healthy, out=buf["published_valid"])
+        first = buf["bound"].execution_start
+        self.state.execution_valid[first : first + plan.capacity].copy_(
+            buf["published_valid"]
+        )
         token.published = True
         ticket = context.record_compute_completion()
         context.retain(ticket)
@@ -513,8 +490,7 @@ class TensorResidencyOps(ResidencyOps):
             torch.logical_and(b["valid"], b["flag"], out=b["valid"])
             torch.logical_not(b["valid"], out=b["flag"])
             torch.logical_and(b["flag"], s.slot_valid, out=b["flag"])
-            torch.any(b["flag"], out=self._bad)
-            self._latch(self._bad)
+            self._fault_if_any(b["flag"])
             torch.logical_and(b["valid"], s.slot_valid, out=b["valid"])
             torch.where(
                 b["valid"], s.slot_to_key, self._key_sentinel, out=b["inverse_keys"]
@@ -523,23 +499,19 @@ class TensorResidencyOps(ResidencyOps):
             b["membership"].zero_()
             b["membership"].scatter_add_(0, b["inverse_keys"], b["marks"])
             torch.gt(b["membership"][: self.num_experts], 1, out=b["duplicate"])
-            torch.any(b["duplicate"], out=self._bad)
-            self._latch(self._bad)
+            self._fault_if_any(b["duplicate"])
             self._inverse(s.slot_to_key, b["valid"], b)
             torch.ne(
                 b["inverse"][: self.num_experts], s.key_to_slot, out=b["duplicate"]
             )
-            torch.any(b["duplicate"], out=self._bad)
-            self._latch(self._bad)
+            self._fault_if_any(b["duplicate"])
             torch.ge(target_keys, 0, out=b["valid"])
             torch.lt(target_keys, self.num_experts, out=b["flag"])
             torch.logical_and(b["valid"], b["flag"], out=b["valid"])
             torch.lt(target_keys, -1, out=b["flag"])
             torch.ge(target_keys, self.num_experts, out=b["flag2"])
             torch.logical_or(b["flag"], b["flag2"], out=b["flag"])
-            torch.any(b["flag"], out=self._bad)
-            torch.logical_and(self._bad, b["enabled"], out=self._bad)
-            self._latch(self._bad)
+            self._fault_if_any(b["flag"], b["enabled"])
             torch.where(
                 b["valid"], target_keys, self._key_sentinel, out=b["safe_target"]
             )
@@ -547,9 +519,7 @@ class TensorResidencyOps(ResidencyOps):
             b["membership"].zero_()
             b["membership"].scatter_add_(0, b["safe_target"], b["marks"])
             torch.gt(b["membership"][: self.num_experts], 1, out=b["duplicate"])
-            torch.any(b["duplicate"], out=self._bad)
-            torch.logical_and(self._bad, b["enabled"], out=self._bad)
-            self._latch(self._bad)
+            self._fault_if_any(b["duplicate"], b["enabled"])
             torch.logical_and(b["enabled"], self._healthy, out=b["enabled"])
             torch.clamp(target_keys, 0, self.num_experts - 1, out=b["safe_target"])
             torch.index_select(s.key_to_slot, 0, b["safe_target"], out=b["slots"])
@@ -602,7 +572,6 @@ class TensorResidencyOps(ResidencyOps):
             torch.logical_and(b["changed"], b["enabled"], out=b["changed"])
             b["marks"].copy_(b["changed"])
             torch.add(s.slot_generation, b["marks"], out=b["generation"])
-            torch.ge(b["proposed"], 0, out=b["proposed_valid"])
             torch.logical_and(b["changed"], b["proposed_valid"], out=p.valid)
             p.source_index.copy_(b["proposed"])
             torch.where(p.valid, self._host, self._zero, out=p.source_kind)
@@ -627,13 +596,12 @@ class TensorResidencyOps(ResidencyOps):
         context.retain(ready)
         token = _Reservation(self._token, context.invocation_id, b)
         self._pending_update = token
-        return UpdatePlan(
+        return MaterializationPlan(
             p,
             self.update_bindings,
             (ready.completion,),
             (self, ready),
             token,
-            plan_covers_compute_frontier=True,
         )
 
     def commit_update(self, update_plan, weights_ready, context):
@@ -648,8 +616,7 @@ class TensorResidencyOps(ResidencyOps):
         if self.hot_slots:
             torch.ne(s.slot_generation, b["generation"], out=b["flag"])
             torch.logical_and(b["flag"], b["enabled"], out=b["flag"])
-            torch.any(b["flag"], out=self._bad)
-            self._latch(self._bad)
+            self._fault_if_any(b["flag"])
             torch.logical_and(b["enabled"], self._healthy, out=b["enabled"])
             self._inverse(b["proposed"], b["proposed_valid"], b)
             torch.where(b["enabled"], b["proposed"], s.slot_to_key, out=s.slot_to_key)

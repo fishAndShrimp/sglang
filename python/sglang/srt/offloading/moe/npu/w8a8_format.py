@@ -10,11 +10,8 @@ from __future__ import annotations
 
 import torch
 
-from .format import ExpertLayerStorage as W8A8LayerStorage
-from .format import NpuExpertFormat, TorchNpuFormatAdapter, _Layout
-from .storage import _align
-
-__all__ = ["NpuV4W8A8Format", "W8A8LayerStorage"]
+from ..formats import CheckpointComponent
+from .format import NpuExpertFormat, TorchNpuFormatAdapter
 
 
 class _TorchNpuW8A8FormatAdapter(TorchNpuFormatAdapter):
@@ -73,80 +70,56 @@ class NpuV4W8A8Format(NpuExpertFormat):
         self.device = device
         self.workspace_limit_bytes = workspace_limit_bytes
         self.adapter = _TorchNpuW8A8FormatAdapter(device, native_acl)
-        self.layouts, checkpoint_dtypes, self.host_component_nbytes = {}, {}, {}
-        self.workspace_nbytes = 0
+        groups, minimum = [], []
         for prefix, n, k in (
             ("w13", 2 * intermediate_size, hidden_size),
             ("w2", hidden_size, intermediate_size),
         ):
-            # Input weights/scales/offset plus the transpose/NZ result and BF16
-            # scales; the probe checks additional allocator padding as well.
-            minimum_peak = 2 * n * k + 10 * n
-            if (
-                workspace_limit_bytes is not None
-                and minimum_peak > workspace_limit_bytes
-            ):
-                raise ValueError("One-expert W8A8 conversion exceeds loader workspace")
-            baseline = self.adapter.begin_workspace()
-            inputs = (
-                self.adapter.to_device(torch.zeros((1, n, k), dtype=torch.int8)),
-                self.adapter.to_device(torch.ones((1, n, 1), dtype=torch.float32)),
-                self.adapter.to_device(torch.zeros((1, n, 1), dtype=torch.float32)),
-            )
-            converted = self.adapter.prepare(*inputs)
-            self.adapter.synchronize()
-            for suffix, raw, value in zip(
-                ("weight", "weight_scale", "weight_offset"), inputs, converted
-            ):
-                name = f"{prefix}_{suffix}"
-                size = self.adapter.physical_nbytes(value)
-                if size < value.numel() * value.element_size() or size % 64:
-                    raise RuntimeError("W8A8 component has an invalid physical extent")
-                self.layouts[name] = _Layout(
-                    tuple(raw.shape),
-                    tuple(value.shape),
-                    tuple(value.stride()),
-                    value.dtype,
-                    size,
-                )
-                checkpoint_dtypes[name] = raw.dtype
-                self.host_component_nbytes[name] = max(
-                    size, _align(raw.numel() * raw.element_size(), 64)
-                )
-            # Count all distinct allocations, including the intermediate ND
-            # transpose which may have existed during the native format cast.
-            known_peak = sum(x.numel() * x.element_size() for x in inputs)
-            known_peak += sum(
-                self.layouts[f"{prefix}_{s}"].nbytes for s in ("weight", "weight_scale")
-            )
-            self._check_workspace(baseline, max(minimum_peak, known_peak))
-            del inputs, converted, raw, value
-        self._bind_schema(
-            "ascend.v4.w8a8.nz.v1",
-            checkpoint_dtypes=checkpoint_dtypes,
-            shards={
-                name: (("w1", "w3") if name.startswith("w13_") else ("w2",))
-                for name in self.layouts
-            },
-            conversion_groups=tuple(
+            shards = ("w1", "w3") if prefix == "w13" else ("w2",)
+            groups.append(
                 tuple(
-                    f"{prefix}_{suffix}"
-                    for suffix in ("weight", "weight_scale", "weight_offset")
+                    CheckpointComponent(
+                        f"{prefix}_{suffix}",
+                        shape,
+                        dtype,
+                        shards,
+                        f"{prefix}_{suffix}",
+                        attributes,
+                        initial,
+                    )
+                    for suffix, shape, dtype, attributes, initial in (
+                        ("weight", (1, n, k), torch.int8, (), 0),
+                        (
+                            "weight_scale",
+                            (1, n, 1),
+                            torch.float32,
+                            (("quant_method", "channel"),),
+                            1,
+                        ),
+                        (
+                            "weight_offset",
+                            (1, n, 1),
+                            torch.float32,
+                            (("quant_method", "channel"),),
+                            0,
+                        ),
+                    )
                 )
-                for prefix in ("w13", "w2")
-            ),
+            )
+            # Include the ND transpose/NZ allocation and BF16 scale output.
+            minimum.append(2 * n * k + 10 * n)
+        self._probe(
+            "ascend.v4.w8a8.nz.v1",
+            groups,
+            minimum_workspace=minimum,
             new_outputs=tuple(
-                name for name in self.layouts if not name.endswith("_offset")
+                component.name for group in groups for component in group[:2]
             ),
-            runtime_names={},
             dispatch_config={
                 "normal_dispatcher_output_dtype": "bf16",
                 "low_latency_dispatcher_output_dtype": "bf16",
             },
         )
-
-    def checkpoint_attributes(self, name):
-        return {"quant_method": "channel"} if not name.endswith("_weight") else {}
 
     def write_checkpoint(self, name, target, loaded_weight, shard_id, metadata):
         if name.startswith("w13_"):

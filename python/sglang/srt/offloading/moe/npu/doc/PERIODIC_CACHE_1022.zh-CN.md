@@ -61,7 +61,7 @@ profile 的专家编号为 **global expert ID**，格式如下。示例数字仅
 
 ## 命中统计与后端边界
 
-`NpuBoundMoERuntime.cache_stats` 暴露 `CacheRouteStats` 的三个固定地址 int64 标量：
+公共 `BoundMoERuntime.cache_stats` 暴露 `CacheRouteStats` 的三个固定地址 int64 标量：
 `accesses`、`hits`、`misses`。每次 decode begin 清零，各固定 wave 直接消费真实 counts，
 避免把 counts 展开成逐 token 路由，也避免 host 回读。
 
@@ -110,7 +110,7 @@ PY
 ```
 
 旧重复缓存栈的部分覆盖迁入既有生产 residency、Graph lease 与原生装配 fixture；
-本次另行新增的六个测试文件已按后续要求删除，删除前验证及当前结果见[重构记录](../../doc/REFACTOR_20261025.zh-CN.md)。
+上一版重构新增的六个测试文件曾按要求删除；本轮在既有测试文件中补充覆盖，历史验证及当前结果见[重构记录](../../doc/REFACTOR_20261025.zh-CN.md)。
 不再保留第二套测试运行栈。
 装配测试中的 CPU 字节复制和事件替身只存在于测试目录，不恢复生产 CPU emulation 开关。
 新增用例覆盖离线完整 bundle 初始化、第四步替换/衰减、下一步命中、assignment 计数、

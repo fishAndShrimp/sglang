@@ -3,7 +3,7 @@
 中文 | [English](README.md)
 
 2026-10-25：当前代码只保留一套缓存驻留与执行运行栈。重构原因、迁移映射及验证记录见
-[重构记录](REFACTOR_20261025.zh-CN.md)。[缓存契约](CACHE_IMPLEMENTATION.zh-CN.md)、
+[精简记录](SIMPLIFICATION_20261025.zh-CN.md) 与[前一轮重构记录](REFACTOR_20261025.zh-CN.md)。[缓存契约](CACHE_IMPLEMENTATION.zh-CN.md)、
 [H2D 契约](H2D_IMPLEMENTATION.zh-CN.md) 和 [Ascend 启动说明](../npu/doc/README.zh-CN.md)
 描述当前实现；历史设计文档不再作为接口清单。
 
@@ -23,7 +23,7 @@
 | 量化格式 | [formats.py](../formats.py) 的 `BundleSchema` / `BundleComponent` 描述完整 bundle；`ExpertFormat` 承担 checkpoint 校验、有界转换和 bank 分配。FP4/W8A8 共用 storage 实现。 |
 | device 后端 | `MoEBackend` 装配物理资源、device 事件和原生执行；`NpuMoEBackend` 是当前原生实现，其他设备继续使用公共生命周期协议。 |
 | cache 算法 | `CachePolicy.observe(..., due_out)`、`select_hot_set(..., target_keys)`、`finish_step`、`copy_state`；`TensorLFUPolicy` 与 `PeriodicLFUPolicy` 使用相同契约。 |
-| H2D 接口 | `HostTransferOps` / `DeviceTransferOps` 经 `ComposedTransferBackend` 组合。ACL 用于 eager host 计划，MemFabric 用于 full graph 设备计划。 |
+| H2D 接口 | `HostTransferOps` / `DeviceTransferOps` 由 `ExpertWeightAccess` 直接绑定。ACL 用于 eager host 计划，MemFabric 用于 full graph 设备计划。 |
 
 五个维度独立扩展不表示任意组合已实现。当前 NPU backend 只有一个兼容格式 arena，
 在分配前拒绝不一致的格式/shape/EP 拓扑；混合格式多 arena 路由尚未实现。
@@ -35,11 +35,12 @@ classDiagram
     ModelAdapter --> ModelEntryBinding
     MoEOffloaderV2 --> MoEBackend
     MoEOffloaderV2 *-- MoEOffloadOwner
-    MoEOffloadOwner --> InvocationRuntime
-    InvocationRuntime <|-- NpuBoundMoERuntime
-    NpuBoundMoERuntime --> LayerProgramTable
-    LayerProgramTable --> DispatchOnceProgram
-    LayerProgramTable --> PrefillDispatchOnceProgram
+    MoEOffloadOwner --> BoundMoERuntime
+    BoundMoERuntime --> ExecutionContext
+    BoundMoERuntime --> NpuDeviceRuntime
+    BoundMoERuntime --> NPULayerPrograms
+    NPULayerPrograms --> DispatchOnceProgram
+    NPULayerPrograms --> PrefillDispatchOnceProgram
     NpuMoEBackend --> ExpertFormat
     ExpertFormat --> BundleSchema
     BundleSchema *-- BundleComponent
@@ -49,9 +50,9 @@ classDiagram
     CacheUpdateCoordinator --> CachePolicy
     CacheUpdateCoordinator --> ExpertWeightAccess
     ExpertWeightAccess --> TensorResidencyOps
-    ExpertWeightAccess --> ComposedTransferBackend
-    ComposedTransferBackend --> HostTransferOps
-    ComposedTransferBackend --> DeviceTransferOps
+    ExpertWeightAccess --> MaterializationPlan
+    ExpertWeightAccess --> HostTransferOps
+    ExpertWeightAccess --> DeviceTransferOps
 ```
 
 ## 唯一运行栈与源文件
@@ -61,7 +62,7 @@ classDiagram
 | [offloader.py](../offloader.py)、[models.py](../models.py) | 模型注册、构造期接管、finalize、可恢复入口绑定。 |
 | [config.py](../config.py)、[formats.py](../formats.py) | 专家身份/容量配置与原生 bundle 数据契约。 |
 | [owner.py](../owner.py) | 唯一 phase/forward/graph 所有者、预算和失败状态；通过 `switch_phase` 切换。 |
-| [runtime.py](../runtime.py) | `ManagedExecutionContext`、`InvocationRuntime` 和持久热状态快照；公共生命周期不再复制在 NPU runtime 中。 |
+| [runtime.py](../runtime.py) | `ExecutionContext`、`BoundMoERuntime` 和持久热状态快照；共用运行流程，设备事件/流/排空由注入的 device runtime 提供。 |
 | [graph.py](../graph.py) | 图 lease、capture 保活、先停止提交/排空再销毁与退休。 |
 | [residency.py](../residency.py)、[state.py](../state.py) | 设备计划、slot 映射、generation、validity、reader 保护和事务发布。 |
 | [policy.py](../policy.py)、[periodic_lfu.py](../periodic_lfu.py)、[cache_metadata.py](../cache_metadata.py) | 策略私有状态及 assignment 统计；runtime 不读取私有策略 config。 |
@@ -98,7 +99,8 @@ wave/tail scratch 保持独立。`AllocationLedger` 对物理分配去重，权�
 1. Owner 的 forward token 禁止并发使用固定资源；后续提交在设备流上等待前一
    `resources_idle`，普通路径不新增逐步 host synchronize。
 2. `retain` 负责保活，`register_completion` 显式登记完成事实；仅有已证明顺序的
-   同流 frontier 可合并。`plan_covers_compute_frontier` 表明 planner 已覆盖必要计算依赖。
+   同流 frontier 可合并。`MaterializationPlan.copy_dependencies` 必须覆盖前序计算与 reader；
+   decode planner 统一承担该契约，不再通过可选字段决定是否补录依赖。
 3. 共享 prefill pipeline 按 invocation/layer 管理 session。覆盖 A/B 前等待旧 reader；
    worker 必须停止并 join 后才能封闭 invocation。提交异常仍保留部分提交资源。
 4. 首次进入 prefill 排空并保存 hot 映射/有效位/generation 与策略；切回 decode 按原 slot
@@ -113,7 +115,7 @@ wave/tail scratch 保持独立。`AllocationLedger` 对物理分配去重，权�
 当前 CPU 测试位于 `test/registered/unit/offloading/`，覆盖生产组件装配、缓存策略、
 设备计划、失败保活、graph lease 和格式。本次另行新增的六个测试文件已按后续要求删除。
 运行方法见
-[周期缓存说明](../npu/doc/PERIODIC_CACHE_1022.zh-CN.md)，本轮结果以[重构记录](REFACTOR_20261025.zh-CN.md)为准。
+[周期缓存说明](../npu/doc/PERIODIC_CACHE_1022.zh-CN.md)，本轮结果以[精简记录](SIMPLIFICATION_20261025.zh-CN.md)为准。
 
 NPU 验收仍需真实 native ACL/MemFabric、NZ 格式与 FP4/W8A8 数值对照、多 rank EP、
 空 rank/尾波、多 bucket 连续 replay、prefill/decode 切换、内存峰值和 H2D/F 时间线。

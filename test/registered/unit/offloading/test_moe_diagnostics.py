@@ -249,11 +249,11 @@ class TestBatchDiagnostics(unittest.TestCase):
                         ),
                         context,
                     )
-                    access.wait_ready(lease, context.compute_stream)
+                    access.wait_ready(lease, context.compute_stream, context=context)
                     access.release_after(
                         lease, context.record_compute_completion(), context
                     )
-                runtime.emit_step_end(context)
+                runtime.cache_updates.emit_step_end(context)
             keys = runtime.residency.slot_to_key.clone()
             frequency = runtime.cache_updates.policy_state.frequency.clone()
             owner.close()

@@ -176,9 +176,6 @@ class MoEOffloaderV2(BaseOffloader):
             raise RuntimeError("MoE runtime/model hooks have not been bound")
         return self.owner.runtime.forward_scope(self.owner, forward_batch)
 
-    def eager_step_scope(self, forward_batch):
-        return self.owner.runtime.eager_step_scope(forward_batch)
-
     @property
     def forbid_copy_engine_usage(self):
         return self.backend.forbid_copy_engine_usage

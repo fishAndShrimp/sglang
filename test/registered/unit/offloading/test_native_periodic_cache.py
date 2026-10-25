@@ -21,7 +21,7 @@ from sglang.srt.offloading.moe.npu.config import (
     NpuOffloadSettings,
     create_npu_offloader,
 )
-from sglang.srt.offloading.moe.npu.runtime import NpuBoundMoERuntime
+from sglang.srt.offloading.moe.runtime import BoundMoERuntime
 from sglang.srt.offloading.moe.owner import MoEOffloadOwner
 from sglang.srt.offloading.moe.periodic_lfu import PeriodicLFUConfig, PeriodicLFUPolicy
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -65,12 +65,16 @@ class TestNativePeriodicCache(unittest.TestCase):
                         ExecutionRequest(spec.layer_id, counts, wave, Phase.DECODE),
                         context,
                     )
-                    access.wait_ready(lease, context.compute_stream)
+                    access.wait_ready(lease, context.compute_stream, context=context)
                     access.release_after(
                         lease, context.record_compute_completion(), context
                     )
-            tail = runtime.emit_step_end(context)
-            context.finish(residency_ready=tail)
+            tail = runtime.cache_updates.emit_step_end(context)
+            result = context.finish(residency_ready=tail)
+            # These are eager CPU emissions of the capture program, with no
+            # actual graph retaining addresses after the completed step.
+            result.resources_idle.completion.synchronize()
+            context.dispose_completed(graph_destroyed=True)
         finally:
             runtime._context = None
 
@@ -145,7 +149,7 @@ class TestNativePeriodicCache(unittest.TestCase):
                 # Stand in for the already captured step nodes, without rerunning
                 # model hooks or marking a second eager step in forward_scope.
                 runtime.ops.begin_step(runtime.context)
-                runtime.emit_step_end(runtime.context)
+                runtime.cache_updates.emit_step_end(runtime.context)
             self.assertEqual(
                 int(runtime.cache_updates.policy_state.step_mod), expected_step
             )
@@ -228,7 +232,7 @@ class TestNativePeriodicCache(unittest.TestCase):
                             # Exercise the actual eager entry guard, not only the
                             # phase helper. No captured-decode scope is installed.
                             self.assertIsNone(runtime._capture)
-                            runtime._ensure_step()
+                            runtime._require_emission()
                             self.assertIs(batch.forward_mode, mode)
                         self.assertEqual(
                             int(runtime.cache_updates.policy_state.step_mod), 0
@@ -248,7 +252,7 @@ class TestNativePeriodicCache(unittest.TestCase):
                 )
                 with runtime.forward_scope(owner, batch):
                     self.assertIs(runtime.context.phase, Phase.PREFILL)
-                    runtime._ensure_step()
+                    runtime._require_emission()
                     self.assertEqual(batch.forward_mode.name, "DECODE")
                 self.assertEqual(int(runtime.cache_updates.policy_state.step_mod), 0)
                 owner.switch_phase(Phase.DECODE)
@@ -289,7 +293,7 @@ class TestNativePeriodicCache(unittest.TestCase):
                 with runtime.forward_scope(
                     owner, self.dp_batch("IDLE", width=width, prefill=True)
                 ):
-                    runtime._ensure_step()
+                    runtime._require_emission()
                     bank = self.assembly.backend.format.banks[0]
                     for tensor in bank.tensors.values():
                         tensor.fill_(199)
@@ -312,7 +316,7 @@ class TestNativePeriodicCache(unittest.TestCase):
                     # Stand in for replay's recorded nodes. The serving scope
                     # must not add a second policy step on exit.
                     runtime.ops.begin_step(runtime.context)
-                    runtime.emit_step_end(runtime.context)
+                    runtime.cache_updates.emit_step_end(runtime.context)
                 self.assertEqual(
                     int(runtime.cache_updates.policy_state.step_mod), before + 1
                 )
@@ -327,7 +331,7 @@ class TestNativePeriodicCache(unittest.TestCase):
                 batch = self.dp_batch(local, counts=[1, 1] + [0] * 6)
                 with runtime.forward_scope(owner, batch):
                     with self.assertRaisesRegex(RuntimeError, "captured full graph"):
-                        runtime._ensure_step()
+                        runtime._require_emission()
         finally:
             owner.close()
 
@@ -343,6 +347,7 @@ class TestNativePeriodicCache(unittest.TestCase):
                 begin.assert_not_called()
         finally:
             owner.close()
+
 
 class TestNativePeriodicConfig(unittest.TestCase):
     def settings(self, **kwargs):
@@ -417,8 +422,8 @@ class TestNativePeriodicConfig(unittest.TestCase):
         active = SimpleNamespace(
             input_ids=torch.empty(0), original_global_num_tokens_cpu=[0, 3]
         )
-        self.assertFalse(NpuBoundMoERuntime._has_global_work(empty))
-        self.assertTrue(NpuBoundMoERuntime._has_global_work(active))
+        self.assertFalse(BoundMoERuntime._has_global_work(empty))
+        self.assertTrue(BoundMoERuntime._has_global_work(active))
 
     def test_native_factory_accepts_attention_dp8_and_dp16_with_moe_dp1(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -440,6 +445,7 @@ class TestNativePeriodicConfig(unittest.TestCase):
                     )
                 self.assertEqual(offloader.config.ep_size, width)
                 self.assertEqual(offloader.config.tp_size, width)
+
 
 if __name__ == "__main__":
     unittest.main()

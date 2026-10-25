@@ -6,7 +6,6 @@ an accelerator graph or creates another expert-weight allocation.
 """
 
 import logging
-
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
 from threading import RLock, get_ident
@@ -14,17 +13,17 @@ from weakref import ref
 
 from ..transfer import Completion, JoinedCompletion, TransferTicket
 from .config import Phase
-from .interfaces import BoundMoERuntime, ExecutionContext, ForwardCompletion
-from .resources import Allocation, ResourceKind
+from .interfaces import ForwardCompletion, RuntimeCapabilities
+from .resources import Allocation, AllocationLedger, ResourceKind, tensor_allocations
 
 logger = logging.getLogger(__name__)
 
 
-class ManagedExecutionContext(ExecutionContext):
+class ExecutionContext:
     """Thread-safe keepalives and fresh completion events for one submission.
 
-    Stop/join host workers before finish(). failure_drain must stop workers and
-    drain *every* device stream, including partially submitted native calls.
+    Stop/join host workers before finish(). The runtime failure path must drain
+    every device stream, including partially submitted native calls.
     On a failed drain the context deliberately keeps all resources alive.
     Capture contexts remain pinned by their graph bucket, not by replay tickets.
     """
@@ -36,20 +35,18 @@ class ManagedExecutionContext(ExecutionContext):
         compute_stream,
         copy_stream,
         record_completion,
-        failure_drain,
         capturing=False,
     ):
         if not isinstance(phase, Phase):
             raise ValueError("Unsupported execution phase")
         if phase is Phase.PREFILL and capturing:
             raise ValueError("Prefill cannot be captured")
-        self._invocation_id = object()
+        self.invocation_id = object()
         self.phase = phase
         self.capturing = capturing
         self.compute_stream = compute_stream
         self.copy_stream = copy_stream
         self._record = record_completion
-        self._failure_drain = failure_drain
         self._lock = RLock()
         self._resources = []
         self._resource_ids = set()
@@ -57,7 +54,6 @@ class ManagedExecutionContext(ExecutionContext):
         self._submission_thread = get_ident()
         self._dependencies = {}
         self._frontiers = {}
-        self._recorded_completions = set()
         self._completion_streams = {}
         self._disposed = False
         self._workers = 0
@@ -80,6 +76,11 @@ class ManagedExecutionContext(ExecutionContext):
                 self._resource_ids.add(id(resource))
                 self._resources.append(resource)
 
+    def retain_completion(self, dependency):
+        """Pin submission resources and register their independent completion."""
+        self.retain(dependency)
+        return self.register_completion(dependency)
+
     def register_completion(self, dependency, *, stream=None):
         """Track dependencies without implicitly retaining arbitrary resources.
 
@@ -99,7 +100,6 @@ class ManagedExecutionContext(ExecutionContext):
                 raise RuntimeError("Invocation already closed")
             if stream is not None:
                 self._frontiers[id(stream)] = completion
-                self._recorded_completions.add(id(completion))
                 self._completion_streams[id(completion)] = id(stream)
             pending = [completion]
             while pending:
@@ -208,7 +208,7 @@ class ManagedExecutionContext(ExecutionContext):
             dependencies = {
                 key: value
                 for key, value in self._dependencies.items()
-                if key not in self._recorded_completions
+                if key not in self._completion_streams
             }
             dependencies.update(
                 (id(value), value) for value in self._frontiers.values()
@@ -259,36 +259,14 @@ class ManagedExecutionContext(ExecutionContext):
         self._resource_ids.clear()
         self._dependencies.clear()
         self._frontiers.clear()
-        self._recorded_completions.clear()
         self._completion_streams.clear()
         self._completion = None
-        self._record = self._failure_drain = None
+        self._record = None
         # These optional bindings otherwise retain the entire serving batch or
         # captured inputs through external references to an already retired ctx.
         self.__dict__.pop("forward_batch", None)
         self.__dict__.pop("num_token_non_padded", None)
         self._disposed = True
-
-    def release_completed(self):
-        """Compatibility eager wait-and-release; serving retirement never calls it."""
-        with self._lock:
-            if not self._closed or self._completion is None:
-                raise RuntimeError("Finish the invocation before releasing resources")
-            completion = self._completion
-        completion.resources_idle.completion.synchronize()
-        # Graph warmups use capturing=True to emit exactly the capture program,
-        # but this method is called only outside actual graph capture.
-        self.dispose_completed(graph_destroyed=True)
-
-    def abort(self):
-        """Drain failed eager submissions before releasing retained objects."""
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("Invocation already finished")
-        self._failure_drain()
-        for completion in tuple(self._dependencies.values()):
-            completion.synchronize()
-        self.dispose_after_drain()
 
 
 @dataclass
@@ -371,7 +349,6 @@ class DecodeStateSnapshot:
         copied.completion.wait_on(context.compute_stream)
         self._copy_residency(self.saved, self.residency)
         self.policy.copy_state(self.saved_policy, self.policy_state)
-        self.residency.execution_key.fill_(-1)
         self.residency.execution_valid.zero_()
         self.residency.step_access_count.zero_()
         # update_enabled belongs to the current invocation/capture, not history.
@@ -409,28 +386,10 @@ class DecodeStateSnapshot:
                 ("policy." + field.name, getattr(self.saved_policy, field.name))
                 for field in fields(self.saved_policy)
             )
-        result, seen = (
-            list(policy_allocations),
-            {x.storage_key for x in policy_allocations},
-        )
-        for name, tensor in tensors:
-            storage = tensor.untyped_storage()
-            key = (str(tensor.device), storage.data_ptr())
-            if storage.nbytes() and key not in seen:
-                seen.add(key)
-                result.append(
-                    Allocation(
-                        "snapshot." + name,
-                        ResourceKind.METADATA,
-                        storage.nbytes(),
-                        key,
-                        self,
-                    )
-                )
-        return tuple(result)
+        return policy_allocations + tensor_allocations("snapshot.", tensors)
 
 
-class InvocationRuntime(BoundMoERuntime):
+class BoundMoERuntime:
     """Shared invocation, transition and worker teardown for device bindings.
 
     A binding supplies streams/events, model hooks, storage and programs. Phase
@@ -438,22 +397,54 @@ class InvocationRuntime(BoundMoERuntime):
     class does not duplicate that state machine.
     """
 
-    def _initialize_lifecycle(self):
+    capabilities = RuntimeCapabilities(True, True, True)
+
+    def __init__(
+        self,
+        *,
+        device_runtime,
+        residency,
+        residency_ops,
+        cache_updates,
+        snapshot,
+        reload_weights,
+        layer_programs,
+        resources,
+        expert_nbytes,
+        storage,
+        cache_stats=None,
+        diagnostics=None,
+        pipelines=(),
+        release=None,
+    ):
+        self.device_runtime = device_runtime
+        self.residency = residency
+        self.ops = residency_ops
+        self.cache_updates = cache_updates
+        self.cache_stats = cache_stats
+        self.diagnostics = diagnostics
+        self.snapshot = snapshot
+        self.reload_weights = reload_weights
+        self.layer_programs = dict(layer_programs)
+        if not self.layer_programs:
+            raise ValueError("At least one offloaded layer must be bound")
+        self.resources = tuple(resources)
+        self.expert_nbytes = expert_nbytes
+        self.storage = tuple(storage)
+        self.pipelines = tuple(pipelines)
+        self._release = release
+        self._model_binding = None
         self._context = None
-        self._step_started = False
         self._capture = None
         self._failed_contexts = []
-        self._transition_contexts = []
         self._closed = False
         self._closing = False
-        self._invocation_sequence = 0
-        self._runtime_identity = object()
-
-    def retire_transitions(self):
-        """Called only after the owner/initializer completed its existing wait."""
-        for context in self._transition_contexts:
-            context.dispose_completed()
-        self._transition_contexts.clear()
+        self._installed = False
+        self._owner = None
+        self._static_allocated = None
+        self._captured_workspace = 0
+        self._cache_initialized = False
+        self.residency.update_enabled.fill_(True)
 
     def retire_graph_resources(self, contexts):
         """Forget only contexts disposed by their own successful graph cleanup.
@@ -472,19 +463,12 @@ class InvocationRuntime(BoundMoERuntime):
         ]
 
     def _new_context(self, phase, *, stream=None, capturing=False):
-        context = ManagedExecutionContext(
+        context = ExecutionContext(
             phase,
             compute_stream=stream or self.device_runtime.current_stream(),
             copy_stream=self.device_runtime.copy_stream,
             record_completion=self.device_runtime.record,
-            failure_drain=self.synchronize,
             capturing=capturing,
-        )
-        self._invocation_sequence += 1
-        context._invocation_id = (
-            self._runtime_identity,
-            self._invocation_sequence,
-            "capture" if capturing else "eager",
         )
         context.started_layers = set()
         return context
@@ -504,18 +488,18 @@ class InvocationRuntime(BoundMoERuntime):
         return self._context
 
     def _transition(self, operation):
+        self._require_open()
         if self._context is not None:
             raise RuntimeError("Phase transition cannot overlap a forward")
         # The owner drained prior work before entering this transition.
-        self.retire_transitions()
         context = self._new_context(Phase.DECODE)
-        self._transition_contexts.append(context)
         self._context = context
         try:
             with self.device_runtime.stream_scope(context.compute_stream):
                 ticket = operation(context)
                 completion = context.finish(residency_ready=ticket)
-            return completion.resources_idle
+            completion.resources_idle.completion.synchronize()
+            context.dispose_completed()
         except BaseException:
             self._failed_contexts.append(context)
             raise
@@ -530,11 +514,9 @@ class InvocationRuntime(BoundMoERuntime):
         self.residency.execution_valid.zero_()
 
     def restore_decode_state(self):
-        ticket = self._transition(
+        self._transition(
             lambda context: self.snapshot.restore(context, self.reload_weights)
         )
-        # The owner retires the transition context immediately after its wait.
-        return ticket
 
     def synchronize(self):
         contexts = list(self._failed_contexts)
@@ -559,6 +541,9 @@ class InvocationRuntime(BoundMoERuntime):
             raise abort_error
 
     def close(self):
+        if self._owner is not None:
+            self._owner.close()
+            return
         if self._closed:
             return
         if self._context is not None or self._capture is not None:
@@ -573,8 +558,7 @@ class InvocationRuntime(BoundMoERuntime):
             return
         if self._context is not None or self._capture is not None:
             raise RuntimeError("Finish active host submissions before closing runtime")
-        owner = getattr(self, "_owner", None)
-        if owner is not None and getattr(owner, "_graphs", ()):
+        if self._owner is not None and self._owner._graphs:
             raise RuntimeError("Destroy graph buckets before closing runtime")
         self._closing = True
         if self.diagnostics is not None:
@@ -587,16 +571,328 @@ class InvocationRuntime(BoundMoERuntime):
         self._remove_hooks()
         if self._release is not None:
             self._release()
-        for context in self._failed_contexts + self._transition_contexts:
+        for context in self._failed_contexts:
             context.dispose_after_drain(graph_destroyed=True)
         self._failed_contexts.clear()
-        self._transition_contexts.clear()
         if self.snapshot is not None:
             self.snapshot._snapshot = None
         self.layer_programs.clear()
-        self.prefill_program = self.decode_program = None
         self.resources = self.storage = self.pipelines = ()
         self.snapshot = self.cache_updates = self.ops = self.residency = None
         self.cache_stats = self.diagnostics = None
         self.reload_weights = self._release = None
         self._closed = True
+
+    def initialize_hot_cache(self, keys):
+        """Materialize offline Top-K through the production transfer/publication.
+
+        No synthetic decode step runs here: online usage and the periodic clock
+        remain zero. The same fault latch and complete-bundle fence used during
+        serving protect initial publication before any graph can capture banks.
+        """
+        import torch
+
+        self._require_open()
+        if self._installed or self._cache_initialized:
+            raise RuntimeError("Initialize the hot cache exactly once before binding")
+        keys = tuple(keys)
+        if len(keys) != self.residency.slot_to_key.numel():
+            raise ValueError("Offline Top-K must fill the configured hot capacity")
+        if len(set(keys)) != len(keys) or any(
+            type(key) is not int or not 0 <= key < self.residency.key_to_slot.numel()
+            for key in keys
+        ):
+            raise ValueError("Offline Top-K must contain distinct catalog keys")
+
+        def initialize(context):
+            targets = self.cache_updates.target_keys
+            source = torch.tensor(keys, dtype=torch.int64, device=targets.device)
+            context.retain(source)
+            targets.copy_(source)
+            return self.cache_updates.access.apply_update(targets, context)
+
+        self._transition(initialize)
+        if self.ops.error_status.item() != 0:
+            raise RuntimeError(
+                "Device residency/transfer fault during cache initialization"
+            )
+        self._cache_initialized = True
+        logger.info(
+            "MoE offload initial cache ready: slots=%s layers=%s",
+            len(keys),
+            len(self.layer_programs),
+        )
+
+    def install_model_hooks(self, offloader, model_runner):
+        self._require_open()
+        if self._installed:
+            raise RuntimeError("Model hooks are already installed")
+        self._owner = offloader.owner
+        try:
+            self._model_binding = offloader.adapter.bind_entries(
+                self, offloader._layers
+            )
+            self._runner = model_runner
+            model_runner.capture_head_hooks.append(self._capture_head)
+            model_runner.capture_tail_hooks.append(self._capture_tail)
+            self._installed = True
+        except BaseException:
+            self._remove_hooks()
+            raise
+
+    def _enter_layer(self, layer_id):
+        self._require_emission()
+        context = self.context
+        if layer_id not in context.started_layers:
+            self.emit_layer_start(layer_id, context)
+            context.started_layers.add(layer_id)
+
+    def _require_emission(self):
+        if self.context.phase is Phase.DECODE and self._capture is None:
+            raise RuntimeError("MoE offload decode must use a captured full graph")
+
+    def emit_layer_start(self, layer_id, context):
+        if context.phase is Phase.PREFILL:
+            if context.capturing:
+                raise RuntimeError("Prefill layer-start cannot run during capture")
+            # Shared A/B storage cannot overwrite the previous layer's reader.
+            frontier = context.record_compute_completion()
+            frontier.completion.wait_on(context.copy_stream)
+            self.layer_programs[layer_id].prefill.layer_start(layer_id, context)
+
+    def run_layer(self, layer_id, hidden_states, routing, *, pre_quant_input=None):
+        self._require_emission()
+        if pre_quant_input is not None:
+            raise ValueError("Prequantized routed side streams are not supported")
+        context = self.context
+        # Eager preprocessing may replace the local-padding Tensor after
+        # forward_scope entry. Read the finalized batch binding at actual D.
+        context.num_token_non_padded = context.forward_batch.moe_num_token_non_padded()
+        programs = self.layer_programs[layer_id]
+        program = (
+            programs.prefill if context.phase is Phase.PREFILL else programs.decode
+        )
+        # Dispatch/combine join native communication onto compute_stream. This
+        # matches resident inference: release receive tensors/handles after C so
+        # the graph allocator can reuse them for the next layer. Events and copy
+        # descriptors remain pinned by the invocation; failed scopes keep tensors.
+        with context.temporary_scope():
+            context.retain(routing)
+            return program.run(layer_id, hidden_states, routing, context)
+
+    @staticmethod
+    def _phase(forward_batch, *, has_global_work, current_phase):
+        mode = forward_batch.forward_mode
+        local_prefill = (
+            not mode.is_decode_or_idle() and mode.is_extend_without_speculative()
+        )
+        if not (mode.is_decode_or_idle() or local_prefill):
+            raise ValueError("MoE offload accepts decode/idle or ordinary extend only")
+        if not has_global_work:
+            # Padded slots are not work. An entirely idle group must not restore
+            # decode weights merely because its local mode is IDLE.
+            return current_phase
+        # Attention-DP ranks may be IDLE or DECODE while peers run prefill.
+        # This scheduler flag is shared even without two-batch overlap; the
+        # local Attention mode remains unchanged. Decide before owner transitions
+        # and before eager preprocessing can relabel/pad the local batch.
+        if local_prefill or getattr(forward_batch, "is_extend_in_batch", False):
+            return Phase.PREFILL
+        return Phase.DECODE
+
+    @staticmethod
+    def _has_global_work(forward_batch):
+        for name in ("original_global_num_tokens_cpu", "global_num_tokens_cpu"):
+            counts = getattr(forward_batch, name, None)
+            if counts is not None:
+                return any(count > 0 for count in counts)
+        count = getattr(forward_batch, "global_num_token_non_padded_cpu", None)
+        if count is not None:
+            return count > 0
+        return forward_batch.input_ids.numel() > 0
+
+    @contextmanager
+    def forward_scope(self, owner, forward_batch):
+        self._require_open()
+        if self._context is not None or self._capture is not None:
+            raise RuntimeError("Concurrent forwards/capture are not supported")
+        has_global_work = self._has_global_work(forward_batch)
+        phase = self._phase(
+            forward_batch,
+            has_global_work=has_global_work,
+            current_phase=owner.phase,
+        )
+        stream = self.device_runtime.current_stream()
+        token = owner.begin_forward(phase, stream)
+        context = self._new_context(phase, stream=stream)
+        self._context = context
+        logger.debug(
+            "MoE offload forward.begin: rank=%s seq=%s phase=%s mode=%s "
+            "extend_in_batch=%s global_work=%s bs=%s tokens=%s",
+            getattr(getattr(owner, "config", None), "ep_rank", None),
+            token.sequence,
+            phase.value,
+            getattr(forward_batch.forward_mode, "name", None),
+            getattr(forward_batch, "is_extend_in_batch", False),
+            has_global_work,
+            getattr(forward_batch, "batch_size", 0),
+            getattr(getattr(forward_batch, "input_ids", None), "numel", lambda: 0)(),
+        )
+        try:
+            # The graph consumes this fixed-address flag on replay. Active
+            # decode peers advance even on locally idle ranks; prefill and an
+            # entirely idle group never advance the decode cache policy.
+            with self.device_runtime.stream_scope(stream):
+                self.residency.update_enabled.fill_(
+                    has_global_work and phase is Phase.DECODE
+                )
+            context.forward_batch = forward_batch
+            context.num_token_non_padded = None
+            context.retain(forward_batch)
+            yield context
+            # Replay does not run Python hooks. Its tail was emitted in capture;
+            # record fresh events only, without updating the policy twice.
+            record = None
+            if self.diagnostics is not None:
+                try:
+                    runner = getattr(
+                        getattr(self, "_runner", None), "decode_cuda_graph_runner", None
+                    )
+                    record = self.diagnostics.snapshot(
+                        phase,
+                        token.sequence,
+                        forward_batch,
+                        bucket=(
+                            getattr(runner, "bs", None)
+                            if phase is Phase.DECODE
+                            else None
+                        ),
+                    )
+                    context.retain(record)
+                except Exception:
+                    logger.warning(
+                        "MoE offload batch snapshot unavailable", exc_info=True
+                    )
+            completion = context.finish()
+            owner.finish_forward(token, completion)
+            if self.diagnostics is not None:
+                try:
+                    self.diagnostics.publish(record, completion.output_ready.completion)
+                except Exception:
+                    logger.warning(
+                        "MoE offload batch log publication failed", exc_info=True
+                    )
+            logger.debug(
+                "MoE offload forward.submitted: seq=%s phase=%s",
+                token.sequence,
+                phase.value,
+            )
+        except BaseException:
+            logger.exception(
+                "MoE offload forward.failed: seq=%s phase=%s",
+                token.sequence,
+                phase.value,
+            )
+            self._failed_contexts.append(context)
+            owner.fail_forward(token)
+            # Stop workers before removing their active retention context. Any
+            # failed drain leaves all contexts pinned for an explicit close retry.
+            self.synchronize()
+            raise
+        finally:
+            self._context = None
+
+    def _capture_head(self, graph_runner, forward_batch, num_tokens):
+        if self._capture is None or self._context is not None:
+            raise RuntimeError("Invalid offload capture invocation")
+        stream = self.device_runtime.current_stream()
+        context = self._new_context(Phase.DECODE, stream=stream, capturing=True)
+        context.forward_batch = forward_batch
+        context.num_token_non_padded = None
+        context.retain(forward_batch)
+        self._capture.append(context)
+        self._context = context
+        self.ops.begin_step(context)
+
+    def _capture_tail(self, graph_runner, output, forward_batch, num_tokens):
+        if self._capture is None or self._context is None:
+            raise RuntimeError("Capture tail requires its matching head")
+        tail = self.cache_updates.emit_step_end(self.context)
+        self.context.finish(residency_ready=tail)
+        self._context = None
+
+    @contextmanager
+    def capture_scope(self, owner, graph_runner, stream):
+        self._require_open()
+        if self._capture is not None or self._context is not None:
+            raise RuntimeError("Nested MoE graph capture")
+        self.synchronize()
+        self.residency.update_enabled.fill_(False)
+        self.synchronize()  # flag must be visible before any warmup stream
+        if self._static_allocated is None:
+            # KV pools and graph input buffers are allocated after model hooks;
+            # take the baseline only when the first capture session starts.
+            self._static_allocated = self.device_runtime.allocated()
+        self.device_runtime.reset_peak()
+        retained = []
+        self._capture = retained
+        try:
+            yield retained
+            if self._context is not None:
+                raise RuntimeError("Capture model invocation did not finish")
+            self.synchronize()
+            if self.ops.error_status.item() != 0:
+                raise RuntimeError("Device residency fault during graph warmup")
+            self._account_capture_workspace(owner)
+        except BaseException:
+            self._failed_contexts.extend(retained)
+            raise
+        finally:
+            self._capture = None
+            self._context = None
+            # Outside the captured graph: replay observes the live device flag.
+            self.residency.update_enabled.fill_(True)
+            self.synchronize()
+
+    def after_graph_warmup(self):
+        self._require_open()
+        if self._capture is None or self._context is not None or not self._capture:
+            raise RuntimeError("Warmup retirement requires a finished invocation")
+        # capture_one invokes its reset hook after one eager forward, before the
+        # next warmup/capture. Older entries may belong to captured graph buckets.
+        context = self._capture[-1]
+        self.synchronize()  # Includes native EP streams and partially queued work.
+        context.dispose_after_drain(graph_destroyed=True)
+        self._capture.pop()
+
+    def _account_capture_workspace(self, owner):
+        if self._static_allocated is None:
+            self._static_allocated = self.device_runtime.allocated()
+        used = max(0, self.device_runtime.peak() - self._static_allocated)
+        self._captured_workspace = max(used, self._captured_workspace)
+        dynamic = Allocation(
+            "npu.capture_and_temporary_workspace",
+            ResourceKind.WORKSPACE,
+            self._captured_workspace,
+            ("capture_workspace", id(self)),
+            self,
+        )
+        # Includes whole-model capture growth conservatively; no expert payload
+        # can hide in an uncharged graph-pool allocation.
+        allocations = self.resources + (dynamic,)
+        ledger = AllocationLedger(owner.allocation_ledger.limits, allocations)
+        owner.allocation_ledger = ledger
+
+    def _remove_hooks(self):
+        if self._model_binding is not None:
+            self._model_binding.close()
+            self._model_binding = None
+        runner = getattr(self, "_runner", None)
+        if runner is not None:
+            for hooks, callback in (
+                (runner.capture_head_hooks, self._capture_head),
+                (runner.capture_tail_hooks, self._capture_tail),
+            ):
+                if callback in hooks:
+                    hooks.remove(callback)
+            self._runner = None

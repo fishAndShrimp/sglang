@@ -1,8 +1,9 @@
 """CPU lifecycle regressions; no accelerator graph or memory-size certification."""
 
-import gc
 import unittest
 import weakref
+from contextlib import contextmanager, nullcontext
+from threading import RLock, Thread
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -11,8 +12,8 @@ from test_moe_graph_leases import Backend, Owner
 
 from sglang.srt.offloading.moe.config import Phase
 from sglang.srt.offloading.moe.graph import GraphLeaseBackend
-from sglang.srt.offloading.moe.npu.runtime import NpuBoundMoERuntime
-from sglang.srt.offloading.moe.runtime import ManagedExecutionContext
+from sglang.srt.offloading.moe.owner import MoEOffloadOwner, OwnerState
+from sglang.srt.offloading.moe.runtime import BoundMoERuntime, ExecutionContext
 from sglang.srt.offloading.transfer import ImmediateCompletion, TransferTicket
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -28,13 +29,14 @@ class TestMoEWarmupLifetime(unittest.TestCase):
         calls = []
         device = SimpleNamespace(
             copy_stream="copy",
+            stream_scope=lambda stream: nullcontext(),
             current_stream=lambda: "compute",
             record=lambda stream: TransferTicket(ImmediateCompletion()),
             allocated=lambda: 0,
             reset_peak=lambda: None,
         )
         device.synchronize = Mock(side_effect=lambda: calls.append("device_drain"))
-        runtime = NpuBoundMoERuntime(
+        runtime = BoundMoERuntime(
             device_runtime=device,
             residency=SimpleNamespace(update_enabled=torch.tensor(False)),
             residency_ops=SimpleNamespace(
@@ -58,6 +60,22 @@ class TestMoEWarmupLifetime(unittest.TestCase):
         return wrapper, owner, runtime, device, calls
 
     @staticmethod
+    def real_owner(runtime):
+        owner = MoEOffloadOwner.__new__(MoEOffloadOwner)
+        owner._lock = RLock()
+        owner.runtime = runtime
+        owner.config = SimpleNamespace(ep_rank=0)
+        owner.phase, owner.state = Phase.DECODE, OwnerState.READY
+        owner._sequence = 0
+        owner._active = owner._capture_session = None
+        owner._pending = []
+        owner._graphs, owner._graph_cleanups = set(), set()
+        owner._closing = False
+        owner.allocation_ledger = None
+        runtime._owner = owner
+        return owner
+
+    @staticmethod
     def invocation(runtime, references):
         batch = object()
         runtime._capture_head(None, batch, 1)
@@ -65,8 +83,7 @@ class TestMoEWarmupLifetime(unittest.TestCase):
         payload = Payload()
         references.append(weakref.ref(payload))
         context.retain(payload)
-        # Production weight leases refer back to the invocation context.
-        context.retain(SimpleNamespace(context=context))
+        context.retain(SimpleNamespace(invocation_id=context.invocation_id))
         runtime._capture_tail(None, None, batch, 1)
 
     def test_each_warmup_releases_resources_without_collecting_captured_buckets(self):
@@ -122,30 +139,150 @@ class TestMoEWarmupLifetime(unittest.TestCase):
     def test_completion_failure_does_not_release_keepalives(self):
         completion = ImmediateCompletion()
         completion.synchronize = Mock(side_effect=RuntimeError("reader unfinished"))
-        context = ManagedExecutionContext(
+        context = ExecutionContext(
             Phase.DECODE,
             compute_stream="compute",
             copy_stream="copy",
             record_completion=lambda stream: TransferTicket(ImmediateCompletion()),
-            failure_drain=lambda: None,
         )
         payload = Payload()
         reference = weakref.ref(payload)
         context.retain(payload)
+        context.forward_batch = payload
         context.retain(SimpleNamespace(context=context))
         ticket = TransferTicket(completion)
         context.retain(ticket)
         context.register_completion(ticket)
         del payload
         with self.assertRaisesRegex(RuntimeError, "Finish the invocation"):
-            context.release_completed()
-        context.finish()
+            context.dispose_completed()
+        owner = MoEOffloadOwner.__new__(MoEOffloadOwner)
+        owner._lock = RLock()
+        owner._active = owner._capture_session = None
+        owner.state = OwnerState.READY
+        result = context.finish()
+        owner._pending = [result]
         with self.assertRaisesRegex(RuntimeError, "reader unfinished"):
-            context.release_completed()
+            owner.wait_idle()
         self.assertIsNotNone(reference())
+        self.assertIs(owner.state, OwnerState.FAILED)
         completion.synchronize.side_effect = None
-        context.release_completed()
+        owner.wait_idle()
         self.assertIsNone(reference())
+        self.assertEqual(result.resources, [])
+        self.assertFalse(hasattr(context, "forward_batch"))
+
+    def test_capture_gate_covers_first_lease_and_runtime_scope_exit(self):
+        wrapper, _, runtime, _, calls = self.make_runtime()
+        owner = self.real_owner(runtime)
+        wrapper.owner = owner
+        other = GraphLeaseBackend(Backend(calls), owner, object())
+        observations = []
+
+        def probe_from_other_thread():
+            errors = []
+
+            def probe():
+                for operation in (
+                    owner.close,
+                    runtime.close,
+                    lambda: owner.begin_forward(Phase.DECODE, "compute"),
+                    other.cleanup,
+                ):
+                    try:
+                        operation()
+                    except RuntimeError:
+                        errors.append(True)
+
+            worker = Thread(target=probe)
+            worker.start()
+            worker.join(timeout=2)
+            self.assertFalse(
+                worker.is_alive(), "Capture gate must reject without blocking"
+            )
+            self.assertEqual(errors, [True, True, True, True])
+            observations.append(True)
+
+        original_scope = runtime.capture_scope
+
+        @contextmanager
+        def scope(*args):
+            with original_scope(*args) as resources:
+                try:
+                    yield resources
+                finally:
+                    probe_from_other_thread()
+
+        runtime.capture_scope = scope
+        with wrapper.capture_session("capture"):
+            self.assertFalse(owner._graphs)
+            probe_from_other_thread()
+        self.assertEqual(observations, [True, True])
+        self.assertIsNone(owner._capture_session)
+        wrapper.cleanup()
+        other.cleanup()
+        owner.close()
+
+    def test_failed_reset_retires_only_its_wrappers_contexts(self):
+        first, _, runtime, _, calls = self.make_runtime()
+        owner = self.real_owner(runtime)
+        first.owner = owner
+        second = GraphLeaseBackend(Backend(calls), owner, object())
+        references = []
+        for wrapper in (first, second):
+            with wrapper.capture_session("capture"):
+                wrapper.capture_one(1, lambda: self.invocation(runtime, references))
+        captured = [first._capture_resources[0][0], second._capture_resources[0][0]]
+        unknown = runtime._new_context(Phase.DECODE, capturing=True)
+        payload = Payload()
+        unknown_ref = weakref.ref(payload)
+        unknown.retain(payload)
+        del payload
+        runtime._failed_contexts = captured + [unknown]
+        first.backend.fail_cleanup = True
+        with self.assertRaisesRegex(RuntimeError, "graph reset failure"):
+            first.cleanup()
+        self.assertIsNotNone(references[2]())
+        self.assertIsNotNone(references[5]())
+        second.cleanup()
+        self.assertIsNotNone(references[2]())
+        self.assertIsNone(references[5]())
+        self.assertEqual(runtime._failed_contexts, [captured[0], unknown])
+        first.backend.fail_cleanup = False
+        first.cleanup()
+        self.assertEqual(runtime._failed_contexts, [unknown])
+        self.assertIsNotNone(unknown_ref())
+        owner.close()
+        self.assertIsNone(unknown_ref())
+
+    def test_transition_owns_wait_and_retires_or_pins_on_failure(self):
+        _, _, runtime, device, _ = self.make_runtime()
+        references = []
+        completion = ImmediateCompletion()
+        completion.synchronize = Mock()
+
+        def operation(context):
+            payload = Payload()
+            references.append(weakref.ref(payload))
+            context.retain(payload)
+            return TransferTicket(completion)
+
+        runtime._transition(operation)
+        self.assertIsNone(references[-1]())
+        completion.synchronize.assert_called_once_with()
+        device.synchronize.assert_not_called()
+        completion.synchronize.side_effect = RuntimeError("transition wait failed")
+        with self.assertRaisesRegex(RuntimeError, "transition wait failed"):
+            runtime._transition(operation)
+        self.assertIsNotNone(references[-1]())
+        self.assertIsNone(runtime._context)
+        device.synchronize.side_effect = RuntimeError("drain failed")
+        with self.assertRaisesRegex(RuntimeError, "drain failed"):
+            runtime.close()
+        self.assertIsNotNone(references[-1]())
+        device.synchronize.side_effect = None
+        runtime.close()
+        self.assertIsNone(references[-1]())
 
 
 if __name__ == "__main__":

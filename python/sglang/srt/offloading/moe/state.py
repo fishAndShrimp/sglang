@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, fields
 
-from .resources import Allocation, ResourceKind
+from .resources import tensor_allocations
 
 
 @dataclass
@@ -11,7 +11,6 @@ class ResidencyState:
     slot_to_key: object
     slot_valid: object
     slot_generation: object
-    execution_key: object
     execution_valid: object
     step_access_count: object
     update_enabled: object
@@ -28,30 +27,13 @@ class ResidencyState:
             torch.full((hot_slots,), -1, dtype=torch.int64, device=device),
             torch.zeros(hot_slots, dtype=torch.bool, device=device),
             torch.zeros(hot_slots, dtype=torch.int64, device=device),
-            torch.full((execution_slots,), -1, dtype=torch.int64, device=device),
             torch.zeros(execution_slots, dtype=torch.bool, device=device),
             torch.zeros(num_experts, dtype=torch.int64, device=device),
             torch.zeros((), dtype=torch.bool, device=device),
         )
 
     def allocations(self):
-        """Report residency tensors for the binder's allocation ledger.
-
-        The binder also reports policy state, snapshots and plans.
-        """
-        allocations = []
-        for field in fields(self):
-            tensor = getattr(self, field.name)
-            storage = tensor.untyped_storage()
-            if storage.nbytes() == 0:
-                continue
-            allocations.append(
-                Allocation(
-                    f"residency.{field.name}",
-                    ResourceKind.METADATA,
-                    storage.nbytes(),
-                    (str(tensor.device), storage.data_ptr()),
-                    tensor,
-                )
-            )
-        return tuple(allocations)
+        return tensor_allocations(
+            "residency.",
+            ((field.name, getattr(self, field.name)) for field in fields(self)),
+        )

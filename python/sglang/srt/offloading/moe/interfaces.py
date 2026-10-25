@@ -8,25 +8,13 @@ called again on graph replay. Runtime bindings must own all captured addresses.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    import torch
+    from .runtime import BoundMoERuntime
 
 from ..transfer import Completion, TransferTicket
-from .config import Phase
-from .formats import ExpertFormat
-from .state import ResidencyState
-
-
-@dataclass(frozen=True)
-class LocalRoutes:
-    """Post-dispatch assignments; expert IDs are local to this rank/layer."""
-
-    expert_ids: torch.Tensor
-    valid: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -70,72 +58,6 @@ class ForwardCompletion:
             context.dispose_completed()
         else:
             self.resources.clear()
-
-
-class ExecutionContext(ABC):
-    """Runtime-owned invocation/capture context; phase/capturing are host constants.
-
-    emit_* submits eager operations or emits captured nodes. Python is not rerun
-    on replay. Prefill may start host work only when capturing is false.
-    """
-
-    phase: Phase
-    capturing: bool
-    compute_stream: object
-    copy_stream: object
-
-    @property
-    def invocation_id(self):
-        # Legacy subclasses need not call a base constructor. The managed
-        # implementation initializes this before starting any host workers.
-        if not hasattr(self, "_invocation_id"):
-            self._invocation_id = object()
-        return self._invocation_id
-
-    @abstractmethod
-    def retain(self, resource):
-        """Pin before submission, within the current resource scope.
-
-        This only retains resources. Register completion separately when an
-        operation returns a dependency. A partially failed submission without a
-        ticket is drained by the runtime's stream/worker failure path.
-        Capture-time tickets are not host proof of a subsequent replay finishing.
-        Eager implementations must support calls from the prefill submitter thread.
-        """
-
-    def register_completion(self, completion, *, stream=None):
-        """Register a dependency independently of resource retention.
-
-        Legacy contexts can conservatively retain tickets; managed contexts
-        deduplicate dependencies and track recorded per-stream frontiers.
-        """
-        self.retain(completion)
-        return completion
-
-    def wait_for(self, dependency, stream):
-        """Join a dependency; device bindings may omit proven same-stream waits."""
-        completion = (
-            dependency.completion
-            if isinstance(dependency, TransferTicket)
-            else dependency
-        )
-        completion.wait_on(stream)
-
-    def temporary_scope(self):
-        """Optional stream-ordered lifetime for prefill/decode wave/layer temporaries.
-
-        The caller must join every auxiliary consumer onto compute_stream before
-        successful exit. Events, transfer descriptors and persistent allocations
-        remain owned through completion/graph teardown. Background submitters
-        retain invocation lifetimes independently of compute-thread scopes.
-        Failure must pin partial submissions until drain. Conservative contexts
-        keep invocation lifetimes.
-        """
-        return nullcontext()
-
-    @abstractmethod
-    def record_compute_completion(self) -> TransferTicket:
-        """Record the current compute frontier, without host synchronization."""
 
 
 class CachePolicy(ABC):
@@ -182,10 +104,12 @@ class ResidencyOps(ABC):
 
     @abstractmethod
     def resolve_execution(self, local_demand, context):
-        """Return ExecutionReservation; misses do not imply hot admission.
+        """Return MaterializationPlan; misses do not imply hot admission.
 
         Accept ExecutionRequest; include plan-ready, old target readers and source
-        readiness in copy_dependencies. Keep source readers pinned through copy.
+        readiness in copy_dependencies. Decode plan readiness also covers the
+        preceding compute frontier: even different banks must not prefetch F.
+        Keep source readers pinned through copy.
         """
 
     @abstractmethod
@@ -202,7 +126,7 @@ class ResidencyOps(ABC):
 
     @abstractmethod
     def prepare_update(self, target_keys, context, *, update_enabled=None):
-        """Return UpdatePlan, retaining survivors and reserving protected victims.
+        """Return MaterializationPlan, retaining survivors and reserving protected victims.
 
         Include plan-ready and all old reader dependencies. Honor the runtime's
         device update_enabled guard during capture/warmup without reading it on CPU.
@@ -261,22 +185,6 @@ class MoEDispatcher(ABC):
         """Apply any common tail/reduction exactly once."""
 
 
-class WaveDispatcher(MoEDispatcher):
-    """Repeated DFC additionally needs route masking and result accumulation."""
-
-    @abstractmethod
-    def mask_routes(self, routing, wave, context):
-        pass
-
-    @abstractmethod
-    def accumulator(self, hidden_states, context):
-        """Return a zeroed, budgeted output buffer."""
-
-    @abstractmethod
-    def accumulate(self, accumulator, partial, context):
-        pass
-
-
 class DispatchLayoutAdapter(ABC):
     """Slice a single full dispatch and assemble its original combine layout.
 
@@ -317,132 +225,6 @@ class DispatchLayoutAdapter(ABC):
 
         Preserve the backend's weighting convention without applying weights a
         second time. Keep layout storage live until combine finishes reading it.
-        """
-
-
-class BoundMoERuntime(ABC):
-    """One rank/model binding, exclusively owned by MoEOffloadOwner.
-
-    resources enumerates unique physical allocations (including policy sort
-    workspace, snapshots, copy plans, graph workspaces and any staging weights).
-    Prefill views can alias the hot arena; aliases are not new allocations.
-    """
-
-    capabilities: RuntimeCapabilities
-    resources: tuple
-    expert_nbytes: int
-    residency: ResidencyState
-    prefill_program: WholeMoEProgram
-    decode_program: WholeMoEProgram
-    cache_updates = None  # Optional bound CacheUpdateCoordinator.
-
-    def eager_step_scope(self, forward_batch):
-        """Optional step emission; capture uses separately installed hooks."""
-        return nullcontext()
-
-    @abstractmethod
-    def install_model_hooks(self, offloader, model_runner):
-        """Bind layer-start/router hooks and capture_head_hooks/capture_tail_hooks.
-
-        Every graph bucket pins owner with a graph lease. Release that lease only
-        after destroying the graph. Reject unsupported runtime features before
-        any collective: EPLB, speculative decoding, weight updates and overlap.
-        Warmup/capture use a device update_enabled=0; real replay sets it to 1.
-        """
-
-    def capture_scope(self, owner, graph_runner, stream):
-        """Host scope for the complete decode graph capture session and warmups.
-
-        Disable the fixed-address update_enabled outside capture, bind contexts
-        for capture_head_hooks/capture_tail_hooks, and yield capture keepalive
-        state. Those hooks emit step begin/end exactly once per model invocation.
-        Restore updates only outside the captured graph. Keep partially submitted
-        resources retained on failure; synchronize drains all involved streams.
-        This default fails closed until a concrete runtime binds that protocol.
-        """
-        raise NotImplementedError(
-            "Bind MoE warmup/capture scope before creating graphs"
-        )
-
-    def after_graph_warmup(self):
-        """Retire the just-finished eager warmup, outside device graph capture.
-
-        Called after each backend warmup and its existing reset hook. Drain all
-        readers/copies before releasing temporary keepalives; preserve resources
-        from earlier captured buckets. Failure must leave keepalives pinned.
-        """
-
-    @abstractmethod
-    def forward_scope(self, owner, forward_batch):
-        """Host context around eager forward OR replay; serialize with idle fence.
-
-        Must finish_forward with fresh completion events recorded after submission.
-        On exceptions call fail_forward; never reuse capture-time host tickets as
-        completion evidence for a later replay. Reject unsupported ForwardModes.
-        """
-
-    @abstractmethod
-    def emit_step_begin(self, context):
-        """Clear step accesses and establish fixed per-forward device state."""
-
-    def emit_layer_start(self, layer_id, context):
-        """Start eager prefill at layer entry; decode emits no weight prefetch.
-
-        Bind resident layers to a no-op program or skip this hook for those layers.
-        """
-        if context.phase is Phase.PREFILL:
-            if context.capturing:
-                raise RuntimeError("Prefill layer-start cannot run during capture")
-            self.prefill_program.layer_start(layer_id, context)
-        elif context.phase is not Phase.DECODE:
-            raise ValueError("Unsupported execution phase")
-
-    @abstractmethod
-    def emit_after_router(self, layer_id, routing, context):
-        """Emit routing bookkeeping; complete local demand is known after D."""
-
-    def emit_step_end(self, context):
-        """Decode: policy update/select, materialize new hot set, then commit.
-
-        A PeriodicLFUPolicy binding calls finish_step after select_hot_set and
-        before preparing transfers. It must not gate valid steps on whether this
-        EP rank has local routes. Disable both policy updates and commits during
-        warmup/capture; selection alone does not publish residency.
-        Prefill: no hotness updates. Whole-model step counts must ignore padding.
-        All background work must join the resources_idle completion.
-        """
-        if context.phase is Phase.PREFILL:
-            if context.capturing:
-                raise RuntimeError("Prefill step-end cannot run during capture")
-            return None
-        if context.phase is not Phase.DECODE:
-            raise ValueError("Unsupported execution phase")
-        if self.cache_updates is None:
-            raise NotImplementedError("Bind cache_updates or implement emit_step_end")
-        return self.cache_updates.emit_step_end(context)
-
-    @abstractmethod
-    def snapshot_decode_state(self):
-        """Return TransferTicket for exact slot/policy metadata snapshot, no weights."""
-
-    @abstractmethod
-    def borrow_hot_arena(self):
-        """After snapshot completes, expose budgeted views to prefill programs."""
-
-    @abstractmethod
-    def restore_decode_state(self):
-        """Reload original slots from host; then restore mappings and policy."""
-
-    @abstractmethod
-    def synchronize(self):
-        """Drain every backend stream, including work from a failed submission."""
-
-    @abstractmethod
-    def close(self):
-        """Stop/drain and release resources after destruction of all graphs.
-
-        A public close owns its drain. An internal close_after_drain may reuse
-        the owner's already completed fence, without synchronizing twice.
         """
 
 

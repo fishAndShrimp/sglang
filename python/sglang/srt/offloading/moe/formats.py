@@ -5,6 +5,19 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
+class CheckpointComponent:
+    """Inputs and loading semantics for one component of a probe recipe."""
+
+    name: str
+    shape: tuple
+    dtype: object
+    shards: tuple
+    runtime_name: str
+    attributes: tuple = ()
+    initial_value: int = 0
+
+
+@dataclass(frozen=True)
 class BundleComponent:
     name: str
     raw_shape: tuple
@@ -38,7 +51,7 @@ class BundleComponent:
 
 @dataclass(frozen=True)
 class BundleSchema:
-    """One storage-compatible arena; fingerprints include native format semantics."""
+    """One storage-compatible arena including its native format semantics."""
 
     format_id: str
     components: tuple
@@ -57,10 +70,6 @@ class BundleSchema:
             raise ValueError("Conversion groups must cover each component exactly once")
         if not set(self.new_outputs) <= set(names):
             raise ValueError("Conversion workspace names must be bundle components")
-
-    @property
-    def fingerprint(self):
-        return self.format_id, self.components
 
     @property
     def required_shards(self):

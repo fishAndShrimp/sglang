@@ -2,7 +2,10 @@
 
 import random
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import patch
+from weakref import ref
 
 import torch
 
@@ -15,15 +18,26 @@ from sglang.srt.offloading.moe.config import (
 )
 from sglang.srt.offloading.moe.execution import (
     ExecutionRequest,
-    ExecutionReservation,
-    SourcePolicy,
+    ExpertWeightAccess,
+    MaterializationPlan,
+)
+from sglang.srt.offloading.moe.prefill import (
+    BoundedPrefillWeightPipeline,
+    PrefillPipelineConfig,
 )
 from sglang.srt.offloading.moe.residency import BoundExecutionWave, TensorResidencyOps
+from sglang.srt.offloading.moe.resources import (
+    AllocationLedger,
+    ResourceKind,
+    tensor_allocations,
+)
 from sglang.srt.offloading.moe.state import ResidencyState
+from sglang.srt.offloading.moe.runtime import ExecutionContext
 from sglang.srt.offloading.transfer import (
     Completion,
     CopySourceKind,
     HostCopyPlan,
+    HostTransferOps,
     TransferTicket,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -96,7 +110,175 @@ def load_hot(state, keys):
     state.slot_generation.copy_(torch.arange(len(keys)) + 5)
 
 
+class ManualCompletion(Completion):
+    def __init__(self, complete, calls):
+        self.complete, self.calls = complete, calls
+
+    def wait_on(self, stream):
+        self.calls.append(("wait", stream))
+
+    def synchronize(self):
+        raise AssertionError("Pipeline abort must fence without a device host wait")
+
+    def done(self):
+        return self.complete
+
+
+class TestPrefillPipelineFailures(unittest.TestCase):
+    def make_pipeline(self, *, fail_copy_at=None, fail_combine=False):
+        calls, prepared = [], []
+        ops, _, _, _ = setup(hot=0, experts=4, slots=2)
+
+        def prepare(request, context):
+            plan = MaterializationPlan(
+                HostCopyPlan(()),
+                SimpleNamespace(wave=request.wave, offset=request.local_demand),
+            )
+            prepared.append(ref(plan))
+            return plan
+
+        ops.prepare_prefill = prepare
+
+        class HostOps(HostTransferOps):
+            def materialize_into(self, plan, bindings, stream):
+                calls.append(("submit", bindings.wave.local_start))
+                if bindings.wave.local_start + 1 == fail_copy_at:
+                    # The driver can queue writes before it reports an error.
+                    raise RuntimeError("copy failed after partial submission")
+                return TransferTicket(ManualCompletion(True, calls))
+
+        def record(stream):
+            calls.append(("record", stream))
+            return TransferTicket(ManualCompletion(True, calls))
+
+        context = ExecutionContext(
+            Phase.PREFILL,
+            compute_stream="compute",
+            copy_stream="copy",
+            record_completion=record,
+        )
+
+        def copy_fence(context):
+            session = pipeline._active_session
+            calls.append(("fence", session.worker.is_alive(), context._workers))
+            return TransferTicket(ManualCompletion(False, calls))
+
+        def combine_bindings(layer, wave, leases, context):
+            if fail_combine:
+                raise ValueError("initial group binding validation failed")
+            return SimpleNamespace(wave=wave)
+
+        pipeline = BoundedPrefillWeightPipeline(
+            ExpertWeightAccess(ops, host_ops=HostOps()),
+            PrefillPipelineConfig(4, 2, 2, 2),
+            make_request=lambda layer, wave, offset, context: ExecutionRequest(
+                layer, offset, wave, Phase.PREFILL
+            ),
+            combine_bindings=combine_bindings,
+            worker_scope=lambda context: nullcontext(),
+            record_copy_completion=copy_fence,
+        )
+        return SimpleNamespace(
+            pipeline=pipeline, context=context, calls=calls, prepared=prepared
+        )
+
+    def assert_aborted_and_retained(self, fixture, session):
+        pipeline, context = fixture.pipeline, fixture.context
+        ticket = pipeline.abort(context)
+        self.assertIs(ticket, pipeline.abort(context))
+        self.assertIsNone(pipeline._active_session)
+        self.assertTrue(session.closed)
+        self.assertIn(session, ticket.keepalive)
+        self.assertFalse(ticket.completion.done())
+        self.assertEqual(
+            [call for call in fixture.calls if call[0] == "fence"],
+            [("fence", False, 0)],
+        )
+        # The partial-copy fence must remain an independent dependency even
+        # after the invocation's compute/copy recorders report completion.
+        completion = context.finish()
+        self.assertFalse(completion.resources_idle.completion.done())
+        self.assertTrue(completion.resources)
+        with self.assertRaisesRegex(RuntimeError, "aborted"):
+            pipeline.start(3, context)
+        return ticket
+
+    def test_worker_start_failure_keeps_session_until_idempotent_abort(self):
+        fixture = self.make_pipeline()
+        with patch(
+            "sglang.srt.offloading.moe.prefill.Thread.start",
+            side_effect=RuntimeError("thread start failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "thread start failed"):
+                fixture.pipeline.start(3, fixture.context)
+        session = fixture.pipeline._active_session
+        self.assertFalse(session.worker_started)
+        self.assertTrue(session.worker_done)
+        self.assertEqual(fixture.context._workers, 0)
+        self.assertFalse(any(call[0] == "submit" for call in fixture.calls))
+        self.assert_aborted_and_retained(fixture, session)
+
+    def test_partial_copy_failure_joins_worker_before_fencing_every_plan(self):
+        fixture = self.make_pipeline(fail_copy_at=2)
+        fixture.pipeline.start(3, fixture.context)
+        session = fixture.pipeline._active_session
+        session.worker.join(timeout=2)
+        self.assertFalse(session.worker.is_alive())
+        self.assertIsInstance(session.error, RuntimeError)
+        self.assertEqual(len(session.leases), 1)
+        self.assertEqual(len(fixture.prepared), 2)
+        # No ticket was returned for the second copy. Its reservation/bindings
+        # must still be pinned by the real access/residency submission path.
+        failed_plan = fixture.prepared[1]()
+        self.assertIsNotNone(failed_plan)
+        self.assertTrue(any(item is failed_plan for item in fixture.context._resources))
+        self.assert_aborted_and_retained(fixture, session)
+        submitted = fixture.calls.index(("submit", 1))
+        self.assertLess(submitted, fixture.calls.index(("fence", False, 0)))
+
+    def test_initial_group_failure_preserves_all_microbatch_leases(self):
+        fixture = self.make_pipeline(fail_combine=True)
+        fixture.pipeline.start(3, fixture.context)
+        session = fixture.pipeline._active_session
+        session.worker.join(timeout=2)
+        self.assertFalse(session.worker.is_alive())
+        initial = tuple(session.leases)
+        self.assertEqual(len(initial), 2)
+        with self.assertRaisesRegex(ValueError, "binding validation"):
+            fixture.pipeline.seal(
+                3, ManualCompletion(True, fixture.calls), fixture.context
+            )
+        self.assertEqual(tuple(session.leases), initial)
+        self.assertTrue(all(not lease.transferred for lease in initial))
+        self.assertEqual(session.waves, ())
+        ticket = self.assert_aborted_and_retained(fixture, session)
+        for lease in initial:
+            self.assertIn(lease.ticket, ticket.keepalive)
+
+
 class TestTensorResidency(unittest.TestCase):
+    def test_allocation_reports_physical_storage_without_hiding_aliases(self):
+        storage = torch.empty(8, dtype=torch.int64)
+        view = storage[2:4]
+        records = tensor_allocations(
+            "scratch.",
+            (("view", view), ("empty", torch.empty(0))),
+            ResourceKind.WORKSPACE,
+        )
+        self.assertEqual(len(records), 1)
+        allocation = records[0]
+        self.assertEqual(allocation.name, "scratch.view")
+        self.assertEqual(allocation.nbytes, storage.untyped_storage().nbytes())
+        self.assertEqual(allocation.storage_key, ("cpu", storage.data_ptr()))
+        self.assertIs(allocation.keepalive, view)
+        empty_view = tensor_allocations("view.", (("empty", storage[:0]),))
+        self.assertEqual(empty_view[0].nbytes, allocation.nbytes)
+        ledger = AllocationLedger({ResourceKind.WORKSPACE: 64}, records)
+        self.assertEqual(ledger.usage[ResourceKind.WORKSPACE], 64)
+        aliases = tensor_allocations("alias.", (("base", storage), ("view", view)))
+        with self.assertRaisesRegex(ValueError, "physical allocations once"):
+            AllocationLedger({ResourceKind.METADATA: 128}, aliases)
+
     def test_policy_gate_is_latched_before_policy_reuses_due(self):
         ops, state, _, ctx = setup()
         state.update_enabled.fill_(True)
@@ -159,9 +341,9 @@ class TestTensorResidency(unittest.TestCase):
         before = len(ctx.calls)
         update = ops.prepare_update(torch.tensor([1, 2, 9]), ctx)
         self.assertEqual(ctx.calls[before], ("wait", "aux-reader", "compute"))
-        self.assertTrue(update.plan_covers_compute_frontier)
-        self.assertTrue(reservation.plan_covers_compute_frontier)
         self.assertEqual(len(update.copy_dependencies), 1)
+        self.assertEqual(ctx.calls[-1], ("record", update.copy_dependencies[0].name))
+        self.assertEqual(len(reservation.copy_dependencies), 1)
         ops.commit_update(update, ctx.copied(), ctx)
 
     def test_mixed_sources_and_counts_come_from_post_dispatch(self):
@@ -287,7 +469,7 @@ class TestTensorResidency(unittest.TestCase):
                 keys = proposed
             self.assertEqual([a.storage_key for a in ops.allocations()], pointers)
             self.assertEqual(len(set(pointers)), len(pointers))
-            self.assertGreater(ops.metadata_nbytes, 0)
+            self.assertGreater(sum(item.nbytes for item in ops.allocations()), 0)
 
     def test_copy_error_suppresses_execution_and_hot_publication(self):
         ops, state, waves, ctx = setup()
@@ -302,7 +484,7 @@ class TestTensorResidency(unittest.TestCase):
         ops.error_status.fill_(1)
         ops.publish_execution(reservation, ctx.copied(), ctx)
         self.assertFalse(state.execution_valid.any())
-        self.assertEqual(state.execution_key.tolist(), [-1, -1, -1])
+        self.assertFalse(bool(state.execution_valid.any()))
         ops.finish_execution(reservation, ctx.copied(), ctx)
         ops.error_status.zero_()
         update = ops.prepare_update(torch.tensor([1, 2, 9]), ctx)
@@ -363,12 +545,10 @@ class TestTensorResidency(unittest.TestCase):
         ops, state, waves, ctx = setup()
         ctx.phase, ctx.capturing = Phase.PREFILL, False
         old = {name: tensor.clone() for name, tensor in vars(state).items()}
-        ops.prepare_prefill = lambda request, context: ExecutionReservation(
+        ops.prepare_prefill = lambda request, context: MaterializationPlan(
             HostCopyPlan(()), "borrowed"
         )
-        request = ExecutionRequest(
-            3, None, waves[0], Phase.PREFILL, SourcePolicy.HOST_ONLY
-        )
+        request = ExecutionRequest(3, None, waves[0], Phase.PREFILL)
         reservation = ops.resolve_execution(request, ctx)
         ops.publish_execution(reservation, ctx.copied(), ctx)
         ops.finish_execution(reservation, ctx.copied(), ctx)
@@ -497,12 +677,10 @@ class TestTensorResidency(unittest.TestCase):
     def test_prefill_publication_keeps_worker_off_compute_stream(self):
         ops, _, waves, ctx = setup()
         ctx.phase, ctx.capturing = Phase.PREFILL, False
-        ops.prepare_prefill = lambda request, context: ExecutionReservation(
+        ops.prepare_prefill = lambda request, context: MaterializationPlan(
             HostCopyPlan(()), "borrowed"
         )
-        request = ExecutionRequest(
-            3, None, waves[0], Phase.PREFILL, SourcePolicy.HOST_ONLY
-        )
+        request = ExecutionRequest(3, None, waves[0], Phase.PREFILL)
         reservation = ops.resolve_execution(request, ctx)
         ready = ops.publish_execution(reservation, ctx.copied(), ctx)
         self.assertEqual(ctx.calls, [])

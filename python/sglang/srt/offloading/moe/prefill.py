@@ -6,80 +6,14 @@ physical bindings remain injected and require separate hardware validation.
 
 import logging
 import math
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from threading import Condition, RLock, Thread
 
 from ..transfer import Completion, ImmediateCompletion, JoinedCompletion, TransferTicket
 from .config import ExpertWave, Phase
-from .execution import (
-    ExecutionRequest,
-    SourcePolicy,
-    invocation_id,
-    require_prefill,
-    retain_completion,
-)
+from .execution import ExecutionRequest, require_prefill
 
 logger = logging.getLogger(__name__)
-
-
-class PrefillWeightPipeline(ABC):
-    """Runtime-owned sessions over borrowed A/B banks; a is a view inside A.
-
-    Implementations key sessions by invocation and layer, retain in-flight plans,
-    and never allocate hidden expert storage. All methods are eager-only.
-    """
-
-    def __init__(self, access):
-        self.access = access
-
-    @abstractmethod
-    def start(self, layer_id, context):
-        """Start bounded ACL batches of whole experts into A at layer entry.
-
-        Pin session state before starting a worker. Set device/context explicitly;
-        permit at most Q unfinished microbatches and at most K_cap experts.
-        """
-
-    @abstractmethod
-    def validate_session(self, layer, context):
-        """Reject missing/stale/failed sessions before dispatching a collective."""
-
-    @abstractmethod
-    def seal(self, layer, dispatch_ready, context):
-        """Return this invocation's tuple of ExpertWave, covering all local experts.
-
-        Observe recorded dispatch readiness, stop NEW submissions, freeze K after
-        whole microbatches. Already submitted copies must complete. Record ready0
-        and hand off stream submission ownership; do not mutate shared waves.
-        Join microbatch leases with access.combine_prefill into one large-group
-        lease; retain exactly the loaded expert range and validate its bindings.
-        """
-
-    @abstractmethod
-    def acquire(self, layer, wave, context):
-        """Return current WeightLease and schedule next wave before current F.
-
-        Use access.stage with HOST_ONLY requests. First serve A, then B/a. Resolve
-        previous-generation reader dependencies before every overwrite. Remember
-        returned leases so access.release_after supplies their reader completions.
-        """
-
-    @abstractmethod
-    def finish(self, layer, context) -> TransferTicket:
-        """Close submission and return all layer worker/copy/reader dependencies.
-
-        No device synchronization is needed in the normal path. Do not free or
-        reuse sessions until their ticket completes; runtime joins resources_idle.
-        """
-
-    @abstractmethod
-    def abort(self, context) -> TransferTicket:
-        """Stop/join host submitters and fence partial work, including failed start.
-
-        Idempotent for the invocation. Keep all resources pinned if draining fails;
-        the runtime failure path must then synchronize its streams before release.
-        """
 
 
 @dataclass(frozen=True)
@@ -148,18 +82,17 @@ class _PrefillSession:
     stop: bool = False
     error: object = None
     dispatch_ready: object = None
-    initial_leases: list = field(default_factory=list)
     loaded: int = 0
     waves: tuple = ()
-    leases: dict = field(default_factory=dict)
+    leases: list = field(default_factory=list)
     next_wave: int = 0
     closed: bool = False
 
 
-class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
+class BoundedPrefillWeightPipeline:
     """Bounded eager submitter and A/B/a scheduling over existing weight pools.
 
-    ``make_request(layer_id, wave, bank_offset, context)`` returns a HOST_ONLY
+    ``make_request(layer_id, wave, bank_offset, context)`` returns a PREFILL
     ExecutionRequest. Initial microbatches write at offsets 0, P, 2P inside A;
     subsequent waves write at offset zero in B or the small alias inside A.
     ``combine_bindings(layer_id, wave, leases, context)`` validates and returns a
@@ -184,9 +117,8 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
         combine_bindings,
         worker_scope,
         record_copy_completion,
-        layer_id=lambda layer: layer if isinstance(layer, int) else layer.layer_id,
     ):
-        super().__init__(access)
+        self.access = access
         if not isinstance(config, PrefillPipelineConfig):
             raise TypeError("Expected PrefillPipelineConfig")
         for callback in (
@@ -194,7 +126,6 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
             combine_bindings,
             worker_scope,
             record_copy_completion,
-            layer_id,
         ):
             if not callable(callback):
                 raise TypeError("Prefill binding callbacks must be callable")
@@ -203,22 +134,19 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
         self.combine_bindings = combine_bindings
         self.worker_scope = worker_scope
         self.record_copy_completion = record_copy_completion
-        self.layer_id = layer_id
         self._lock = RLock()
-        self._sessions = {}
+        self._active_session = None
         self._aborted = {}
         self._previous_idle = None
-
-    def _key(self, layer, context):
-        return invocation_id(context), self.layer_id(layer)
 
     def _session(self, layer, context):
         require_prefill(context)
         with self._lock:
-            session = self._sessions.get(self._key(layer, context))
+            session = self._active_session
         if (
             session is None
-            or session.invocation_id is not invocation_id(context)
+            or session.invocation_id is not context.invocation_id
+            or session.layer_id != layer
             or session.closed
         ):
             raise RuntimeError(
@@ -234,23 +162,21 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
             raise RuntimeError("Prefill session was aborted")
 
     def start(self, layer_id, context):
+        """Pin one layer's session before starting its bounded eager submitter."""
         require_prefill(context)
         if type(layer_id) is not int or layer_id < 0:
             raise ValueError("A prefill layer needs a nonnegative integer identifier")
-        session = _PrefillSession(layer_id, invocation_id(context))
-        key = (invocation_id(context), layer_id)
+        session = _PrefillSession(layer_id, context.invocation_id)
         with self._lock:
-            if invocation_id(context) in self._aborted:
+            if context.invocation_id in self._aborted:
                 raise RuntimeError("Cannot restart an aborted prefill invocation")
-            if key in self._sessions:
-                raise RuntimeError("Prefill layer-start was already submitted")
             # A/B views are shared: a sealed but unread layer still owns them.
-            if self._sessions:
+            if self._active_session is not None:
                 raise RuntimeError(
                     "Finish the previous prefill session before starting another"
                 )
             session.previous_idle = self._previous_idle
-            self._sessions[key] = session
+            self._active_session = session
         context.retain(self)
         context.retain(session)
         session.worker = Thread(
@@ -259,16 +185,12 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
             name=f"moe-prefill-{layer_id}",
             daemon=False,
         )
-        started = getattr(context, "worker_started", None)
-        if started is not None:
-            started()
+        context.worker_started()
         try:
             session.worker.start()
             session.worker_started = True
         except BaseException as error:
-            finished = getattr(context, "worker_finished", None)
-            if finished is not None:
-                finished()
+            context.worker_finished()
             with session.condition:
                 session.error = error
                 session.worker_done = True
@@ -289,9 +211,8 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
             or request.layer_id != session.layer_id
             or request.wave != wave
             or request.phase is not Phase.PREFILL
-            or request.source_policy is not SourcePolicy.HOST_ONLY
         ):
-            raise ValueError("Prefill binding must request exactly this HOST_ONLY wave")
+            raise ValueError("Prefill binding must request exactly this prefill wave")
         return request
 
     def _load_initial(self, session, context):
@@ -326,14 +247,14 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
                     start = session.loaded
                     end = min(start + config.microbatch_size, config.initial_capacity)
                     wave = ExpertWave(
-                        len(session.initial_leases), start, end, config.initial_bank
+                        len(session.leases), start, end, config.initial_bank
                     )
                     lease = self.access.stage(
                         self._request(session, wave, start, context), context
                     )
                     # A complete expert bundle was submitted; readiness is separate.
                     with session.condition:
-                        session.initial_leases.append(lease)
+                        session.leases.append(lease)
                         session.loaded = end
                         inflight.append(lease)
                         session.condition.notify_all()
@@ -342,9 +263,7 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
                 session.error = error
                 session.stop = True
         finally:
-            finished = getattr(context, "worker_finished", None)
-            if finished is not None:
-                finished()
+            context.worker_finished()
             with session.condition:
                 session.worker_done = True
                 session.condition.notify_all()
@@ -355,6 +274,7 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
             session.worker.join()
 
     def seal(self, layer, dispatch_ready, context):
+        """Stop new batches at dispatch feedback; join and combine submitted leases."""
         session = self._session(layer, context)
         if not isinstance(dispatch_ready, Completion):
             raise TypeError("Dispatch feedback must be a recorded Completion")
@@ -369,7 +289,7 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
                 session.condition.wait()
         self._join_worker(session)
         self._raise_failed(session)
-        if not session.initial_leases or not session.loaded:
+        if not session.leases or not session.loaded:
             raise RuntimeError("Prefill must submit at least one complete microbatch")
         config = self.config
         logger.debug(
@@ -395,10 +315,10 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
                 )
             )
         bindings = self.combine_bindings(
-            session.layer_id, waves[0], tuple(session.initial_leases), context
+            session.layer_id, waves[0], tuple(session.leases), context
         )
-        lease = self.access.combine_prefill(session.initial_leases, bindings, context)
-        session.leases[0] = lease
+        lease = self.access.combine_prefill(session.leases, bindings, context)
+        session.leases = [lease]
         session.waves = tuple(waves)
         return session.waves
 
@@ -426,14 +346,14 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
             lease = self.access.stage(
                 self._request(session, next_wave, 0, context), context
             )
-            session.leases[next_index] = lease
+            session.leases.append(lease)
         session.next_wave += 1
         return current
 
     @staticmethod
     def _tickets(session):
-        tickets = [lease.ticket for lease in session.initial_leases]
-        for lease in session.leases.values():
+        tickets = []
+        for lease in session.leases:
             tickets.append(lease.ticket)
             if lease.read_done is not None:
                 tickets.append(lease.read_done)
@@ -443,15 +363,16 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
         ticket = self.record_copy_completion(context)
         if not isinstance(ticket, TransferTicket):
             raise TypeError("Copy-stream completion must be a TransferTicket")
-        retain_completion(context, ticket)
+        context.retain_completion(ticket)
         return ticket
 
     def finish(self, layer, context):
+        """Retire this session with every copy/reader dependency, without host wait."""
         session = self._session(layer, context)
         self._raise_failed(session)
         if not session.waves or session.next_wave != len(session.waves):
             raise RuntimeError("All sealed prefill waves must execute before finish")
-        if any(lease.read_done is None for lease in session.leases.values()):
+        if any(lease.read_done is None for lease in session.leases):
             raise RuntimeError("Every prefill wave must retire its final reader")
         self._join_worker(session)
         tickets = self._tickets(session) + [self._copy_fence(context)]
@@ -459,50 +380,53 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
             JoinedCompletion(item.completion for item in tickets),
             (session, *tickets),
         )
-        retain_completion(context, ticket)
+        context.retain_completion(ticket)
         session.closed = True
         with self._lock:
             # Keep the dependency but avoid chaining prior sessions/contexts.
             # Their owning forward tickets retain storage until device idle.
             self._previous_idle = TransferTicket(ticket.completion)
-            del self._sessions[self._key(layer, context)]
+            self._active_session = None
         return ticket
 
     def abort(self, context):
+        """Idempotently stop host submission and fence partial work before release."""
         require_prefill(context)
         with self._lock:
-            previous = self._aborted.get(invocation_id(context))
+            previous = self._aborted.get(context.invocation_id)
             if previous is not None:
                 return previous
-            sessions = [
-                item
-                for item in self._sessions.values()
-                if item.invocation_id is invocation_id(context)
-            ]
-        for session in sessions:
+            session = self._active_session
+            if (
+                session is not None
+                and session.invocation_id is not context.invocation_id
+            ):
+                session = None
+        if session is not None:
             with session.condition:
                 session.stop = True
                 session.condition.notify_all()
-        for session in sessions:
             self._join_worker(session)
         # Record AFTER the submitter exits: failed driver calls may have queued
         # writes without returning a lease. If fencing fails, retain sessions and
         # propagate; the runtime must drain all streams before freeing resources.
-        tickets = [self._copy_fence(context)] if sessions else []
-        for session in sessions:
-            tickets.extend(self._tickets(session))
+        tickets = (
+            [self._copy_fence(context), *self._tickets(session)]
+            if session is not None
+            else []
+        )
         ticket = TransferTicket(
             (
                 JoinedCompletion(item.completion for item in tickets)
                 if tickets
                 else ImmediateCompletion()
             ),
-            (*sessions, *tickets),
+            (session, *tickets),
         )
-        retain_completion(context, ticket)
+        context.retain_completion(ticket)
         with self._lock:
-            for session in sessions:
+            if session is not None:
                 session.closed = True
-                self._sessions.pop((invocation_id(context), session.layer_id), None)
-            self._aborted[invocation_id(context)] = ticket
+                self._active_session = None
+            self._aborted[context.invocation_id] = ticket
         return ticket

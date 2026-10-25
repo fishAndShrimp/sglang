@@ -19,10 +19,9 @@ of this slab. There is no parallel pinned copy of the complete expert master.
 MemFabric's `get_dva` must certify a linear mapping over the slab; ACL's real
 `aclrtHostRegisterV2(..., ACL_HOST_REG_PINNED)` must succeed before asynchronous
 host-read capability is published. The existing MemFabric mapping is reused;
-ACL is not asked to make a second device mapping. Because MemFabric allocated
-the memory, ACL batch location is `unregistered` (external allocation), even
-after successful PINNED registration. Source location and pin capability have
-different meanings.
+ACL is not asked to make a second device mapping. The production backend submits ACL batches with `source_location="host"`;
+registration independently certifies asynchronous access. The location attribute
+and registration compatibility still require qualification on the target SDK.
 
 The reference MemFabric `initialize` silently returns success if somebody else
 already initialized its process singleton. This owner therefore requires
@@ -31,21 +30,22 @@ repository's MemFabric HiCache backend are rejected. An unrelated external
 caller that initializes the same singleton is unsupported; the reference API
 provides no query that would certify its configuration or ownership.
 
-External host registration requires Linux newer than 5.10. Older kernels and
-unrecognized releases are rejected before native initialization; a vendor
-backport needs independent qualification rather than silently bypassing this
-check. See the official [aclrtHostRegisterV2 contract](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/API/runtimeapi/aclcppdevg_03_2128.html).
+The Linux-version guard helper remains in `storage.py`, but its call is currently
+commented out; startup does not reject older kernels through that guard. Deployment
+must qualify its kernel/vendor support for external registration. See the recorded [aclrtHostRegisterV2 contract](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/API/runtimeapi/aclcppdevg_03_2128.html).
 
 Runtime teardown must drain host submitters, streams and captured-graph leases,
-then call each `V4LayerStorage.close()` before `MemFabricHostPool.close()`.
+then call each `ExpertLayerStorage.close()` before `MemFabricHostPool.close()`.
 Layer close retires module-visible parameter views. Pool close unregisters ACL,
 frees the slab, then uninitializes MemFabric. Unregister failure preserves the
 allocation and owner for a safe retry. No GC destructor guesses reader lifetime.
 
 ## Checkpoint and fixed bank layout
 
-Construction is intercepted in the native FP4 quantization method before its
-first expert allocation. The four registered CPU parameters retain the existing
+FusedMoE weight creation invokes `NpuMoEBackend.prepare_expert_weights` before
+the first expert allocation. The selected format supplies `CheckpointComponent`
+recipes to the common probe; the resulting `BundleComponent` is the single
+authority for checkpoint and runtime shapes, strides and byte extents. The four registered CPU parameters retain the existing
 checkpoint names and packed byte shapes:
 
 | Component | Checkpoint shape per expert | Runtime adaptation |
@@ -71,7 +71,9 @@ then copies physical bytes back into that expert's original host region using
 `aclrtMemcpy`. Ordinary `.cpu()` is not used for NZ serialization because it
 may convert layout. Failed partial repacks poison the writable master; retrying
 would otherwise mistake already converted bytes for a checkpoint tensor.
-Only complete finalization seals the host store.
+Only complete finalization seals `ExpertLayerStorage`; it then clears shard
+bookkeeping and raw-component views and replaces parameter loaders with a
+read-only rejection function. There is no separate host-store sealing state.
 
 The loader checks both known input/output bytes and torch_npu's measured
 incremental allocation peak against `workspace_limit_bytes`. The native probe
@@ -92,9 +94,10 @@ storage. No pointer or bank tensor is rebound during execution.
 
 ## Target hardware checks
 
-CPU test implementations, fake native APIs and the injectable format adapter
-have been removed. The runtime uses the deployed torch_npu adapter and the
-installed MemFabric host allocator.
+Production uses the deployed torch_npu adapter and installed MemFabric host
+allocator. Existing CPU tests patch only native/device boundaries to verify byte
+layout, loading, workspace rejection and retirement; they do not certify NZ
+operators, registration or graph behavior on hardware.
 
 On the target Ascend/CANN/torch_npu/MemFabric combination, qualify registration
 of the MemFabric allocation, compare a resident expert with host-serialized and

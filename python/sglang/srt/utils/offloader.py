@@ -13,7 +13,6 @@ from sglang.srt.distributed.naive_distributed import (
 )
 from sglang.srt.layers.parameter import ModelWeightParameter
 from sglang.srt.offloading.base import BaseOffloader
-from sglang.srt.offloading.transfer import TorchTransferBackend
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -426,7 +425,7 @@ class _CpuParamOffloader(_BaseParamOffloader):
         _move_param_to_cpu(self._param, pin_memory=True)
 
     def create_device_tensor(self):
-        return TorchTransferBackend.allocate_and_copy(self._param, self._device)
+        return self._param.to(device=self._device, non_blocking=True)
 
 
 class _ShmCpuParamOffloader(_BaseParamOffloader):

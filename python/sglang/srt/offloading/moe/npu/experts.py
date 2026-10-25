@@ -9,9 +9,8 @@ still belong to the runtime's graph workspace budget.
 
 from __future__ import annotations
 
-import os
 from contextlib import ExitStack
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, fields
 
 import torch
 
@@ -25,7 +24,8 @@ from ..programs import (
     PrefillDispatchOnceProgram,
     PrefillLocalExpertProgram,
 )
-from ..resources import Allocation, ResourceKind
+from ..resources import ResourceKind, tensor_allocations
+from .config import validate_native_environment
 
 
 def _compute_scope(context, device):
@@ -44,62 +44,42 @@ def _format_name(raw):
 
 @dataclass(frozen=True)
 class NPUExpertBank:
-    """Native weight views and the canonical validity/error tensors.
+    """An exact native weight/validity view, validated once when bound.
 
-    execution_start is an index into execution_valid, independent of the weight
-    view's first expert. Quantization payloads already point at this bank's first
-    physical expert. No tensor or Parameter on the model is rebound.
+    Decode binds views before capture; eager prefill binds its actual group width.
+    Weight tensors and Parameters are never rebound during native execution.
     """
 
     quant_info: object
     execution_valid: torch.Tensor
     error_status: torch.Tensor
-    execution_start: int = 0
 
     def __post_init__(self):
+        valid, error = self.execution_valid, self.error_status
         if (
-            self.execution_valid.ndim != 1
-            or self.execution_valid.dtype != torch.bool
-            or self.error_status.shape != torch.Size([])
-            or self.error_status.dtype != torch.int32
-            or self.error_status.device != self.execution_valid.device
+            valid.ndim != 1
+            or valid.dtype != torch.bool
+            or valid.numel() == 0
+            or error.shape != torch.Size([])
+            or error.dtype != torch.int32
+            or error.device != valid.device
         ):
-            raise ValueError(
-                "FFN bank requires canonical boolean validity and int32 error"
-            )
+            raise ValueError("FFN bank requires boolean validity and int32 error")
         for name in ("w13_weight", "w2_weight"):
-            tensor = getattr(self.quant_info, name, None)
-            if (
-                not isinstance(tensor, torch.Tensor)
-                or tensor.ndim < 2
-                or tensor.device != self.execution_valid.device
-            ):
+            weight = getattr(self.quant_info, name, None)
+            if not isinstance(weight, torch.Tensor) or weight.ndim < 2:
                 raise ValueError("FFN bank weights must be native expert-major tensors")
-
-    def for_width(self, width):
-        if width <= 0 or self.execution_start < 0:
-            raise ValueError("An FFN bank requires a positive expert view")
-        if self.execution_start + width > self.execution_valid.numel():
-            raise ValueError("Execution validity does not cover the FFN bank")
-        values = {}
         for field in fields(self.quant_info):
             tensor = getattr(self.quant_info, field.name)
-            if tensor is not None:
-                if not isinstance(tensor, torch.Tensor) or tensor.ndim == 0:
-                    raise ValueError("Ascend expert components must be expert-major")
-                if tensor.shape[0] < width:
-                    raise ValueError("FFN bank is smaller than its wave")
-                view = tensor if tensor.shape[0] == width else tensor[:width]
-                if (
-                    view.data_ptr() != tensor.data_ptr()
-                    or view.untyped_storage().data_ptr()
-                    != tensor.untyped_storage().data_ptr()
-                ):
-                    raise ValueError(
-                        "Native bank slicing must preserve physical storage"
-                    )
-                values[field.name] = view
-        return replace(self.quant_info, **values)
+            if tensor is not None and (
+                not isinstance(tensor, torch.Tensor)
+                or tensor.ndim == 0
+                or tensor.shape[0] != valid.numel()
+                or tensor.device != valid.device
+            ):
+                raise ValueError(
+                    "Quantization components must match the exact FFN bank"
+                )
 
 
 @dataclass(frozen=True)
@@ -133,12 +113,6 @@ class NPUWaveInput:
 
 
 @dataclass(frozen=True)
-class _Combine:
-    layout: _Layout
-    hidden_states: torch.Tensor
-
-
-@dataclass(frozen=True)
 class _Combined:
     hidden_states: torch.Tensor
     original_hidden_width: int
@@ -162,16 +136,7 @@ class NPUOffloadDispatcher(MoEDispatcher):
         if inners is not None and len(inners) != 1:
             raise ValueError("MoE offload does not support two-batch overlap")
         self.inner = inners[0] if inners is not None else self.dispatcher
-        if int(os.environ.get("MOE_EXPERT_TOKEN_NUMS_TYPE", "1")) != 1:
-            raise ValueError("NPU MoE offload requires per-expert counts (type 1)")
-        if os.environ.get("DEEP_USE_MODE", "default").lower() != "default":
-            raise ValueError(
-                "NPU offload requires the default DeepEP strategy and compact counts"
-            )
-        if os.environ.get("MOE_ENABLE_TOPK_NEG_ONE", "0") != "1":
-            raise ValueError(
-                "NPU offload requires MOE_ENABLE_TOPK_NEG_ONE=1 for padding"
-            )
+        validate_native_environment()
 
     def _mask_routing(self, hidden_states, routing, context):
         count = getattr(context, "num_token_non_padded", None)
@@ -255,12 +220,10 @@ class NPUOffloadDispatcher(MoEDispatcher):
         return constructors[name](hidden_states, raw.topk_ids, raw.topk_weights)
 
     def combine(self, local_output, context):
-        layout = local_output.layout
-        context.retain(local_output)
-        with _compute_scope(context, local_output.hidden_states.device):
-            combine_input = self._combine_input(
-                layout.dispatched.raw, local_output.hidden_states
-            )
+        layout = local_output
+        context.retain(layout)
+        with _compute_scope(context, layout.output.device):
+            combine_input = self._combine_input(layout.dispatched.raw, layout.output)
             context.retain(combine_input)
             # Ascend uses HCCL; CUDA symmetric-memory allocation is inapplicable.
             output = self.dispatcher.combine(combine_input=combine_input)
@@ -323,9 +286,9 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
             "input_bytes", (max_dispatch_rows * hidden_size * 2,), torch.uint8
         )
         # Covers E8M0 MXFP8 scales and FP32 per-token/group scales.
-        self.scale_bytes_per_row = max(4, (hidden_size + 31) // 32 * 4)
+        scale_bytes_per_row = max(4, (hidden_size + 31) // 32 * 4)
         self._allocate(
-            "scale_bytes", (max_dispatch_rows * self.scale_bytes_per_row,), torch.uint8
+            "scale_bytes", (max_dispatch_rows * scale_bytes_per_row,), torch.uint8
         )
         self._allocate("output", (max_dispatch_rows, hidden_size), torch.bfloat16)
         self._allocate("counts", (local_experts,), torch.int64)
@@ -339,15 +302,8 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
         return value
 
     def allocations(self, prefix="npu_dispatch"):
-        return tuple(
-            Allocation(
-                prefix + "." + name,
-                ResourceKind.WORKSPACE,
-                value.untyped_storage().nbytes(),
-                (str(value.device), value.untyped_storage().data_ptr()),
-                value,
-            )
-            for name, value in self._owned.items()
+        return tensor_allocations(
+            prefix + ".", self._owned.items(), ResourceKind.WORKSPACE
         )
 
     def bind(self, dispatched, context):
@@ -485,9 +441,7 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
         # routed result when a later bank failed validation.
         with _compute_scope(context, self.device):
             layout.output.masked_fill_(self.error_status != 0, 0)
-        result = _Combine(layout, layout.output)
-        context.retain(result)
-        return result
+        return layout
 
 
 class NPUExpertRunner:
@@ -534,13 +488,13 @@ class NPUExpertRunner:
         ):
             raise ValueError("FFN and transfer must share canonical error_status")
         width = dispatched.expert_tokens.numel()
-        quant = bank.for_width(width)
+        if width != bank.execution_valid.numel():
+            raise ValueError("FFN wave must match its bound expert view")
+        quant = bank.quant_info
         # Retain *before* submission, including partial native failures.
         context.retain((self, bank, quant, dispatched, bindings, self.reader_streams))
         with _compute_scope(context, dispatched.hidden_states.device):
-            valid = bank.execution_valid[
-                bank.execution_start : bank.execution_start + width
-            ]
+            valid = bank.execution_valid
             bad = ((dispatched.expert_tokens > 0) & ~valid).any()
             bank.error_status.bitwise_or_(bad.to(torch.int32) * 128)
             healthy = bank.error_status == 0
@@ -568,12 +522,10 @@ class NPULayerPrograms:
     prefill: object
     decode: object
     layout: NPUDispatchLayout
-    dispatcher: NPUOffloadDispatcher
-    runner: NPUExpertRunner
 
     def allocations(self, prefix=None):
         if prefix is None:
-            prefix = f"npu_dispatch.{self.dispatcher.experts.layer_id}"
+            prefix = f"npu_dispatch.{self.prefill.dispatcher.experts.layer_id}"
         return self.layout.allocations(prefix)
 
 
@@ -642,6 +594,4 @@ def build_npu_layer_programs(
             local_experts=experts.num_local_experts,
         ),
         layout,
-        dispatcher,
-        runner,
     )

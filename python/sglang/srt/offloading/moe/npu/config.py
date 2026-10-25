@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass, fields
+from dataclasses import dataclass, fields
 from pathlib import Path
 
 from ..config import MoEOffloadConfig
@@ -147,9 +147,6 @@ class NpuOffloadSettings:
             metadata_limit_bytes=self.metadata_limit_bytes,
             host_allocation_limit_bytes=self.host_pool_gib * 1024**3,
         )
-
-    def to_dict(self):
-        return asdict(self)
 
 
 def create_npu_offloader(path, *, hf_config, parallel, device):

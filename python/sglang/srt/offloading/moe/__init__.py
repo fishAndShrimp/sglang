@@ -5,15 +5,12 @@ from .config import ExpertCatalog, ExpertLayerSpec, MoEOffloadConfig, Phase
 from .execution import (
     CacheUpdateCoordinator,
     ExecutionRequest,
-    ExecutionReservation,
+    MaterializationPlan,
     ExpertWeightAccess,
     LocalExecution,
-    SourcePolicy,
-    UpdatePlan,
     WeightLease,
 )
 from .formats import BundleComponent, BundleSchema, ExpertFormat
-from .interfaces import ExecutionContext, LocalRoutes
 from .models import DeepSeekV4Adapter, ModelAdapter
 from .offloader import MoEOffloaderV2
 from .owner import MoEOffloadOwner
@@ -22,41 +19,37 @@ from .policy import TensorLFUPolicy
 from .prefill import (
     BoundedPrefillWeightPipeline,
     PrefillPipelineConfig,
-    PrefillWeightPipeline,
 )
 from .programs import (
-    ComposedDFCProgram,
     DecodeLocalExpertProgram,
     DispatchOnceProgram,
     PrefillDispatchOnceProgram,
     PrefillLocalExpertProgram,
 )
 from .residency import BoundExecutionWave, TensorResidencyOps
-from .runtime import DecodeStateSnapshot, ManagedExecutionContext
+from .runtime import BoundMoERuntime, DecodeStateSnapshot, ExecutionContext
 from .storage import HostMemoryCapability
 
 __all__ = [
     "BoundExecutionWave",
+    "BoundMoERuntime",
     "BoundedPrefillWeightPipeline",
     "BundleComponent",
     "BundleSchema",
     "CacheRouteStats",
     "CacheUpdateCoordinator",
-    "ComposedDFCProgram",
     "DecodeLocalExpertProgram",
     "DecodeStateSnapshot",
     "DeepSeekV4Adapter",
     "DispatchOnceProgram",
     "ExecutionContext",
     "ExecutionRequest",
-    "ExecutionReservation",
+    "MaterializationPlan",
     "ExpertCatalog",
     "ExpertLayerSpec",
     "ExpertFormat",
     "ExpertWeightAccess",
     "LocalExecution",
-    "ManagedExecutionContext",
-    "LocalRoutes",
     "MoEOffloadConfig",
     "ModelAdapter",
     "MoEOffloadOwner",
@@ -69,10 +62,7 @@ __all__ = [
     "PrefillPipelineConfig",
     "PrefillDispatchOnceProgram",
     "PrefillLocalExpertProgram",
-    "PrefillWeightPipeline",
-    "SourcePolicy",
     "TensorLFUPolicy",
     "TensorResidencyOps",
-    "UpdatePlan",
     "WeightLease",
 ]

@@ -13,14 +13,14 @@ import torch
 
 from sglang.srt.offloading.moe.config import Phase, fixed_waves
 from sglang.srt.offloading.moe.npu import experts as native
-from sglang.srt.offloading.moe.npu.runtime import NpuBoundMoERuntime
+from sglang.srt.offloading.moe.runtime import BoundMoERuntime
 from sglang.srt.offloading.moe.programs import (
     DecodeLocalExpertProgram,
     DispatchOnceProgram,
     PrefillDispatchOnceProgram,
     PrefillLocalExpertProgram,
 )
-from sglang.srt.offloading.moe.runtime import ManagedExecutionContext
+from sglang.srt.offloading.moe.runtime import ExecutionContext
 from sglang.srt.offloading.transfer import ImmediateCompletion, TransferTicket
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -36,6 +36,25 @@ class QuantInfo:
 
 
 class TestDecodeWorkspace(unittest.TestCase):
+    def test_bank_rejects_mismatched_payload_before_native_execution(self):
+        valid = torch.ones(2, dtype=torch.bool)
+        error = torch.zeros((), dtype=torch.int32)
+        with self.assertRaisesRegex(ValueError, "exact FFN bank"):
+            native.NPUExpertBank(
+                QuantInfo(torch.ones(2, 1, 1), torch.ones(3, 1, 1)), valid, error
+            )
+        bank = native.NPUExpertBank(
+            QuantInfo(torch.ones(2, 1, 1), torch.ones(2, 1, 1)), valid, error
+        )
+        runner = native.NPUExpertRunner(None, _core=object(), _input_type=object)
+        with self.assertRaisesRegex(ValueError, "bound expert view"):
+            runner(
+                3,
+                SimpleNamespace(expert_tokens=torch.zeros(1, dtype=torch.int64)),
+                SimpleNamespace(expert_bank=bank, error_status=error),
+                None,
+            )
+
     def fixture(self, ids=(0, 2), experts=4, slots=2, *, phase=Phase.DECODE):
         ids = torch.tensor(ids, dtype=torch.int64).unsqueeze(1)
         rows, hidden = max(8, ids.numel()), 4
@@ -44,7 +63,6 @@ class TestDecodeWorkspace(unittest.TestCase):
         layout = native.NPUDispatchLayout(experts, hidden, rows, "cpu", error)
         quant = QuantInfo(torch.ones(slots, 1, 1), torch.ones(slots, 1, 1))
         bank = native.NPUExpertBank(quant, torch.ones(slots, dtype=torch.bool), error)
-        bindings = SimpleNamespace(expert_bank=bank, error_status=error)
         test = self
 
         class Dispatch:
@@ -103,7 +121,14 @@ class TestDecodeWorkspace(unittest.TestCase):
                 quant.w13_weight[:size, 0, 0].copy_(
                     torch.arange(wave.local_start + 1, wave.local_end + 1)
                 )
-                return bindings
+                return SimpleNamespace(
+                    expert_bank=native.NPUExpertBank(
+                        QuantInfo(quant.w13_weight[:size], quant.w2_weight[:size]),
+                        bank.execution_valid[:size],
+                        error,
+                    ),
+                    error_status=error,
+                )
 
             def wait_ready(self, lease, stream, *, context=None):
                 waits.append("ready")
@@ -177,7 +202,7 @@ class TestDecodeWorkspace(unittest.TestCase):
             record=lambda stream: TransferTicket(ImmediateCompletion()),
             synchronize=lambda: waits.append("drain"),
         )
-        runtime = NpuBoundMoERuntime(
+        runtime = BoundMoERuntime(
             device_runtime=device,
             residency=SimpleNamespace(update_enabled=torch.tensor(True)),
             residency_ops=SimpleNamespace(begin_step=lambda context: None),
@@ -197,6 +222,8 @@ class TestDecodeWorkspace(unittest.TestCase):
             moe_num_token_non_padded=lambda: torch.tensor(ids.shape[0])
         )
         runtime._context, runtime._capture = context, []
+        if phase is Phase.PREFILL:
+            runtime.pipelines = (pipeline,)
         return SimpleNamespace(
             runtime=runtime,
             context=context,
@@ -223,7 +250,7 @@ class TestDecodeWorkspace(unittest.TestCase):
                     value = fixture.input
                     for step, layer in enumerate(range(3, 43), 1):
                         if phase is Phase.PREFILL:
-                            fixture.runtime.prefill_program.layer_start(
+                            fixture.runtime.layer_programs[3].prefill.layer_start(
                                 layer, fixture.context
                             )
                         routes = Routes(
@@ -295,14 +322,13 @@ class TestDecodeWorkspace(unittest.TestCase):
         for phase in Phase:
             with self.subTest(phase=phase):
                 completion = Completion()
-                context = ManagedExecutionContext(
+                context = ExecutionContext(
                     phase,
                     compute_stream="compute",
                     copy_stream="copy",
                     record_completion=lambda stream: TransferTicket(
                         ImmediateCompletion()
                     ),
-                    failure_drain=lambda: None,
                     capturing=phase is Phase.DECODE,
                 )
                 with context.temporary_scope():
@@ -326,12 +352,11 @@ class TestDecodeWorkspace(unittest.TestCase):
                 self.assertIsNotNone(protected_ref())
 
     def test_prefill_keeps_invocation_lifetimes_for_worker_submissions(self):
-        context = ManagedExecutionContext(
+        context = ExecutionContext(
             Phase.PREFILL,
             compute_stream="compute",
             copy_stream="copy",
             record_completion=lambda stream: TransferTicket(ImmediateCompletion()),
-            failure_drain=lambda: None,
         )
 
         def submit():
@@ -350,16 +375,15 @@ class TestDecodeWorkspace(unittest.TestCase):
             self.assertIsNone(compute_reference())
             self.assertIsNotNone(reference())
         context.finish()
-        context.release_completed()
+        context.dispose_completed()
         self.assertIsNone(reference())
 
     def test_nested_prefill_scopes_release_only_their_own_compute_temporaries(self):
-        context = ManagedExecutionContext(
+        context = ExecutionContext(
             Phase.PREFILL,
             compute_stream="compute",
             copy_stream="copy",
             record_completion=lambda stream: TransferTicket(ImmediateCompletion()),
-            failure_drain=lambda: None,
         )
         with context.temporary_scope():
             outer = torch.ones(4)
@@ -377,12 +401,11 @@ class TestDecodeWorkspace(unittest.TestCase):
         context.finish()
 
     def test_worker_cannot_open_submission_thread_temporary_scopes(self):
-        context = ManagedExecutionContext(
+        context = ExecutionContext(
             Phase.PREFILL,
             compute_stream="compute",
             copy_stream="copy",
             record_completion=lambda stream: TransferTicket(ImmediateCompletion()),
-            failure_drain=lambda: None,
         )
 
         def submit():
@@ -401,7 +424,7 @@ class TestDecodeWorkspace(unittest.TestCase):
             patch.object(native, "_compute_scope", lambda *args: nullcontext()),
         ):
             fixture = self.fixture(phase=Phase.PREFILL)
-            fixture.runtime.prefill_program.layer_start(3, fixture.context)
+            fixture.runtime.layer_programs[3].prefill.layer_start(3, fixture.context)
 
             def fail(*args):
                 raise RuntimeError("write failed after F")
@@ -413,15 +436,16 @@ class TestDecodeWorkspace(unittest.TestCase):
             self.assertIsNotNone(fixture.output_refs[-1]())
             self.assertFalse(fixture.context._temporary_resources)
             with patch.object(
-                fixture.context,
-                "_failure_drain",
+                fixture.runtime.device_runtime,
+                "synchronize",
                 side_effect=RuntimeError("drain failed"),
             ):
                 with self.assertRaisesRegex(RuntimeError, "drain failed"):
-                    fixture.context.abort()
+                    fixture.runtime.synchronize()
             self.assertIsNotNone(fixture.raw_refs[-1]())
             self.assertIsNotNone(fixture.output_refs[-1]())
-            fixture.context.abort()
+            fixture.runtime.synchronize()
+            fixture.context.dispose_after_drain()
             self.assertIsNone(fixture.raw_refs[-1]())
             self.assertIsNone(fixture.output_refs[-1]())
 
@@ -441,8 +465,9 @@ class TestDecodeWorkspace(unittest.TestCase):
             self.assertIsNotNone(fixture.raw_refs[-1]())
             self.assertIsNotNone(fixture.output_refs[-1]())
             self.assertFalse(fixture.context._temporary_resources)
+            fixture.runtime.synchronize()
             with self.assertRaisesRegex(RuntimeError, "Destroy the captured graph"):
-                fixture.context.abort()
+                fixture.context.dispose_after_drain()
             self.assertIsNotNone(fixture.raw_refs[-1]())
             fixture.context.dispose_after_drain(graph_destroyed=True)
             self.assertIn("drain", fixture.waits)

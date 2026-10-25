@@ -18,7 +18,6 @@ from sglang.srt.offloading.moe.config import (
     fixed_waves,
 )
 from sglang.srt.offloading.moe.interfaces import (
-    BoundMoERuntime,
     ForwardCompletion,
     MoEBackend,
     RuntimeCapabilities,
@@ -27,19 +26,17 @@ from sglang.srt.offloading.moe.offloader import DeepSeekV4Adapter, MoEOffloaderV
 from sglang.srt.offloading.moe.owner import MoEOffloadOwner, OwnerState
 from sglang.srt.offloading.moe.periodic_lfu import PeriodicLFUConfig, PeriodicLFUPolicy
 from sglang.srt.offloading.moe.policy import TensorLFUPolicy
-from sglang.srt.offloading.moe.programs import ComposedDFCProgram
+from sglang.srt.offloading.moe.programs import DispatchOnceProgram
 from sglang.srt.offloading.moe.resources import (
     Allocation,
     AllocationLedger,
     ResourceKind,
-    SlotLeaseManager,
 )
 from sglang.srt.offloading.moe.state import ResidencyState
-from sglang.srt.offloading.moe.storage import HostExpertStore
+from sglang.srt.offloading.moe.storage import HostMemoryCapability
 from sglang.srt.offloading.transfer import (
     Completion,
     ImmediateCompletion,
-    TorchTransferBackend,
     TransferTicket,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -80,7 +77,7 @@ class DelayedCompletion(Completion):
         return self.ready
 
 
-class FakeRuntime(BoundMoERuntime):
+class FakeRuntime:
     """Metadata-only runtime double; never presented as a hardware backend."""
 
     capabilities = RuntimeCapabilities(True, True, True)
@@ -227,12 +224,16 @@ class TestIdentityAndBudget(unittest.TestCase):
         with self.assertRaises(ValueError):
             MoEOffloadOwner(config(), catalog(), runtime)
 
-    def test_host_store_rejects_unpinned_memory(self):
-        store = HostExpertStore()
+    def test_host_capability_requires_owner_and_bounded_mapping(self):
         with self.assertRaises(ValueError):
-            store.add(3, "w13", torch.empty(4, 16, dtype=torch.uint8))
-        with self.assertRaises(RuntimeError):
-            store.allocations()
+            HostMemoryCapability(1000, 64, True, 2000, None)
+        capability = HostMemoryCapability(1000, 64, True, 2000, object())
+        self.assertEqual(capability.device_pointer(1016, 48), 2016)
+        with self.assertRaises(ValueError):
+            capability.device_pointer(1016, 49)
+        unmapped = HostMemoryCapability(1000, 64, True, None, object())
+        with self.assertRaises(ValueError):
+            unmapped.device_pointer(1000, 1)
 
     def test_residency_metadata_is_accounted_and_starts_invalid(self):
         state = ResidencyState.allocate(8, 4, 2, "cpu")
@@ -342,13 +343,15 @@ class TestLifetime(unittest.TestCase):
         self.assertEqual(delayed.syncs, 1)
 
     def test_graph_lease_prevents_teardown(self):
-        lease = self.owner.acquire_graph("batch8")
+        self.owner.acquire_graph("batch8")
         with self.assertRaises(RuntimeError):
             self.owner.close()
         with self.assertRaises(ValueError):
             self.owner.acquire_graph("batch8")
-        lease.close()
-        lease.close()
+        self.runtime.synchronize()
+        self.owner._release_graph("batch8")
+        with self.assertRaises(KeyError):
+            self.owner._release_graph("batch8")
         self.owner.close()
         self.owner.close()
         self.assertEqual(self.runtime.actions.count("close"), 1)
@@ -387,23 +390,6 @@ class TestLifetime(unittest.TestCase):
         self.runtime.synchronize = synchronize
         self.owner.close()
         self.assertIsNone(self.owner.allocation_ledger)
-
-    def test_slot_generation_and_pending_reader_protection(self):
-        lease_manager = SlotLeaseManager(2)
-        delayed = DelayedCompletion()
-        lease = lease_manager.acquire([0])
-        lease_manager.retire(lease, TransferTicket(delayed))
-        with self.assertRaises(RuntimeError):
-            lease_manager.acquire([0])
-        with self.assertRaises(ValueError):
-            lease_manager.retire(lease, immediate())
-        delayed.ready = True
-        new_lease = lease_manager.acquire([0])
-        self.assertGreater(new_lease.generation, lease.generation)
-        with self.assertRaises(ValueError):
-            lease_manager.retire(lease, immediate())
-        lease_manager.retire(new_lease, immediate())
-        lease_manager.require_empty()
 
 
 class TestLFU(unittest.TestCase):
@@ -606,59 +592,53 @@ class TestIntegration(unittest.TestCase):
         self.assertIsNone(facade._runtime)
         self.assertEqual(backend.runtime.actions, ["close"])
 
-    def test_static_torch_transport_is_not_dynamic_graph_fallback(self):
-        transport = TorchTransferBackend()
-        self.assertFalse(transport.supports_device_plans)
-        with self.assertRaises(NotImplementedError):
-            transport.materialize_into(None, None, None)
-
-    def test_legacy_tensor_copy_preserves_dtype_and_values(self):
-        source = torch.tensor([1, 2], dtype=torch.uint8)
-        result = TorchTransferBackend.allocate_and_copy(source, torch.device("cpu"))
-        self.assertEqual(result.dtype, source.dtype)
-        self.assertTrue(torch.equal(result, source))
-
-    def test_dfc_order_and_single_common_tail(self):
+    def test_dispatch_once_order_and_single_common_tail(self):
         calls = []
 
         class Dispatch:
-            def accumulator(self, hidden, context):
-                return [0]
-
-            def mask_routes(self, routing, wave, context):
-                return wave
-
             def dispatch(self, hidden, routing, context):
-                calls.append(("D", routing.index))
-                return routing.index
+                calls.append("D")
+                return object()
 
             def combine(self, local, context):
-                calls.append(("C", local))
-                return local + 1
-
-            def accumulate(self, result, partial, context):
-                result[0] += partial
+                calls.append("C")
+                return local
 
             def finish(self, result, context):
-                calls.append(("tail",))
-                return result[0]
+                calls.append("tail")
+                return result
+
+        class Layout:
+            def bind(self, dispatched, context):
+                return []
+
+            def select_wave(self, layout, wave, context):
+                return wave.index
+
+            def write_wave(self, layout, wave, output, context):
+                layout.append(output)
+
+            def combine_input(self, layout, context):
+                return sum(layout)
 
         class Local:
             def run(self, layer, dispatched, wave, context):
                 calls.append(("F", wave.index))
-                return dispatched
+                return dispatched + 1
 
         waves = fixed_waves(5, 2, bank_count=2)
         self.assertEqual(
             [(w.local_start, w.local_end, w.bank) for w in waves],
             [(0, 2, 0), (2, 4, 1), (4, 5, 0)],
         )
-        program = ComposedDFCProgram(waves, Dispatch(), Local())
-        self.assertEqual(program.run(None, None, None, None), 6)
-        self.assertEqual(
-            calls,
-            [(kind, i) for i in range(3) for kind in ("D", "F", "C")] + [("tail",)],
+        program = DispatchOnceProgram(
+            waves, Dispatch(), Local(), Layout(), local_experts=5
         )
+        context = SimpleNamespace(
+            phase=Phase.DECODE, capturing=True, temporary_scope=nullcontext
+        )
+        self.assertEqual(program.run(3, None, None, context), 6)
+        self.assertEqual(calls, ["D", ("F", 0), ("F", 1), ("F", 2), "C", "tail"])
 
 
 if __name__ == "__main__":

@@ -4,53 +4,10 @@ import logging
 
 from ..transfer import Completion, TransferTicket
 from .config import Phase
-from .execution import (
-    LocalExecution,
-    require_prefill,
-    retain_completion,
-    wait_completion,
-)
+from .execution import LocalExecution, require_prefill
 from .interfaces import LocalExpertProgram, WholeMoEProgram
 
 logger = logging.getLogger(__name__)
-
-
-class LayerProgramTable(WholeMoEProgram):
-    """A frozen phase-specific program table, without a runtime back-reference."""
-
-    def __init__(self, programs):
-        from types import MappingProxyType
-
-        self.programs = MappingProxyType(dict(programs))
-        if not self.programs:
-            raise ValueError("Bind at least one layer program")
-
-    def layer_start(self, layer_id, context):
-        self.programs[layer_id].layer_start(layer_id, context)
-
-    def run(self, layer, hidden_states, routing, context):
-        return self.programs[layer].run(layer, hidden_states, routing, context)
-
-
-class ComposedDFCProgram(WholeMoEProgram):
-    def __init__(self, waves, dispatcher, local_program):
-        self.waves = tuple(waves)
-        if not self.waves:
-            raise ValueError("A DFC program requires a static nonempty wave schedule")
-        self.dispatcher = dispatcher
-        self.local_program = local_program
-
-    def run(self, layer, hidden_states, routing, context):
-        # This static Python loop is unrolled at capture. Its length never depends
-        # on misses or device route contents. A dispatcher handle lives for D/F/C.
-        result = self.dispatcher.accumulator(hidden_states, context)
-        for wave in self.waves:
-            masked = self.dispatcher.mask_routes(routing, wave, context)
-            dispatched = self.dispatcher.dispatch(hidden_states, masked, context)
-            local = self.local_program.run(layer, dispatched, wave, context)
-            partial = self.dispatcher.combine(local, context)
-            self.dispatcher.accumulate(result, partial, context)
-        return self.dispatcher.finish(result, context)
 
 
 class DispatchOnceProgram(WholeMoEProgram):
@@ -165,7 +122,7 @@ class PrefillDispatchOnceProgram(DispatchOnceProgram):
         ready = self.dispatcher.dispatch_completion(dispatched, context)
         if not isinstance(ready, Completion):
             raise TypeError("Dispatcher must return a recorded Completion")
-        retain_completion(context, ready)
+        context.retain_completion(ready)
         waves = tuple(self.pipeline.seal(layer, ready, context))
         self._validate_waves(waves)
         return waves
@@ -186,7 +143,7 @@ class PrefillDispatchOnceProgram(DispatchOnceProgram):
     def _retain_completion(ticket, context):
         if not isinstance(ticket, TransferTicket):
             raise TypeError("Pipeline completion must return TransferTicket")
-        retain_completion(context, ticket)
+        context.retain_completion(ticket)
 
 
 def _run_local(run_experts, access, layer, dispatch_output, lease, context):
@@ -204,7 +161,7 @@ def _run_local(run_experts, access, layer, dispatch_output, lease, context):
     if not isinstance(result.read_done, TransferTicket):
         raise TypeError("Expert runner must return a reader TransferTicket")
     # Join auxiliary FFN streams before write_wave or the next decode load.
-    wait_completion(context, result.read_done, context.compute_stream)
+    context.wait_for(result.read_done, context.compute_stream)
     access.release_after(lease, result.read_done, context)
     return result.output
 
