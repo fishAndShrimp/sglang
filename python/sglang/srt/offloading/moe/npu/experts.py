@@ -2,15 +2,17 @@
 
 The NPU DeepEP receive buffer is a *flat*, expert-grouped allocation. Its device
 counts delimit the meaningful prefix; CUDA's [expert, capacity, hidden] layout
-is deliberately not accepted. Every wave keeps fixed activation capacity and
-uses device offsets, including empty waves. Native GMM/activation temporaries
-still belong to the runtime's graph workspace budget.
+is deliberately not accepted. Decode waves keep fixed activation capacity and
+device offsets; eager NORMAL prefill uses the dispatcher's host counts to slice
+each wave's actual rows. Native GMM/activation temporaries still belong to the
+runtime's workspace budget.
 """
 
 from __future__ import annotations
 
 from contextlib import ExitStack
 from dataclasses import dataclass, fields
+from itertools import accumulate
 
 import torch
 
@@ -99,6 +101,7 @@ class _Layout:
     output: torch.Tensor
     row_ids: torch.Tensor
     selected: object = None
+    prefill_offsets: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -257,12 +260,14 @@ class NPUOffloadDispatcher(MoEDispatcher):
 
 
 class NPUDispatchLayout(DispatchLayoutAdapter):
-    """Bounded packing workspace with device-only offsets and inverse mapping.
+    """Bounded decode packing and compact eager prefill over one receive buffer.
 
     Byte views preserve MXFP8 activation/scale bits without relying on float8
     index_select support. The full receive output is initialized, and padding is
-    never counted as expert demand. Buffers are reused only on the compute stream
-    after the local program has joined every registered FFN reader.
+    never counted as expert demand. NORMAL prefill slices contiguous expert rows
+    using existing host counts, without reading device counts back to the CPU.
+    Buffers are reused only on the compute stream after the local program has
+    joined every registered FFN reader.
     """
 
     def __init__(
@@ -319,12 +324,23 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
         ):
             raise ValueError("Unsupported NPU compact dispatch shape or capacity")
         name = _format_name(raw)
+        prefill_offsets = None
         if name == "deepep_normal":
             if context.capturing or context.phase is Phase.DECODE:
                 raise ValueError("Decode requires device-count DeepEP low latency")
-            source = torch.as_tensor(
-                raw.num_recv_tokens_per_expert, dtype=torch.int64, device=self.device
-            )
+            host_counts = raw.num_recv_tokens_per_expert
+            if (
+                not isinstance(host_counts, (list, tuple))
+                or len(host_counts) != self.local_experts
+                or any(type(count) is not int or count < 0 for count in host_counts)
+            ):
+                raise ValueError(
+                    "Prefill dispatch requires nonnegative host counts for every expert"
+                )
+            prefill_offsets = tuple(accumulate(host_counts, initial=0))
+            if prefill_offsets[-1] > x.shape[0]:
+                raise ValueError("Prefill dispatch counts exceed receive capacity")
+            source = torch.as_tensor(host_counts, dtype=torch.int64, device=self.device)
         elif name == "deepep_ll":
             source = raw.masked_m
         else:
@@ -350,7 +366,12 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
                 output = output.view(torch.float16)
             output.zero_()
             result = _Layout(
-                dispatched, counts, offsets, output, self._owned["rows"][: x.shape[0]]
+                dispatched,
+                counts,
+                offsets,
+                output,
+                self._owned["rows"][: x.shape[0]],
+                prefill_offsets=prefill_offsets,
             )
             context.retain(result)
             return result
@@ -383,10 +404,15 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
             raw = layout.dispatched.raw
             offset = layout.offsets[wave.local_start]
             count = layout.offsets[wave.local_end] - offset
-            indices = (layout.row_ids + offset).clamp(
-                max=max(0, layout.output.shape[0] - 1)
-            )
-            x = self._gather_bytes(raw.hidden_states, indices, count, "input_bytes")
+            if layout.prefill_offsets is not None:
+                start = layout.prefill_offsets[wave.local_start]
+                end = layout.prefill_offsets[wave.local_end]
+                x = raw.hidden_states[start:end]
+            else:
+                indices = (layout.row_ids + offset).clamp(
+                    max=max(0, layout.output.shape[0] - 1)
+                )
+                x = self._gather_bytes(raw.hidden_states, indices, count, "input_bytes")
             scale = raw.hidden_states_scale
             if scale is not None:
                 rows = raw.hidden_states.shape[0]
@@ -398,9 +424,14 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
                 else:
                     if scale.numel() % rows:
                         raise ValueError("NPU scales must have a fixed per-row shape")
-                    scale = self._gather_bytes(
-                        scale.reshape(rows, -1), indices, count, "scale_bytes"
-                    )
+                    if layout.prefill_offsets is not None:
+                        if not scale.is_contiguous():
+                            raise ValueError("NPU activation scales must be contiguous")
+                        scale = scale.view(rows, -1)[start:end]
+                    else:
+                        scale = self._gather_bytes(
+                            scale.reshape(rows, -1), indices, count, "scale_bytes"
+                        )
             result = NPUWaveInput(
                 x,
                 scale,
@@ -418,10 +449,17 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
         selected = layout.selected
         if selected is None or selected.wave != wave:
             raise RuntimeError("Wave write must match its selected receive rows")
-        if local_output.shape != layout.output.shape:
-            raise ValueError("Native FFN must preserve fixed receive capacity")
+        target = layout.output
+        if layout.prefill_offsets is not None:
+            start = layout.prefill_offsets[wave.local_start]
+            end = layout.prefill_offsets[wave.local_end]
+            target = target[start:end]
+        if local_output.shape != target.shape:
+            raise ValueError("Native FFN must preserve the selected receive shape")
         with _compute_scope(context, self.device):
-            if layout.output.shape[0]:
+            if layout.prefill_offsets is not None:
+                target.copy_(local_output)
+            elif layout.output.shape[0]:
                 inverse = (layout.row_ids - selected.offset).clamp(
                     0, layout.output.shape[0] - 1
                 )
@@ -494,6 +532,21 @@ class NPUExpertRunner:
         # Retain *before* submission, including partial native failures.
         context.retain((self, bank, quant, dispatched, bindings, self.reader_streams))
         with _compute_scope(context, dispatched.hidden_states.device):
+            if (
+                context.phase is Phase.PREFILL
+                and not context.capturing
+                and dispatched.hidden_states.shape[0] == 0
+            ):
+                # Empty eager waves still retire their weight lease and readers,
+                # but do not call native quantization/GMM with a zero-row input.
+                dtype = (
+                    torch.float16
+                    if dispatched.hidden_states.dtype == torch.float16
+                    else torch.bfloat16
+                )
+                output = torch.empty_like(dispatched.hidden_states, dtype=dtype)
+                context.retain(output)
+                return LocalExecution(output, self._reader_ticket(context))
             valid = bank.execution_valid
             bad = ((dispatched.expert_tokens > 0) & ~valid).any()
             bank.error_status.bitwise_or_(bad.to(torch.int32) * 128)

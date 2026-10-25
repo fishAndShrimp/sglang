@@ -188,9 +188,11 @@ class MoEDispatcher(ABC):
 class DispatchLayoutAdapter(ABC):
     """Slice a single full dispatch and assemble its original combine layout.
 
-    These methods emit device operations; Python is not rerun during replay.
-    Use device counts/masks with fixed-capacity storage, never host decisions
-    from .item()/.tolist(). Compact and padded layouts need backend adapters.
+    During graph capture these methods emit device operations; Python is not
+    rerun during replay. Use device counts/masks with fixed-capacity storage,
+    never host decisions from .item()/.tolist(). Eager prefill may slice compact
+    receive rows using host counts already supplied by its dispatcher, without
+    synchronizing device metadata. Compact and padded layouts need backend adapters.
     """
 
     @abstractmethod

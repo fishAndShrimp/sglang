@@ -13,10 +13,14 @@ routed scaling 仍由外层 DeepSeek MLP 执行；返回值包含原 `FusedMoE.f
 2. 原生 dispatch 已在 `dispatch_b` 等待通信事件或 receive hook；在其后记录 compute
    事件，作为 prefill worker 的真实 dispatch completion。提前保留 native handle
    的值，避免 combine 清除 dispatcher 字段后过早释放通信元数据。
-3. NPU DeepEP 的接收缓冲是二维、按专家紧排的固定容量张量。设备端 counts / prefix
-   offsets 驱动 wave gather 与原位置回填，不用 `.item()`、`.tolist()` 或变长主机切片。
+3. NPU DeepEP 的接收缓冲是二维、按专家紧排的张量。Decode 使用设备端 counts /
+   prefix offsets 驱动固定容量 wave gather 与原位置回填。Eager NORMAL prefill 利用
+   dispatcher 已返回的 Python-list counts 计算主机 offsets，直接切出本 wave 的连续
+   activation / scale 行，FFN 只接收这些行，结果直接回填对应输出区间。全层输出仍保持
+   combine 所需的形状与零 padding，不新增 `.item()` / `.tolist()` 设备回读。
    整个 local-demand 向量传给 residency，各 wave 只消费自身的专家区间。
-4. activation 与 MXFP8 scale 通过 byte views 搬运，保留量化位模式；固定 input、scale、
+4. Decode activation 与 MXFP8 scale 通过 byte views 搬运，保留量化位模式；prefill
+   连续视图保留原 dtype 和位模式。固定 input、scale、
    output、counts、offsets、row-index allocation 显式计入预算。串行层可共享同一 layout，
    factory 只登记一次物理 allocation。
 5. 每个 lease 的 `bindings.expert_bank` 包含 `AscendQuantInfo` 原生权重视图、
@@ -29,7 +33,9 @@ routed scaling 仍由外层 DeepSeek MLP 执行；返回值包含原 `FusedMoE.f
 7. compute 与显式登记的附加 weight-reader stream 的事件组成 reader ticket。
    local program 在下一次 bank 写入前等待全部 readers；提交前即保留 bank / quant
    views / input，异常由 runtime drain 后释放。默认原生 core 不注入 overlap hooks，
-   两个 GMM 与 activation 均使用当前 compute stream。
+   两个 GMM 与 activation 均使用当前 compute stream。Eager prefill 的零 token wave
+   跳过 native FFN，仍返回正确 dtype 的空结果和 reader ticket，照常释放 lease；本地
+   IDLE rank 是否计算由 dispatch 后的接收行数决定。
 8. Combine 使用原 EP IDs / weights，wave 回填不重复应用 top-k 权重。错误状态还会
    清零此前成功 wave 的结果；masked token 的 combine 输出再次清零，避免读取未写 padding。
 
@@ -47,8 +53,10 @@ routed scaling 仍由外层 DeepSeek MLP 执行；返回值包含原 `FusedMoE.f
 
 ## 目标机验收
 
-既有 CPU 契约测试覆盖字节打包、padding 和绑定宽度；native/device 替身只存在
+CPU 契约测试覆盖字节打包、prefill 连续切片和回填、空组、padding、错误屏蔽及绑定宽度；
+native/device 替身只存在
 于测试目录，不能证明原生算子的数值或图行为。在目标机验证
 全零 counts 的 grouped matmul 不读取无效 lane；byte gather / where / prefix-sum
 的 torch_npu graph 支持；不同 padding 下 native `-1` D/C；MXFP8 scale / NZ
-weight views；多 rank 单层参考一致性；整模型 graph replay、模式切换和故障 drain。
+weight views；prefill 不同实际行数及非零 storage offset 的原生 GMM；多 rank 单层
+参考一致性；整模型 graph replay、模式切换和故障 drain。
