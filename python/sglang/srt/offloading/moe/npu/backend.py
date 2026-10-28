@@ -428,9 +428,16 @@ class NpuMoEBackend(MoEBackend):
                 from .single_token import SingleTokenProgram
 
                 original = programs[spec.layer_id]
+                decode_dispatcher = original.decode.dispatcher
+                if os.environ.get("SGLANG_MOE_BS1_COLLECTIVE") == "1":
+                    from .single_token_collective import SingleTokenCollectiveDispatcher
+
+                    decode_dispatcher = SingleTokenCollectiveDispatcher(
+                        self.model_adapter.expert_module(module), error_status=error, state=state)
+                    program_resources.extend(decode_dispatcher.allocations())
                 decode = SingleTokenProgram(
                     self.model_adapter.expert_module(module),
-                    dispatcher=original.decode.dispatcher, layout=original.layout,
+                    dispatcher=decode_dispatcher, layout=original.layout,
                     state=state, error=error, catalog=catalog,
                     address_catalog=address_catalog, source_table=source_table,
                     execution=execution, cache_stats=ops.cache_stats,

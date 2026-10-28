@@ -103,8 +103,12 @@ class SingleTokenProgram:
             counts.copy_(torch.where(duplicate | (self.error != 0), 0, counts))
         else:
             counts.masked_fill_(duplicate | (self.error != 0), 0)
-        ids = active_expert_ids(counts, self.capacity, float_sort=self.fast_meta)
-        needed = counts.gather(0, ids) > 0
+        raw = getattr(getattr(layout, "dispatched", None), "raw", None)
+        if hasattr(raw, "single_token_ids"):
+            ids, needed = raw.single_token_ids, raw.single_token_needed
+        else:
+            ids = active_expert_ids(counts, self.capacity, float_sort=self.fast_meta)
+            needed = counts.gather(0, ids) > 0
         keys = ids + self.key_start
         slots = self.state.key_to_slot.gather(0, keys)
         safe_slots = slots.clamp(0, self.hot_count - 1)
@@ -132,6 +136,16 @@ class SingleTokenProgram:
         if not self.fast_meta:
             return self.layout.bind(dispatched, context)
         raw = dispatched.raw
+        if hasattr(raw, "single_token_ids"):
+            # All-gather produced a fixed six-expert plan, not a variable token
+            # receive layout. Reuse only the preallocated six-row output view.
+            output = self.layout._owned["output"][:self.capacity]
+            output.zero_()
+            result = SimpleNamespace(dispatched=dispatched, counts=raw.masked_m,
+                                     output=output, offsets=self.zero_offset,
+                                     compact_rows=self.capacity, selected=None)
+            context.retain(result)
+            return result
         x, source = raw.hidden_states, raw.masked_m
         if (dispatched.decode_row_bound != self.capacity
             or x.ndim != 2 or x.shape[1] != self.layout.hidden_size
