@@ -25,12 +25,14 @@ def active_expert_ids(counts, capacity, *, float_sort=False):
     return torch.argsort(keys.float() if float_sort else keys)[:capacity]
 
 
-def split_hit_miss(needed, hit, slots, hot_count):
+def split_hit_miss(needed, hit, slots, hot_count, *, float_sort=False):
     """Permutations into native Hot-slot order and compact miss order."""
     rows = torch.arange(needed.numel(), device=needed.device)
     hits, misses = needed & hit, needed & ~hit
-    hot_order = torch.argsort(torch.where(hits, slots, hot_count + rows))
-    miss_order = torch.argsort(torch.where(misses, rows, rows + rows.numel()))
+    hot_keys = torch.where(hits, slots, hot_count + rows)
+    miss_keys = torch.where(misses, rows, rows + rows.numel())
+    hot_order = torch.argsort(hot_keys.float() if float_sort else hot_keys)
+    miss_order = torch.argsort(miss_keys.float() if float_sort else miss_keys)
     return hits, misses, hot_order, miss_order
 
 
@@ -80,6 +82,8 @@ class SingleTokenProgram:
                 expert_bank=NPUExpertBank(direct_hot.quant_info(), state.slot_valid, error),
                 error_status=error)
             self.hot_groups = self._own("hot_groups", torch.zeros(
+                self.hot_count, dtype=torch.int64, device=self.device))
+            self.hot_rows = self._own("hot_rows", torch.arange(
                 self.hot_count, dtype=torch.int64, device=self.device))
 
     def _own(self, name, value):
@@ -206,8 +210,9 @@ class SingleTokenProgram:
 
     def _run_split(self, layer, dispatched, layout, source_indices, needed, hit, slots, context):
         hits, misses, hot_order, miss_order = split_hit_miss(
-            needed, hit, slots, self.hot_count)
-        miss_valid = misses.gather(0, miss_order)
+            needed, hit, slots, self.hot_count, float_sort=self.fast_meta)
+        miss_valid = (misses.to(torch.int32).gather(0, miss_order) != 0
+                      if self.fast_meta else misses.gather(0, miss_order))
         copy = self._copy(source_indices.gather(0, miss_order), miss_valid, context)
         # Main-stream Hot readers touch no Execution slots: they may run while
         # the copy stream stages misses into the six fixed Execution slots.
@@ -216,8 +221,14 @@ class SingleTokenProgram:
         hit_count, miss_count = hits.sum(), misses.sum()
         hot_x = x.index_select(0, hot_order)
         hot_x.masked_fill_((self.rows >= hit_count).unsqueeze(1), 0)
-        self.hot_groups.zero_()
-        self.hot_groups.scatter_add_(0, slots, hits.to(torch.int64))
+        if self.fast_meta:
+            # At most six hits: a 720x6 comparison avoids integer Scatter's
+            # AI CPU path. This writes counts only, never gathers weights.
+            self.hot_groups.copy_(((self.hot_rows.unsqueeze(1) == slots.unsqueeze(0))
+                                    & hits.unsqueeze(0)).sum(dim=1))
+        else:
+            self.hot_groups.zero_()
+            self.hot_groups.scatter_add_(0, slots, hits.to(torch.int64))
         hot_input = NPUWaveInput(hot_x, None, self.hot_groups, layout.counts,
                                  hit_count, layout.offsets[0], self.wave)
         hot_run = self.runner(layer, hot_input, self.hot_bindings, context)
@@ -234,8 +245,10 @@ class SingleTokenProgram:
         context.wait_for(miss_run.read_done, context.compute_stream)
         # Both runners clear unwritten padding (including NaNs) before this
         # inverse permutation; exactly one contribution exists per active row.
-        output = (hot_run.output.index_select(0, torch.argsort(hot_order))
-                  + miss_run.output.index_select(0, torch.argsort(miss_order)))
+        hot_inverse = torch.argsort(hot_order.float() if self.fast_meta else hot_order)
+        miss_inverse = torch.argsort(miss_order.float() if self.fast_meta else miss_order)
+        output = (hot_run.output.index_select(0, hot_inverse)
+                  + miss_run.output.index_select(0, miss_inverse))
         layout.output[:self.capacity].copy_(output)
         combined = self.dispatcher.combine(self.layout.combine_input(layout, context), context)
         return self.dispatcher.finish(combined, context)
