@@ -11,6 +11,7 @@ class TestSingleTokenPlanner(unittest.TestCase):
     def planner(self):
         program = SingleTokenProgram.__new__(SingleTokenProgram)
         program.capacity, program.local_experts = 6, 64
+        program.fast_meta = False
         program.key_start, program.hot_count, program.host_count = 64, 4, 128
         program.error = torch.tensor(0, dtype=torch.int32)
         program.cache_stats = None
@@ -30,6 +31,7 @@ class TestSingleTokenPlanner(unittest.TestCase):
             ids = active_expert_ids(counts, 6)
             self.assertEqual(ids[:len(active)].tolist(), active)
             self.assertEqual((counts[ids] > 0).tolist(), [True]*len(active)+[False]*(6-len(active)))
+            self.assertTrue(torch.equal(ids, active_expert_ids(counts, 6, float_sort=True)))
 
     def test_host_and_hot_addresses_and_lfu_demand(self):
         p = self.planner()
@@ -87,6 +89,36 @@ class TestSingleTokenPlanner(unittest.TestCase):
                 miss_output[nm:] = 0
                 combined = hot_output[ho.argsort()] + miss_output[mo.argsort()]
                 self.assertTrue(torch.equal(combined, torch.where(needed, values, 0)))
+
+    def test_fast_meta_matches_original_planner(self):
+        for active in ([], [1], [0, 1, 6, 35, 50, 63]):
+            slow, fast = self.planner(), self.planner()
+            fast.fast_meta = True
+            counts = torch.zeros(64, dtype=torch.int64)
+            counts[active] = 1
+            a = slow._prepare(SimpleNamespace(counts=counts.clone()), None)
+            b = fast._prepare(SimpleNamespace(counts=counts.clone()), None)
+            self.assertTrue(all(torch.equal(x, y) for x, y in zip(a, b)))
+            self.assertTrue(torch.equal(slow.state.step_access_count, fast.state.step_access_count))
+
+    def test_small_layout_preserves_native_counts_and_faults_real_overflow(self):
+        for size, replay in ((0, True), (6, True), (7, True), (7, False)):
+            p = self.planner()
+            p.fast_meta, p.device = True, torch.device('cpu')
+            p.state.update_enabled.fill_(replay)
+            p.zero_offset = torch.zeros(1, dtype=torch.int64)
+            p.layout = SimpleNamespace(hidden_size=4, max_rows=24, _owned={
+                'counts': torch.empty(64, dtype=torch.int64),
+                'output': torch.full((24, 4), float('nan'), dtype=torch.bfloat16)})
+            source = torch.zeros(64, dtype=torch.int64)
+            source[:size] = 1
+            d = SimpleNamespace(decode_row_bound=6, raw=SimpleNamespace(
+                hidden_states=torch.ones(24, 4, dtype=torch.bfloat16), masked_m=source))
+            layout = p._bind(d, SimpleNamespace(retain=lambda x: None))
+            self.assertEqual(int(source.sum()), size)
+            self.assertEqual(int(layout.counts.sum()), size if size <= 6 else 0)
+            self.assertEqual(bool(p.error), size > 6 and replay)
+            self.assertTrue((layout.output == 0).all())
 
 
 if __name__ == '__main__':

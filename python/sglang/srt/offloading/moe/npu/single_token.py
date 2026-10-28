@@ -16,10 +16,13 @@ from .experts import NPUExpertBank, NPUExpertRunner, NPUWaveInput, _compute_scop
 from .transfer import _group_pack_copy
 
 
-def active_expert_ids(counts, capacity):
+def active_expert_ids(counts, capacity, *, float_sort=False):
     """Selected experts in receive-prefix order, followed by inactive fillers."""
     ids = torch.arange(counts.numel(), dtype=torch.int64, device=counts.device)
-    return torch.argsort(torch.where(counts > 0, ids, ids + counts.numel()))[:capacity]
+    keys = torch.where(counts > 0, ids, ids + counts.numel())
+    # Keys are small distinct integers (<128), exactly represented by float32.
+    # Integer argsort falls back to AI CPU on the tested Ascend stack.
+    return torch.argsort(keys.float() if float_sort else keys)[:capacity]
 
 
 def split_hit_miss(needed, hit, slots, hot_count):
@@ -34,7 +37,7 @@ def split_hit_miss(needed, hit, slots, hot_count):
 class SingleTokenProgram:
     def __init__(self, experts, *, dispatcher, layout, state, error,
                  catalog, address_catalog, source_table, execution, cache_stats=None,
-                 direct_hot=None):
+                 direct_hot=None, fast_meta=False):
         self.dispatcher, self.layout = dispatcher, layout
         self.state, self.error = state, error
         self.layer = experts.layer_id
@@ -42,6 +45,7 @@ class SingleTokenProgram:
         self.local_experts = experts.num_local_experts
         self.device = error.device
         self.capacity = 6
+        self.fast_meta = fast_meta
         if not dispatcher.global_bs1 or execution.capacity < self.capacity:
             raise ValueError("Single-token executor requires global BS=1 and six execution slots")
         self.source_table = source_table
@@ -52,6 +56,7 @@ class SingleTokenProgram:
         self.cache_stats = cache_stats
         self._owned = {}
         self.rows = self._own("rows", torch.arange(self.capacity, device=self.device))
+        self.zero_offset = self._own("zero_offset", torch.zeros(1, dtype=torch.int64, device=self.device))
         self.valid = self._own("valid", torch.zeros(self.capacity, dtype=torch.bool, device=self.device))
         self.groups = self._own("groups", torch.zeros(self.capacity, dtype=torch.int64, device=self.device))
         self.packed = self._own("packed", torch.zeros(
@@ -90,14 +95,19 @@ class SingleTokenProgram:
         # Synthetic capture can violate this; real replay must fault instead.
         duplicate = (counts > 1).any()
         self.error.bitwise_or_((duplicate & self.state.update_enabled).to(torch.int32) * 512)
-        counts.masked_fill_(duplicate | (self.error != 0), 0)
-        ids = active_expert_ids(counts, self.capacity)
+        if self.fast_meta:
+            counts.copy_(torch.where(duplicate | (self.error != 0), 0, counts))
+        else:
+            counts.masked_fill_(duplicate | (self.error != 0), 0)
+        ids = active_expert_ids(counts, self.capacity, float_sort=self.fast_meta)
         needed = counts.gather(0, ids) > 0
         keys = ids + self.key_start
         slots = self.state.key_to_slot.gather(0, keys)
         safe_slots = slots.clamp(0, self.hot_count - 1)
         hit = slots >= 0
-        coherent = self.state.slot_valid.gather(0, safe_slots) & (
+        valid = (self.state.slot_valid.to(torch.int32).gather(0, safe_slots) != 0
+                 if self.fast_meta else self.state.slot_valid.gather(0, safe_slots))
+        coherent = valid & (
             self.state.slot_to_key.gather(0, safe_slots) == keys)
         bad = needed & ((slots < -1) | (slots >= self.hot_count) | (hit & ~coherent))
         self.error.bitwise_or_(bad.any().to(torch.int32) * 1024)
@@ -113,6 +123,34 @@ class SingleTokenProgram:
             self.cache_stats.record_counts(needed.to(torch.int64), hit,
                                            self.state.update_enabled & (self.error == 0))
         return source_indices, needed, hit, safe_slots
+
+    def _bind(self, dispatched, context):
+        if not self.fast_meta:
+            return self.layout.bind(dispatched, context)
+        raw = dispatched.raw
+        x, source = raw.hidden_states, raw.masked_m
+        if (dispatched.decode_row_bound != self.capacity
+            or x.ndim != 2 or x.shape[1] != self.layout.hidden_size
+            or x.shape[0] < self.capacity or x.shape[0] > self.layout.max_rows
+            or x.dtype != torch.bfloat16 or x.device != self.device
+            or not x.is_contiguous() or source.shape != (self.local_experts,)
+            or source.dtype not in (torch.int32, torch.int64) or source.device != self.device):
+            raise ValueError("Unsupported single-token native dispatch layout")
+        counts = self.layout._owned["counts"]
+        counts.copy_(source)
+        overflow = counts.sum() > self.capacity
+        bad = (counts < 0).any() | (overflow & self.state.update_enabled)
+        self.error.bitwise_or_(bad.to(torch.int32) * 64)
+        counts.copy_(torch.where(overflow | (self.error != 0), 0, counts))
+        output = self.layout._owned["output"][:x.shape[0]]
+        output.zero_()
+        # Grouped receive already gives the active prefix. No per-expert
+        # cumulative offsets, activation workspace, or inverse gather is used.
+        result = SimpleNamespace(dispatched=dispatched, counts=counts,
+                                 output=output, offsets=self.zero_offset,
+                                 compact_rows=self.capacity, selected=None)
+        context.retain(result)
+        return result
 
     def _copy(self, source_indices, needed, context):
         # The compute frontier covers the preceding layer's FFN readers too.
@@ -144,7 +182,7 @@ class SingleTokenProgram:
             raise ValueError("Single-token executor only supports decode with top-k=6")
         with _compute_scope(context, self.device):
             dispatched = self.dispatcher.dispatch(hidden_states, routing, context)
-            layout = self.layout.bind(dispatched, context)
+            layout = self._bind(dispatched, context)
             if layout.compact_rows != self.capacity or dispatched.raw.hidden_states_scale is not None:
                 raise ValueError("Single-token executor requires a six-row BF16 dispatch prefix")
             source_indices, needed, hit, slots = self._prepare(layout, context)

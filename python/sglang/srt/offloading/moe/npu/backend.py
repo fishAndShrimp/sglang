@@ -437,6 +437,7 @@ class NpuMoEBackend(MoEBackend):
                     direct_hot=(hot.view(0, hot.capacity)
                                 if os.environ.get("SGLANG_MOE_BS1_DIRECT_HOT") == "1"
                                 else None),
+                    fast_meta=os.environ.get("SGLANG_MOE_BS1_FAST_META") == "1",
                 )
                 programs[spec.layer_id] = replace(original, decode=decode)
                 program_resources.extend(decode.allocations())
