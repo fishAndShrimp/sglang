@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from functools import lru_cache
 from types import SimpleNamespace
 
@@ -401,6 +401,14 @@ class NpuMoEBackend(MoEBackend):
             ordered_copy_stream=True,
         )
         pipelines = (pipeline,)
+        light = os.environ.get("SGLANG_MOE_BS1_LIGHT") == "1"
+        source_table = None
+        if light:
+            source_table = torch.stack([
+                torch.cat((host_table, hot_table))
+                for host_table, hot_table in address_catalog.source_tables
+            ])
+            program_resources.extend(tensor_allocations("bs1.shared.", [("sources", source_table)]))
         shared_layout = None
         for module, spec in layers:
             programs[spec.layer_id] = build_npu_layer_programs(
@@ -416,6 +424,19 @@ class NpuMoEBackend(MoEBackend):
             if shared_layout is None:
                 shared_layout = programs[spec.layer_id].layout
                 program_resources.extend(programs[spec.layer_id].allocations())
+            if light:
+                from .single_token import SingleTokenProgram
+
+                original = programs[spec.layer_id]
+                decode = SingleTokenProgram(
+                    self.model_adapter.expert_module(module),
+                    dispatcher=original.decode.dispatcher, layout=original.layout,
+                    state=state, error=error, catalog=catalog,
+                    address_catalog=address_catalog, source_table=source_table,
+                    execution=execution, cache_stats=ops.cache_stats,
+                )
+                programs[spec.layer_id] = replace(original, decode=decode)
+                program_resources.extend(decode.allocations())
         resources = (
             list(self.host_pool.allocations())
             + list(hot.allocations())
