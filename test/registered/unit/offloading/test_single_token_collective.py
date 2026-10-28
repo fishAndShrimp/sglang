@@ -16,12 +16,14 @@ class TestSingleTokenCollective(unittest.TestCase):
                     reference += (torch.arange(4).float() + int(i)) * w
             all_active = 0
             for rank in range(4):
-                local, needed, rw, demand = local_topk_plan(ids, weights, rank, 64)
+                local, needed, rw, demand, order = local_topk_plan(ids, weights, rank, 64)
                 n = int(needed.sum())
                 all_active += n
                 self.assertEqual(needed.tolist(), [True]*n + [False]*(6-n))
                 self.assertEqual(local[:n].tolist(), sorted((ids[(ids//64)==rank] % 64).tolist()))
                 self.assertEqual(int(demand.sum()), n)
+                restored = torch.where(needed, local + rank*64, -1)[order.argsort()]
+                self.assertTrue(torch.equal(restored, torch.where(ids//64 == rank, ids, -1)))
                 values = torch.arange(4).float().unsqueeze(0) + (local + rank*64).unsqueeze(1)
                 total += (values * rw.unsqueeze(1)).sum(0)
             self.assertEqual(all_active, int((ids >= 0).sum()))

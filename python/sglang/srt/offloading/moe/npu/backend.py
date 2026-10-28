@@ -433,7 +433,8 @@ class NpuMoEBackend(MoEBackend):
                     from .single_token_collective import SingleTokenCollectiveDispatcher
 
                     decode_dispatcher = SingleTokenCollectiveDispatcher(
-                        self.model_adapter.expert_module(module), error_status=error, state=state)
+                        self.model_adapter.expert_module(module), error_status=error, state=state,
+                        ordered_combine=os.environ.get("SGLANG_MOE_BS1_ORDERED_COMBINE") == "1")
                     program_resources.extend(decode_dispatcher.allocations())
                 decode = SingleTokenProgram(
                     self.model_adapter.expert_module(module),

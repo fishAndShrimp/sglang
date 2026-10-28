@@ -24,11 +24,11 @@ def local_topk_plan(ids, weights, rank, local_experts):
     local_ids = (selected - start).clamp(0, local_experts - 1)
     row_weights = torch.where(needed, weights.gather(0, order), 0)
     demand = (torch.arange(local_experts, device=ids.device).unsqueeze(1) + start == ids).sum(1)
-    return local_ids, needed, row_weights, demand
+    return local_ids, needed, row_weights, demand, order
 
 
 class SingleTokenCollectiveDispatcher(NPUOffloadDispatcher):
-    def __init__(self, experts, *, error_status, state):
+    def __init__(self, experts, *, error_status, state, ordered_combine=False):
         super().__init__(experts, error_status=error_status)
         from sglang.srt.distributed import get_moe_ep_group
 
@@ -36,6 +36,7 @@ class SingleTokenCollectiveDispatcher(NPUOffloadDispatcher):
         self.state = state
         self.hidden = experts.hidden_size
         self.topk = 6
+        self.ordered_combine = ordered_combine
         if (self.group.world_size != 4 or experts.moe_ep_size != 4
             or experts.moe_tp_size != 1 or experts.num_fused_shared_experts != 0
             or experts.num_local_experts != 64 or experts.reduce_results):
@@ -71,7 +72,7 @@ class SingleTokenCollectiveDispatcher(NPUOffloadDispatcher):
             good = one & (self.error_status == 0)
             ids = torch.where(good, total[self.hidden:self.hidden+self.topk].long() - 1, -1)
             weights = torch.where(good, total[self.hidden+self.topk:-1], 0)
-            local_ids, needed, row_weights, demand = local_topk_plan(
+            local_ids, needed, row_weights, demand, order = local_topk_plan(
                 ids, weights, self.experts.moe_ep_rank, self.experts.num_local_experts)
             x = torch.where(good, total[:self.hidden], 0).to(torch.bfloat16)
             # All selected experts consume exactly this token; fixed GMM input
@@ -79,6 +80,7 @@ class SingleTokenCollectiveDispatcher(NPUOffloadDispatcher):
             raw = SimpleNamespace(hidden_states=x.expand(self.topk, -1).contiguous(),
                 hidden_states_scale=None, masked_m=demand, single_token_ids=local_ids,
                 single_token_needed=needed, single_token_weights=row_weights,
+                single_token_order=order,
                 topk_ids=ids, topk_weights=weights, format="bs1_collective")
             result = NPUDispatch(raw, context.record_compute_completion(), self.hidden,
                                  None, count, self.topk)
@@ -87,6 +89,20 @@ class SingleTokenCollectiveDispatcher(NPUOffloadDispatcher):
 
     def combine(self, layout, context):
         with _compute_scope(context, layout.output.device):
+            if self.ordered_combine:
+                raw = layout.dispatched.raw
+                # Each original TopK position has exactly one owning rank.
+                # Reduce unweighted BF16 rows with zero contributions elsewhere,
+                # then perform the weighted sum in original TopK order. This
+                # avoids regrouping FP32 additions by EP rank before rounding.
+                inverse = torch.argsort(raw.single_token_order.float())
+                local = layout.output.index_select(0, inverse)
+                reduced = self.group.all_reduce(local)
+                output = (reduced.float() * raw.topk_weights.unsqueeze(1)).sum(0, keepdim=True)
+                result = _Combined(output.to(torch.bfloat16), self.hidden,
+                                   layout.dispatched.valid_token_count)
+                context.retain((local, reduced, output, result))
+                return result
             weights = layout.dispatched.raw.single_token_weights
             local = (layout.output.float() * weights.unsqueeze(1)).sum(0, keepdim=True)
             reduced = self.group.all_reduce(local)
