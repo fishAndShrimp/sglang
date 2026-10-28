@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.offloading.moe.npu.single_token import SingleTokenProgram, active_expert_ids
+from sglang.srt.offloading.moe.npu.single_token import SingleTokenProgram, active_expert_ids, split_hit_miss
 
 
 class TestSingleTokenPlanner(unittest.TestCase):
@@ -36,7 +36,7 @@ class TestSingleTokenPlanner(unittest.TestCase):
         counts = torch.zeros(64, dtype=torch.int64)
         active = [0, 1, 6, 35, 50, 63]
         counts[active] = 1
-        indices, needed = p._prepare(SimpleNamespace(counts=counts), None)
+        indices, needed, _, _ = p._prepare(SimpleNamespace(counts=counts), None)
         # Combined address table is [host sentinel, hosts..., hot sentinel, hot...].
         self.assertEqual(indices.tolist(), [65, 130, 131, 132, 115, 133])
         self.assertTrue(needed.all())
@@ -54,7 +54,7 @@ class TestSingleTokenPlanner(unittest.TestCase):
                 p.state.key_to_slot[65] = 9
             counts = torch.zeros(64, dtype=torch.int64)
             counts[1] = 1
-            _, needed = p._prepare(SimpleNamespace(counts=counts), None)
+            _, needed, _, _ = p._prepare(SimpleNamespace(counts=counts), None)
             self.assertNotEqual(p.error.item(), 0)
             self.assertFalse(needed.any())
 
@@ -64,9 +64,29 @@ class TestSingleTokenPlanner(unittest.TestCase):
             p.state.update_enabled.fill_(replay)
             counts = torch.zeros(64, dtype=torch.int64)
             counts[1] = 2
-            _, needed = p._prepare(SimpleNamespace(counts=counts), None)
+            _, needed, _, _ = p._prepare(SimpleNamespace(counts=counts), None)
             self.assertEqual(p.error.item() != 0, replay)
             self.assertFalse(needed.any())
+
+    def test_all_hit_miss_patterns_preserve_rows(self):
+        # Exercise empty ranks, all-hit/all-miss, mixed sets, arbitrary Hot order,
+        # and absent rows. This verifies GMM grouping and inverse permutations.
+        for count in range(7):
+            for bits in range(1 << count):
+                needed = torch.arange(6) < count
+                hit = torch.tensor([bool(bits & (1 << i)) for i in range(6)])
+                slots = torch.tensor([4, 2, 5, 0, 3, 1])
+                hits, misses, ho, mo = split_hit_miss(needed, hit, slots, 6)
+                nh, nm = int(hits.sum()), int(misses.sum())
+                self.assertEqual(slots[ho[:nh]].tolist(), sorted(slots[hits].tolist()))
+                self.assertEqual(mo[:nm].tolist(), torch.where(misses)[0].tolist())
+                values = torch.arange(1, 7, dtype=torch.float32)
+                hot_output = values[ho].clone()
+                miss_output = values[mo].clone()
+                hot_output[nh:] = 0
+                miss_output[nm:] = 0
+                combined = hot_output[ho.argsort()] + miss_output[mo.argsort()]
+                self.assertTrue(torch.equal(combined, torch.where(needed, values, 0)))
 
 
 if __name__ == '__main__':

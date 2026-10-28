@@ -434,6 +434,9 @@ class NpuMoEBackend(MoEBackend):
                     state=state, error=error, catalog=catalog,
                     address_catalog=address_catalog, source_table=source_table,
                     execution=execution, cache_stats=ops.cache_stats,
+                    direct_hot=(hot.view(0, hot.capacity)
+                                if os.environ.get("SGLANG_MOE_BS1_DIRECT_HOT") == "1"
+                                else None),
                 )
                 programs[spec.layer_id] = replace(original, decode=decode)
                 program_resources.extend(decode.allocations())

@@ -22,9 +22,19 @@ def active_expert_ids(counts, capacity):
     return torch.argsort(torch.where(counts > 0, ids, ids + counts.numel()))[:capacity]
 
 
+def split_hit_miss(needed, hit, slots, hot_count):
+    """Permutations into native Hot-slot order and compact miss order."""
+    rows = torch.arange(needed.numel(), device=needed.device)
+    hits, misses = needed & hit, needed & ~hit
+    hot_order = torch.argsort(torch.where(hits, slots, hot_count + rows))
+    miss_order = torch.argsort(torch.where(misses, rows, rows + rows.numel()))
+    return hits, misses, hot_order, miss_order
+
+
 class SingleTokenProgram:
     def __init__(self, experts, *, dispatcher, layout, state, error,
-                 catalog, address_catalog, source_table, execution, cache_stats=None):
+                 catalog, address_catalog, source_table, execution, cache_stats=None,
+                 direct_hot=None):
         self.dispatcher, self.layout = dispatcher, layout
         self.state, self.error = state, error
         self.layer = experts.layer_id
@@ -59,6 +69,13 @@ class SingleTokenProgram:
             expert_bank=NPUExpertBank(bank.quant_info(), self.valid, error), error_status=error)
         self.runner = NPUExpertRunner(experts)
         self.wave = ExpertWave(0, 0, self.capacity, 0)
+        self.hot_bindings = None
+        if direct_hot is not None:
+            self.hot_bindings = SimpleNamespace(
+                expert_bank=NPUExpertBank(direct_hot.quant_info(), state.slot_valid, error),
+                error_status=error)
+            self.hot_groups = self._own("hot_groups", torch.zeros(
+                self.hot_count, dtype=torch.int64, device=self.device))
 
     def _own(self, name, value):
         self._owned[name] = value
@@ -95,7 +112,7 @@ class SingleTokenProgram:
         if self.cache_stats is not None:
             self.cache_stats.record_counts(needed.to(torch.int64), hit,
                                            self.state.update_enabled & (self.error == 0))
-        return source_indices, needed
+        return source_indices, needed, hit, safe_slots
 
     def _copy(self, source_indices, needed, context):
         # The compute frontier covers the preceding layer's FFN readers too.
@@ -130,7 +147,10 @@ class SingleTokenProgram:
             layout = self.layout.bind(dispatched, context)
             if layout.compact_rows != self.capacity or dispatched.raw.hidden_states_scale is not None:
                 raise ValueError("Single-token executor requires a six-row BF16 dispatch prefix")
-            source_indices, needed = self._prepare(layout, context)
+            source_indices, needed, hit, slots = self._prepare(layout, context)
+            if self.hot_bindings is not None:
+                return self._run_split(layer, dispatched, layout, source_indices,
+                                       needed, hit, slots, context)
             copy = self._copy(source_indices, needed, context)
             x = dispatched.raw.hidden_states[:self.capacity].clone()
             count = needed.sum()
@@ -145,3 +165,39 @@ class SingleTokenProgram:
             layout.output[:self.capacity].copy_(execution.output)
             combined = self.dispatcher.combine(self.layout.combine_input(layout, context), context)
             return self.dispatcher.finish(combined, context)
+
+    def _run_split(self, layer, dispatched, layout, source_indices, needed, hit, slots, context):
+        hits, misses, hot_order, miss_order = split_hit_miss(
+            needed, hit, slots, self.hot_count)
+        miss_valid = misses.gather(0, miss_order)
+        copy = self._copy(source_indices.gather(0, miss_order), miss_valid, context)
+        # Main-stream Hot readers touch no Execution slots: they may run while
+        # the copy stream stages misses into the six fixed Execution slots.
+        # Policy mutations remain at graph tail, after both FFNs and combine.
+        x = dispatched.raw.hidden_states[:self.capacity]
+        hit_count, miss_count = hits.sum(), misses.sum()
+        hot_x = x.index_select(0, hot_order)
+        hot_x.masked_fill_((self.rows >= hit_count).unsqueeze(1), 0)
+        self.hot_groups.zero_()
+        self.hot_groups.scatter_add_(0, slots, hits.to(torch.int64))
+        hot_input = NPUWaveInput(hot_x, None, self.hot_groups, layout.counts,
+                                 hit_count, layout.offsets[0], self.wave)
+        hot_run = self.runner(layer, hot_input, self.hot_bindings, context)
+        context.retain(hot_run)
+        context.wait_for(hot_run.read_done, context.compute_stream)
+        miss_x = x.index_select(0, miss_order)
+        miss_x.masked_fill_((self.rows >= miss_count).unsqueeze(1), 0)
+        self.valid.copy_(miss_valid)
+        miss_input = NPUWaveInput(miss_x, None, miss_valid.to(torch.int64), layout.counts,
+                                  miss_count, layout.offsets[0], self.wave)
+        context.wait_for(copy, context.compute_stream)
+        miss_run = self.runner(layer, miss_input, self.bindings, context)
+        context.retain(miss_run)
+        context.wait_for(miss_run.read_done, context.compute_stream)
+        # Both runners clear unwritten padding (including NaNs) before this
+        # inverse permutation; exactly one contribution exists per active row.
+        output = (hot_run.output.index_select(0, torch.argsort(hot_order))
+                  + miss_run.output.index_select(0, torch.argsort(miss_order)))
+        layout.output[:self.capacity].copy_(output)
+        combined = self.dispatcher.combine(self.layout.combine_input(layout, context), context)
+        return self.dispatcher.finish(combined, context)
