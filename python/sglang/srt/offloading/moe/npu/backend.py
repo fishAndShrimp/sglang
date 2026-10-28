@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, fields
 from functools import lru_cache
 from types import SimpleNamespace
@@ -200,6 +201,10 @@ class NpuMoEBackend(MoEBackend):
                 hot_generations=state.slot_generation,
                 error_status=error,
                 name=name,
+                fixed_destination_order=(
+                    valid is not None
+                    and os.environ.get("SGLANG_MOE_FIXED_DEST") == "1"
+                ),
             )
             if valid is not None:
                 result.expert_bank = NPUExpertBank(bank.quant_info(), valid, error)

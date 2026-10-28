@@ -13,6 +13,8 @@ from __future__ import annotations
 from contextlib import ExitStack
 from dataclasses import dataclass, fields
 from itertools import accumulate
+import logging
+import os
 
 import torch
 
@@ -91,6 +93,7 @@ class NPUDispatch:
     original_hidden_width: int
     handle: object
     valid_token_count: object = None
+    decode_row_bound: int | None = None
 
 
 @dataclass
@@ -102,6 +105,7 @@ class _Layout:
     row_ids: torch.Tensor
     selected: object = None
     prefill_offsets: tuple[int, ...] | None = None
+    compact_rows: int | None = None
 
 
 @dataclass(frozen=True)
@@ -134,11 +138,23 @@ class NPUOffloadDispatcher(MoEDispatcher):
         ):
             raise ValueError("Dispatcher requires the canonical int32 error scalar")
         self.error_status = error_status
+        self.compact_decode = os.environ.get("SGLANG_MOE_BS1_COMPACT") == "1"
+        self.global_bs1 = os.environ.get("SGLANG_MOE_GLOBAL_BS1") == "1"
+        if self.global_bs1 and not self.compact_decode:
+            raise ValueError("Global BS=1 experiment requires compact decode")
         self.dispatcher = experts.dispatcher
         inners = getattr(self.dispatcher, "_inners", None)
         if inners is not None and len(inners) != 1:
             raise ValueError("MoE offload does not support two-batch overlap")
         self.inner = inners[0] if inners is not None else self.dispatcher
+        self.small_ll = os.environ.get("SGLANG_MOE_BS1_LL_CAPACITY") == "1"
+        if self.small_ll:
+            if not self.global_bs1:
+                raise ValueError("Small DeepEP capacity requires the global BS=1 guard")
+            # Only this offloaded layer's low-latency implementation changes.
+            # NORMAL prefill and the shared communication-buffer allocation keep
+            # their existing capacities. All EP ranks bind the same capacity.
+            self.inner._low_latency_dispatcher.num_max_dispatch_tokens_per_rank = 1
         validate_native_environment()
 
     def _mask_routing(self, hidden_states, routing, context):
@@ -183,6 +199,8 @@ class NPUOffloadDispatcher(MoEDispatcher):
     def dispatch(self, hidden_states, routing, context):
         context.retain((self, hidden_states, routing))
         with _compute_scope(context, hidden_states.device):
+            if self.small_ll and context.phase is Phase.DECODE and hidden_states.shape[0] > 1:
+                raise ValueError("Small DeepEP capacity supports only bucket=1 decode")
             routing, count = self._mask_routing(hidden_states, routing, context)
             # Native dispatch_b joins its communication event/receive hook onto
             # this stream. Recording after dispatch therefore covers real D.
@@ -199,7 +217,45 @@ class NPUOffloadDispatcher(MoEDispatcher):
             # combine clears implementation.handle; retain the *value* now.
             context.retain(handle)
             ready = context.record_compute_completion()
-            result = NPUDispatch(raw, ready, hidden_states.shape[-1], handle, count)
+            row_bound = None
+            global_rows = getattr(
+                getattr(context, "forward_batch", None), "global_num_tokens_cpu", None
+            )
+            if (
+                self.compact_decode
+                and context.phase is Phase.DECODE
+                and hidden_states.shape[0] == 1
+                and _format_name(raw) == "deepep_ll"
+                and self.experts.moe_tp_size == 1
+                and global_rows is not None
+                and len(global_rows) == self.experts.moe_ep_size
+                and all(0 <= rows <= 1 for rows in global_rows)
+            ):
+                # The full-graph bucket is symmetric across EP ranks. Keep a
+                # bound for ONE PADDED TOKEN PER RANK, not just one global token:
+                # TP4/EP4, top-k=6 needs at most 24 received rows. This remains
+                # safe for all four requests that can replay this same graph.
+                # bind() also validates actual device counts before any GMM.
+                row_bound = self.experts.moe_ep_size * routing.topk_ids.shape[1]
+                if self.global_bs1:
+                    # Host admission checks actual global counts once per step.
+                    row_bound = routing.topk_ids.shape[1]
+            if (
+                self.compact_decode
+                and context.phase is Phase.DECODE
+                and self.experts.layer_id == 3
+                and not getattr(self, "_compact_logged", False)
+            ):
+                logging.getLogger(__name__).info(
+                    "MoE experimental compact decode: input=%s global_rows=%s "
+                    "receive=%s row_bound=%s",
+                    tuple(hidden_states.shape), global_rows,
+                    tuple(raw.hidden_states.shape), row_bound,
+                )
+                self._compact_logged = True
+            result = NPUDispatch(
+                raw, ready, hidden_states.shape[-1], handle, count, row_bound
+            )
             context.retain(result)
             return result
 
@@ -271,7 +327,8 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
     """
 
     def __init__(
-        self, local_experts, hidden_size, max_dispatch_rows, device, error_status
+        self, local_experts, hidden_size, max_dispatch_rows, device, error_status,
+        *, replay_enabled=None,
     ):
         if min(local_experts, hidden_size, max_dispatch_rows) <= 0:
             raise ValueError("NPU dispatch workspace capacities must be positive")
@@ -286,6 +343,8 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
         ):
             raise ValueError("Layout requires the canonical device error scalar")
         self.error_status = error_status
+        self.replay_enabled = replay_enabled
+        self.global_bs1 = os.environ.get("SGLANG_MOE_GLOBAL_BS1") == "1"
         self._owned = {}
         self._allocate(
             "input_bytes", (max_dispatch_rows * hidden_size * 2,), torch.uint8
@@ -356,6 +415,20 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
             counts = self._owned["counts"]
             counts.copy_(source)
             invalid = (counts < 0).any() | (counts.sum() > x.shape[0])
+            compact_rows = dispatched.decode_row_bound
+            if compact_rows is not None:
+                compact_rows = min(compact_rows, x.shape[0])
+                overflow = counts.sum() > compact_rows
+                if self.global_bs1 and self.replay_enabled is not None:
+                    # Capture/warmup fabricates a token on EVERY rank. Those
+                    # synthetic inputs need not satisfy global BS=1. Suppress
+                    # overflowing synthetic counts, but latch an error on any
+                    # real replay overflow. The existing device flag is false
+                    # for capture/warmup and true for serving decode.
+                    invalid |= overflow & self.replay_enabled
+                    counts.masked_fill_(overflow, 0)
+                else:
+                    invalid |= overflow
             self.error_status.bitwise_or_(invalid.to(torch.int32) * 64)
             counts.masked_fill_(self.error_status != 0, 0)
             offsets = self._owned["offsets"]
@@ -372,6 +445,7 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
                 output,
                 self._owned["rows"][: x.shape[0]],
                 prefill_offsets=prefill_offsets,
+                compact_rows=compact_rows,
             )
             context.retain(result)
             return result
@@ -404,7 +478,20 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
             raw = layout.dispatched.raw
             offset = layout.offsets[wave.local_start]
             count = layout.offsets[wave.local_end] - offset
-            if layout.prefill_offsets is not None:
+            compact = (
+                layout.compact_rows is not None
+                and wave.local_start == 0
+                and wave.local_end == self.local_experts
+            )
+            if compact:
+                # All experts are in one wave: their input is already a grouped
+                # prefix. No gather/reordering is necessary. Clear only the
+                # small padding prefix; retain the full native combine buffer.
+                x = raw.hidden_states[: layout.compact_rows].clone()
+                x.masked_fill_(
+                    (layout.row_ids[: layout.compact_rows] >= count).unsqueeze(1), 0
+                )
+            elif layout.prefill_offsets is not None:
                 start = layout.prefill_offsets[wave.local_start]
                 end = layout.prefill_offsets[wave.local_end]
                 x = raw.hidden_states[start:end]
@@ -424,7 +511,12 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
                 else:
                     if scale.numel() % rows:
                         raise ValueError("NPU scales must have a fixed per-row shape")
-                    if layout.prefill_offsets is not None:
+                    if compact:
+                        scale = scale.reshape(rows, -1)[: layout.compact_rows].clone()
+                        scale.view(torch.int8).masked_fill_(
+                            (layout.row_ids[: layout.compact_rows] >= count).unsqueeze(1), 0
+                        )
+                    elif layout.prefill_offsets is not None:
                         if not scale.is_contiguous():
                             raise ValueError("NPU activation scales must be contiguous")
                         scale = scale.view(rows, -1)[start:end]
@@ -450,14 +542,21 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
         if selected is None or selected.wave != wave:
             raise RuntimeError("Wave write must match its selected receive rows")
         target = layout.output
-        if layout.prefill_offsets is not None:
+        compact = (
+            layout.compact_rows is not None
+            and wave.local_start == 0
+            and wave.local_end == self.local_experts
+        )
+        if compact:
+            target = target[: layout.compact_rows]
+        elif layout.prefill_offsets is not None:
             start = layout.prefill_offsets[wave.local_start]
             end = layout.prefill_offsets[wave.local_end]
             target = target[start:end]
         if local_output.shape != target.shape:
             raise ValueError("Native FFN must preserve the selected receive shape")
         with _compute_scope(context, self.device):
-            if layout.prefill_offsets is not None:
+            if compact or layout.prefill_offsets is not None:
                 target.copy_(local_output)
             elif layout.output.shape[0]:
                 inverse = (layout.row_ids - selected.offset).clamp(
@@ -612,6 +711,7 @@ def build_npu_layer_programs(
             max_dispatch_rows,
             device,
             residency.error_status,
+            replay_enabled=residency.state.update_enabled,
         )
     else:
         layout = shared_layout

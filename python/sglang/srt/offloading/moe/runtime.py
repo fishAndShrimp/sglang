@@ -6,6 +6,7 @@ an accelerator graph or creates another expert-weight allocation.
 """
 
 import logging
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
 from threading import RLock, get_ident
@@ -17,6 +18,19 @@ from .interfaces import ForwardCompletion, RuntimeCapabilities
 from .resources import Allocation, AllocationLedger, ResourceKind, tensor_allocations
 
 logger = logging.getLogger(__name__)
+
+
+def _require_global_bs1(forward_batch):
+    """Experiment admission, using existing scheduler metadata, never D2H.
+
+    Deliberately fail closed for unsupported concurrency instead of executing a
+    six-row graph with larger inputs. This mode is for serial benchmarking.
+    """
+    counts = getattr(forward_batch, "original_global_num_tokens_cpu", None)
+    if counts is None or any(n < 0 for n in counts) or sum(counts) != 1:
+        raise RuntimeError(
+            f"SGLANG_MOE_GLOBAL_BS1 requires exactly one global decode token; got {counts}"
+        )
 
 
 class ExecutionContext:
@@ -418,6 +432,7 @@ class BoundMoERuntime:
         release=None,
     ):
         self.device_runtime = device_runtime
+        self.global_bs1 = os.environ.get("SGLANG_MOE_GLOBAL_BS1") == "1"
         self.residency = residency
         self.ops = residency_ops
         self.cache_updates = cache_updates
@@ -733,6 +748,12 @@ class BoundMoERuntime:
             has_global_work=has_global_work,
             current_phase=owner.phase,
         )
+        if (
+            self.global_bs1
+            and phase is Phase.DECODE
+            and has_global_work
+        ):
+            _require_global_bs1(forward_batch)
         stream = self.device_runtime.current_stream()
         token = owner.begin_forward(phase, stream)
         context = self._new_context(phase, stream=stream)

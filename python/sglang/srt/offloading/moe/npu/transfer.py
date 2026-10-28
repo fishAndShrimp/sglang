@@ -281,6 +281,7 @@ class MemFabricTransferBindings:
         error_status,
         max_batch_entries=256,
         name=None,
+        fixed_destination_order=False,
     ):
         import torch
 
@@ -316,6 +317,12 @@ class MemFabricTransferBindings:
             [0] * (self.destination_count + 1), torch.int64
         )
         self.mask = tensor([False] * capacity, torch.bool)
+        # Decode targets are constructed as 0..capacity-1 by residency. Checking
+        # equality with this fixed vector proves uniqueness without scatter-add.
+        self.fixed_destination_slots = (
+            tensor(list(range(capacity)), torch.int64)
+            if fixed_destination_order else None
+        )
         self.batches = []
         for nbytes in address_catalog.component_nbytes.values():
             component_batches = []
@@ -392,6 +399,20 @@ def _group_pack_copy(*args):
     return offload.group_pack_copy(*args)
 
 
+def _packed_destination_slots(mask, destination_indices):
+    """Stable selected prefix, shared by all components of one native batch.
+
+    Unique sort keys preserve the original selected-source order without
+    relying on stable-sort support. Inactive slots address catalog entry zero.
+    This replaces six independent pointer scatter-adds, not copy validation.
+    """
+    import torch
+
+    rows = torch.arange(mask.numel(), device=mask.device, dtype=torch.int32)
+    order = torch.argsort(rows + (~mask).to(torch.int32) * mask.numel())
+    return torch.where(mask, destination_indices, 0).gather(0, order)
+
+
 class MemFabricDeviceTransferOps(DeviceTransferOps):
     """Lower fixed device plans; callers supply complete-bundle bindings.
 
@@ -414,6 +435,9 @@ class MemFabricDeviceTransferOps(DeviceTransferOps):
         self.group_pack_copy = group_pack_copy or _group_pack_copy
         self.record_completion = record_completion or _npu_completion
         self.stream_context = stream_context or _npu_stream_context
+        import os
+
+        self.gather_pack = os.environ.get("SGLANG_MOE_GATHER_PACK") == "1"
 
     @staticmethod
     def _mask(plan, bindings):
@@ -439,10 +463,14 @@ class MemFabricDeviceTransferOps(DeviceTransferOps):
         invalid |= plan.count != plan.valid.sum(dtype=torch.int32)
         # Destination slot duplication is unsafe even when split into bounded
         # calls: publication cannot assign two expert identities to one slot.
-        bindings.destination_writes.zero_()
-        indices = torch.where(destination_in_range, plan.destination_slot + 1, 0)
-        bindings.destination_writes.scatter_add_(0, indices, plan.valid.to(torch.int64))
-        invalid |= (bindings.destination_writes[1:] > 1).any()
+        fixed_slots = getattr(bindings, "fixed_destination_slots", None)
+        if fixed_slots is not None:
+            invalid |= (plan.destination_slot != fixed_slots).any()
+        else:
+            bindings.destination_writes.zero_()
+            indices = torch.where(destination_in_range, plan.destination_slot + 1, 0)
+            bindings.destination_writes.scatter_add_(0, indices, plan.valid.to(torch.int64))
+            invalid |= (bindings.destination_writes[1:] > 1).any()
         bindings.error_status.bitwise_or_(invalid.to(torch.int32))
         bindings.mask.copy_(plan.valid & (bindings.error_status == 0))
 
@@ -482,10 +510,18 @@ class MemFabricDeviceTransferOps(DeviceTransferOps):
                     0, bindings.destination_count
                 )
                 from_host = plan.source_kind == int(CopySourceKind.HOST)
-                packed_indices = tuple(
-                    (bindings.mask[begin:end].to(torch.int64).cumsum(0) - 1).clamp_min(0)
-                    for begin, end, *_ in bindings.batches[0]
-                )
+                if self.gather_pack:
+                    packed_indices = tuple(
+                        _packed_destination_slots(
+                            bindings.mask[begin:end], destination_indices[begin:end]
+                        )
+                        for begin, end, *_ in bindings.batches[0]
+                    )
+                else:
+                    packed_indices = tuple(
+                        (bindings.mask[begin:end].to(torch.int64).cumsum(0) - 1).clamp_min(0)
+                        for begin, end, *_ in bindings.batches[0]
+                    )
                 for tables, batches in zip(bindings.tables, bindings.batches):
                     host_table, hot_table, destination_table = tables
                     for batch, packed_index in zip(batches, packed_indices):
@@ -505,17 +541,19 @@ class MemFabricDeviceTransferOps(DeviceTransferOps):
                             )
                         )
                         groups.copy_(selected)
-                        destinations = destination_table.gather(
-                            0,
-                            destination_indices[begin:end],
-                        )
                         # Native output j corresponds to the j-th selected i.
                         # Zero additions from inactive entries cannot overwrite an
                         # active destination, including entirely empty masks.
-                        dst.zero_()
-                        dst.scatter_add_(
-                            0, packed_index, torch.where(selected, destinations, 0)
-                        )
+                        if self.gather_pack:
+                            torch.gather(destination_table, 0, packed_index, out=dst)
+                        else:
+                            destinations = destination_table.gather(
+                                0, destination_indices[begin:end]
+                            )
+                            dst.zero_()
+                            dst.scatter_add_(
+                                0, packed_index, torch.where(selected, destinations, 0)
+                            )
                         packed.zero_()
                         status = self.group_pack_copy(
                             src, dst, lengths, scan, groups, packed, bindings.device
