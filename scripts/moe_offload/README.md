@@ -31,7 +31,7 @@ python3 scripts/moe_offload/test_requests.py --bench
 
 ## 保留的实现
 
-- 复用主线 dispatch、combine 和专家 GMM；固定执行区跨层复用，有效 token mask 排除 padding 和空 rank。
-- 融合搬运地址、长度和访问计数，缓存更新后统一发布地址表；跳过已校验为零的 offset，合并搬运。
+- 复用主线 dispatch、combine 和专家 GMM；固定容量执行区跨层复用，活跃专家的 W13/W2 和 scale 按相同顺序打包到前缀槽位，GMM 使用同步打包并清零尾部的逐专家 token 计数。有效 token mask 排除 padding 和空 rank。
+- 融合准备搬运地址、逐专家计数和访问统计，缓存更新后统一发布地址表；跳过已校验为零的 offset，各权重/scale 分别使用相同计数调用 `group_pack_copy`。
 - 独立流搬运 W13/W2，W2 与第一段专家计算重叠，第二段计算前等待完成。
 - 周期 LFU、固定槽缓存搬运、融合缓存更新及维护图重放。Hot 命中仍需 D2D 到执行区，miss 从 Host 搬入。

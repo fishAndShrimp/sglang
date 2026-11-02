@@ -1,4 +1,4 @@
-"""NPU integration check for sparse fixed-slot copies and dynamic graph replay.
+"""NPU integration check for packed expert copies and dynamic graph replay.
 
 Run on an idle NPU with the same MemFabric / native ACL environment as serving.
 Set MOE_NATIVE_ACL_DIR to the already-built native extension directory.
@@ -33,7 +33,8 @@ def main():
     assert module.weight.data_ptr() == original
     assert torch.equal(module.weight, torch.arange(16, dtype=torch.float32) + 100)
     n, h, components, size = int(os.environ.get("MOE_TEST_EXPERTS", "64")), 2, 6, 1024
-    cfg = {}
+    if not 8 <= n <= 256:
+        raise ValueError("MOE_TEST_EXPERTS must be in [8, 256]")
     names = tuple(
         f"{prefix}_{suffix}"
         for prefix in ("w13", "w2")
@@ -54,7 +55,7 @@ def main():
     owner = object.__new__(AscendOpsOffloader)
     owner.device, owner.ready, owner.local_experts, owner.hot_slots = device, True, n, h
     owner.copy_capacity = n
-    owner.cfg, owner.context = cfg, _Context()
+    owner.context = _Context()
     owner.catalog = SimpleNamespace(
         num_experts=n,
         key=lambda layer, e: e,
@@ -66,8 +67,6 @@ def main():
     owner.state.slot_to_key.copy_(torch.tensor([2, 6], device=device))
     owner.state.slot_valid.fill_(True)
     owner.state.update_enabled.fill_(True)
-    owner.ids = torch.arange(n, device=device)
-    owner.keys = {0: owner.ids}
     owner.error = torch.zeros((), dtype=torch.int32, device=device)
     owner.sources = torch.tensor(
         [
@@ -89,19 +88,26 @@ def main():
         device=device,
     )
     owner.lengths = torch.tensor(
-        [[size] * n for _ in range(components)], dtype=torch.uint32, device=device
+        [[size] * n for _ in range(components)], dtype=torch.int32, device=device
     )
-    owner.scan = torch.tensor(n, dtype=torch.uint32, device=device)
-    owner.packed = torch.zeros_like(owner.destinations)
     owner.quant_info = object()
     owner.execution = SimpleNamespace(
         tensors={name: destination[c] for c, name in enumerate(names)}
     )
     owner._init_copy_plan(names)
     owner._publish_sources()
+    descriptors = [d for phase in owner.fused_descriptors for d in phase]
+    assert len(descriptors) == 4
+    assert len({d[-1].data_ptr() for d in descriptors}) == 4
+    assert all(d[0].numel() == n and d[3].item() == n for d in descriptors)
+    assert all(d[2].dtype == d[3].dtype == torch.int32 for d in descriptors)
+    # Read GMM's counts on the compute stream before the W2 wait. W2's packed
+    # output buffers must not overwrite the count vector used by GMM1.
+    observed_counts = torch.empty(n, dtype=torch.int64, device=device)
 
     def run():
         owner.prepare_weights(0, inp)
+        observed_counts.copy_(inp.expert_tokens)
         owner.wait_for_w2(0)
 
     def reset_destination():
@@ -112,40 +118,77 @@ def main():
     counts = torch.zeros(n, dtype=torch.int64, device=device)
     inp = SimpleNamespace(expert_tokens=counts, group_list_type=1)
 
-    def verify(values, run):
+    def verify(values, run, *, cumulative=False):
         inp.expert_tokens = counts
+        inp.group_list_type = 0 if cumulative else 1
         reset_destination()
-        counts.copy_(torch.tensor(values, device=device))
+        raw = torch.tensor(values, device=device)
+        counts.copy_(raw.cumsum(0) if cumulative else raw)
         before = owner.state.step_access_count.cpu().clone()
         run()
         torch.npu.synchronize()
         assert torch.equal(
             owner.state.step_access_count.cpu(), before + torch.tensor(values)
         )
+        active = [e for e, count in enumerate(values) if count]
+        packed = torch.tensor(
+            [values[e] for e in active] + [0] * (n - len(active)),
+            dtype=torch.int64,
+        )
+        assert torch.equal(owner.packed_counts.cpu(), packed)
+        assert torch.equal(observed_counts.cpu(), packed)
+        assert inp.group_list_type == 1
         actual = destination.cpu()
-        for e, count in enumerate(values):
-            expected = host[:, e] if count else torch.full_like(host[:, e], 255)
+        for slot in range(n):
+            expected = (
+                host[:, active[slot]]
+                if slot < len(active)
+                else torch.full_like(host[:, 0], 255)
+            )
             expected = expected.clone()
             expected[2].zero_()
             expected[5].zero_()
-            assert torch.equal(actual[:, e], expected), (values, e)
+            assert torch.equal(actual[:, slot], expected), (values, slot)
         assert owner.error.item() == 0
+        if active:
+            # Exercise the real grouped-matmul consumer with packed weights and
+            # counts. Token rows retain original expert order; zero groups at
+            # the tail must never make GMM read stale execution weights.
+            x = torch.ones((sum(values), 32), dtype=torch.bfloat16, device=device)
+            for component in (0, 3):
+                weight = destination[component].view(n, 32, 32).to(torch.bfloat16)
+                weight.mul_(1 / 256)
+                output = torch.ops.npu.npu_grouped_matmul(
+                    x=[x],
+                    weight=[weight],
+                    split_item=2,
+                    group_list_type=1,
+                    group_type=0,
+                    group_list=owner.packed_counts,
+                    output_dtype=torch.bfloat16,
+                )[0]
+                expected = torch.tensor(
+                    [
+                        float(host[component, expert, 0]) / 8
+                        for expert, count in enumerate(values)
+                        for _ in range(count)
+                    ],
+                    dtype=torch.bfloat16,
+                ).unsqueeze(1).expand(-1, 32)
+                torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
 
     cases = [
         [0] * n,
         [0, 3, 1, 0, 0, 0, 7, 0] + [0] * (n - 8),
         [1] * n,
+        [0] * n,  # Dense -> empty must clear all packed count tails.
         [9, 0, 0, 0, 1, 0, 0, 1] + [0] * (n - 8),
+        [0] * (n - 1) + [7],
     ]
     for values in cases:
         verify(values, run)
-    inp.group_list_type = 0
-    inp.expert_tokens = counts
-    counts.copy_(torch.tensor(cases[1], device=device).cumsum(0))
-    reset_destination()
-    run()
-    torch.npu.synchronize()
-    assert torch.equal(destination[:, 1].cpu(), host[:, 1])
+    for values in cases:
+        verify(values, run, cumulative=True)
     inp.group_list_type = 1
     inp.expert_tokens = counts
     graph = torch.npu.NPUGraph()
@@ -177,16 +220,17 @@ def main():
     torch.npu.synchronize()
     assert owner.error.item() != 0
     assert not inp.expert_tokens.any().item()
+    assert not observed_counts.any().item()
     for c, name in enumerate(names):
         assert destination[c].eq(0 if name.endswith("_offset") else 255).all().item()
     print(
-        "PASS: load-context ownership, six-component H2D/Hot D2D, holes, empty rank, all experts, cumulative counts, changing graph replay routes, invalid-count masking",
+        "PASS: load-context ownership, packed H2D/Hot D2D weights/scales, GMM row order, zero offsets, empty rank, dense-to-empty tails, last expert, cumulative counts, changing graph replay routes, invalid-count masking",
         flush=True,
     )
     import triton
 
     from sglang.srt.offloading.moe.npu.small_batch_kernels import (
-        prepare_fixed_copies,
+        prepare_packed_copies,
     )
 
     width = n * 3
@@ -195,19 +239,16 @@ def main():
     raw = torch.arange(n, dtype=torch.int64, device=device) % 4
     out_counts = torch.empty_like(raw)
     out_sources = torch.empty(4 * n, dtype=torch.int64, device=device)
-    out_lengths = torch.empty(4 * n, dtype=torch.uint32, device=device)
     fault = torch.zeros_like(owner.error)
     enabled = torch.ones((), dtype=torch.bool, device=device)
-    prepare_fixed_copies[(1,)](
+    prepare_packed_copies[(1,)](
         raw,
         fault,
         enabled,
         access[n : 2 * n],
         table[:, n : 2 * n],
-        owner.lengths,
         out_counts,
         out_sources,
-        out_lengths,
         EXPERTS=n,
         SOURCE_STRIDE=width,
         START=0,
@@ -221,6 +262,7 @@ def main():
         out_sources.reshape(4, n).cpu(), table[[0, 1, 3, 4], n : 2 * n].cpu()
     )
     assert torch.equal(access[n : 2 * n], raw)
+    assert torch.equal(out_counts, raw)
     assert not access[:n].any().item() and not access[2 * n :].any().item()
     print("PASS: nonzero layer offset and strided published source table", flush=True)
     # Pool lifetime deliberately extends beyond graph lifetime until process exit.

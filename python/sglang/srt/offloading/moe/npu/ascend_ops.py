@@ -1,8 +1,8 @@
 """Expert weights for the native Ascend Ops runner.
 
-Communication and token layout stay in the mainline dispatcher/runner. One
-cross-layer bank has a fixed slot for every local expert. Device-side counts
-select Host/Hot copies; cache publication occurs only after the whole forward.
+Communication and token layout stay in the mainline dispatcher/runner. Active
+experts are stably packed into one cross-layer execution bank, together with
+their token counts. Cache publication occurs only after the whole forward.
 """
 
 import json
@@ -136,7 +136,7 @@ class AscendOpsOffloader(BaseOffloader):
         # counts need explicit chunking; never overrun the native metadata UB.
         if self.copy_capacity > 256:
             raise ValueError(
-                "Initial fixed-slot copy supports at most 256 local experts"
+                "Packed expert copies support at most 256 local experts"
             )
         self.hot_slots = int(self.catalog.num_experts * ratio)
         if self.hot_slots < 1:
@@ -246,7 +246,7 @@ class AscendOpsOffloader(BaseOffloader):
         )
         self.lengths = torch.tensor(
             [[self.format.layouts[n].nbytes] * self.copy_capacity for n in names],
-            dtype=torch.uint32,
+            dtype=torch.int32,
             device=self.device,
         )
         self._init_copy_plan(names)
@@ -313,7 +313,7 @@ class AscendOpsOffloader(BaseOffloader):
         self._capture_cache_tails()
         self.ready = True
         logger.info(
-            "Ascend expert offload: local=%d hot=%d/%d execution=%.3f GiB host=%.3f GiB; fixed-slot copies, W2 overlap=%s, fused metadata=%s",
+            "Ascend expert offload: local=%d hot=%d/%d execution=%.3f GiB host=%.3f GiB; packed expert copies, W2 overlap=%s, fused metadata=%s",
             self.local_experts,
             self.hot_slots,
             self.catalog.num_experts,
@@ -341,6 +341,8 @@ class AscendOpsOffloader(BaseOffloader):
     def _launch_copies(self, layer_id, copies):
         ready, first, second = self.copy_events[layer_id]
         compute = torch.npu.current_stream()
+        # This frontier also follows the previous layer's GMM2, so neither the
+        # execution weights nor their packed counts are overwritten while read.
         ready.record(compute)
         with torch.npu.stream(self.weight_copy_stream):
             self.weight_copy_stream.wait_event(ready)
@@ -368,65 +370,45 @@ class AscendOpsOffloader(BaseOffloader):
             s.layer_id: tuple(torch.npu.Event() for _ in range(3))
             for s in self.catalog.offloaded_layers
         }
-        self.fixed_groups = torch.ones(256, dtype=torch.int64, device=self.device)
-        self.copy_plans = []
-        chunk = max(1, 256 // self.copy_capacity)
-        for phase in phases:
-            plans = []
-            for begin in range(0, len(phase), chunk):
-                components = torch.tensor(
-                    phase[begin : begin + chunk], device=self.device
-                )
-                n = components.numel() * self.copy_capacity
-                plans.append(
-                    (
-                        tuple(phase[begin : begin + chunk]),
-                        components,
-                        self.destinations.index_select(0, components).flatten(),
-                        self.lengths.view(torch.int32)
-                        .index_select(0, components)
-                        .flatten()
-                        .view(torch.uint32),
-                        torch.tensor(n, dtype=torch.uint32, device=self.device),
-                        torch.arange(n, device=self.device),
-                        torch.zeros(n, dtype=torch.int64, device=self.device),
-                    )
-                )
-            self.copy_plans.append(plans)
-
         self.fused_components = tuple(selected)
         self.fused_sources = torch.empty(
-            len(selected) * self.copy_capacity,
+            (len(selected), self.copy_capacity),
             dtype=torch.int64,
             device=self.device,
         )
-        self.fused_lengths = torch.empty_like(self.fused_sources, dtype=torch.uint32)
-        self.fused_counts = torch.empty(
+        self.copy_groups = torch.empty(
             self.copy_capacity, dtype=torch.int64, device=self.device
         )
+        self.copy_scan = torch.tensor(
+            self.copy_capacity, dtype=torch.int32, device=self.device
+        )
         self.fused_descriptors = []
-        offset = 0
-        for phase in self.copy_plans:
+        for phase in phases:
             descriptors = []
-            for indices, _, destinations, _, scan, ids, packed in phase:
-                n = len(indices) * self.copy_capacity
+            for component in phase:
+                # Each component packs the same expert sequence into its own
+                # destination prefix. Flattening components together would put
+                # the scale's first output at slot M of the weight address table.
+                packed = torch.zeros_like(self.copy_groups)
                 descriptors.append(
                     (
-                        self.fused_sources[offset : offset + n],
-                        destinations,
-                        self.fused_lengths[offset : offset + n],
-                        scan,
-                        self.fixed_groups[:n],
+                        self.fused_sources[selected.index(component)],
+                        self.destinations[component],
+                        self.lengths[component],
+                        self.copy_scan,
+                        self.copy_groups,
                         packed,
                     )
                 )
-                offset += n
             self.fused_descriptors.append(descriptors)
+        # GMM reads the first W13 copy's output after the W13 event. All other
+        # calls own separate outputs, especially W2 copies overlapping GMM1.
+        self.packed_counts = self.fused_descriptors[0][0][-1]
 
     def _prepare_fused(self, layer_id, runner_input):
         import triton
 
-        from .small_batch_kernels import prepare_fixed_copies
+        from .small_batch_kernels import prepare_packed_copies
 
         counts = runner_input.expert_tokens
         if (
@@ -441,16 +423,14 @@ class AscendOpsOffloader(BaseOffloader):
             raise ValueError("Unsupported group list type")
         start = self.catalog.key(layer_id, 0)
         end = start + self.local_experts
-        prepare_fixed_copies[(1,)](
+        prepare_packed_copies[(1,)](
             counts,
             self.error,
             self.state.update_enabled,
             self.state.step_access_count[start:end],
             self.published_sources[:, start:end],
-            self.lengths,
-            self.fused_counts,
+            self.copy_groups,
             self.fused_sources,
-            self.fused_lengths,
             EXPERTS=self.local_experts,
             SOURCE_STRIDE=self.catalog.num_experts,
             START=0,
@@ -459,14 +439,18 @@ class AscendOpsOffloader(BaseOffloader):
             CUMULATIVE=runner_input.group_list_type == 0,
             BLOCK=triton.next_power_of_2(self.local_experts),
         )
-        runner_input.expert_tokens = self.fused_counts
         self._launch_copies(layer_id, self.fused_descriptors)
+        # Dispatch already sorts rows by local expert. Removing zero-token
+        # groups preserves row order, including the original combine metadata.
+        runner_input.expert_tokens = self.packed_counts
+        runner_input.group_list_type = 1
         return self.quant_info
 
     def _submit_copies(self, descriptors):
         for source, dst, lengths, scan, groups, packed in descriptors:
-            # Only the valid packed prefix is written, and no caller consumes
-            # its unused tail. No per-layer clearing of this output is needed.
+            # Native packing leaves the unused tail untouched. GMM consumes a
+            # fixed-capacity count vector, so stale groups must be cleared.
+            packed.zero_()
             status = _group_pack_copy(
                 source, dst, lengths, scan, groups, packed, self.device
             )

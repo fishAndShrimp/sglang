@@ -1,20 +1,18 @@
-"""NPU kernels for the fixed-slot offload path."""
+"""NPU metadata preparation for stably packed expert copies."""
 
 import triton
 import triton.language as tl
 
 
 @triton.jit
-def prepare_fixed_copies(
+def prepare_packed_copies(
     Counts,
     Error,
     Enabled,
     Access,
     Sources,
-    Lengths,
-    OutCounts,
+    Groups,
     OutSources,
-    OutLengths,
     EXPERTS: tl.constexpr,
     SOURCE_STRIDE: tl.constexpr,
     START: tl.constexpr,
@@ -33,20 +31,19 @@ def prepare_fixed_copies(
     bad = tl.sum(((count < 0) & (e < EXPERTS)).to(tl.int32), 0) > 0
     error = tl.load(Error) | bad.to(tl.int32)
     tl.store(Error, error)
-    tl.store(OutCounts + e, tl.where(error == 0, raw, 0), e < EXPERTS)
+    # group_pack_copy expects per-expert counts, never cumulative boundaries.
+    # Its packed output becomes GMM's count vector after the copy completes.
+    tl.store(Groups + e, tl.where(error == 0, count, 0), e < EXPERTS)
     enabled = tl.load(Enabled) != 0
     accesses = tl.load(Access + START + e, e < EXPERTS, 0)
-    tl.store(Access + START + e, accesses + tl.where(enabled, count, 0), e < EXPERTS)
-    needed = (count > 0) & (error == 0)
+    tl.store(
+        Access + START + e,
+        accesses + tl.where(enabled & (error == 0), count, 0),
+        e < EXPERTS,
+    )
     for position in tl.static_range(COMPONENT_COUNT):
         component = (position // 2) * 3 + position % 2 if SKIP_OFFSETS else position
         source = tl.load(
             Sources + component * SOURCE_STRIDE + START + e, e < EXPERTS, 0
         )
-        length = tl.load(Lengths + component * EXPERTS + e, e < EXPERTS, 0)
         tl.store(OutSources + position * EXPERTS + e, source, e < EXPERTS)
-        tl.store(
-            OutLengths + position * EXPERTS + e,
-            tl.where(needed, length, 0),
-            e < EXPERTS,
-        )
