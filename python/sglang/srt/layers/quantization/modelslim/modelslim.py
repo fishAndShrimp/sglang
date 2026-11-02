@@ -536,6 +536,12 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         self.quantization_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        storage = getattr(layer, "_moe_offload_storage", None)
+        if storage is not None:
+            storage.finalize()
+            # Preserve the mainline W8A8 communication quantization contract.
+            layer.w13_kernel._set_moe_dispatch_dtype(layer, "int8")
+            return
         layer.w13_scheme.process_weights_after_loading(layer)
         layer.w2_scheme.process_weights_after_loading(layer)
 
@@ -553,6 +559,17 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         the necessary parameters for the layer. See FusedMoEMethodBase for param
         details
         """
+        from sglang.srt.utils.offloader import get_offloader
+
+        owner = get_offloader()
+        if hasattr(owner, "prepare_layer") and owner.prepare_layer(
+            layer,
+            num_experts,
+            hidden_size,
+            intermediate_size_per_partition,
+            extra_weight_attrs,
+        ):
+            return
         layer.w13_scheme.create_weights(
             layer=layer,
             num_experts=num_experts,

@@ -504,7 +504,24 @@ class ModelRunner:
         self.shared_read_done_event: Optional[torch.cuda.Event] = None
 
         # CPU offload
-        set_offloader(create_offloader())
+        self.moe_offloader = None
+        if get_exec().offload.moe_offload_config and not self.is_draft_worker:
+            if (
+                get_exec().offload.cpu_offload_gb
+                or get_exec().offload.offload_group_size > 0
+            ):
+                raise ValueError(
+                    "Expert offload cannot share ownership with module offload"
+                )
+            from sglang.srt.offloading.moe.npu.ascend_ops import AscendOpsOffloader
+
+            self.moe_offloader = AscendOpsOffloader(
+                self.model_config.hf_config, get_exec().offload.moe_offload_config
+            )
+            set_offloader(self.moe_offloader)
+        else:
+            # Draft weights remain resident; target layers retain their owner.
+            set_offloader(create_offloader())
 
         self._weight_checker = WeightChecker(get_model=lambda: self.model)
 
@@ -1883,6 +1900,9 @@ class ModelRunner:
         )
 
         with (
+            self.moe_offloader.forward_scope(forward_batch)
+            if self.moe_offloader is not None
+            else contextlib.nullcontext(),
             canary_ctx,
             step_span_ctx,
             get_global_expert_distribution_recorder().with_forward_pass(

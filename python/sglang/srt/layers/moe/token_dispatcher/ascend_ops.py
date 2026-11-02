@@ -152,6 +152,7 @@ class AscendOpsDispatcher(BaseDispatcher):
         self.num_experts = moe_runner_config.num_experts
         self.num_local_experts = moe_runner_config.num_local_experts
         self.top_k = moe_runner_config.top_k
+        self._offload_layer = moe_runner_config.layer
         self.hidden_size = moe_runner_config.hidden_size
         self.quant_config: Optional[dict] = None
         self._ep_comm_name: Optional[str] = None
@@ -236,11 +237,18 @@ class AscendOpsDispatcher(BaseDispatcher):
         topk_weights = topk_weights.float()
         quant_mode = self._quant_mode("mc2", dtype_mode)
 
+        # Graph buckets may contain stale/padded rows on otherwise idle ranks.
+        # The offloader owns a stable device mask updated before graph replay.
         x_active_mask = None
+        owner = getattr(self._offload_layer, "_ascend_ops_offloader", None)
+        if owner is not None:
+            x_active_mask = owner.decode_row_mask(padded_bs)
         if padded_bs != num_tokens:
-            hidden_states, topk_ids, topk_weights, x_active_mask = self._pad_batch(
+            hidden_states, topk_ids, topk_weights, pad_mask = self._pad_batch(
                 hidden_states, topk_ids, topk_weights, num_tokens, padded_bs
             )
+            if x_active_mask is None:
+                x_active_mask = pad_mask
 
         mxfp8_args = (
             {"y_dtype": _TORCH_DTYPE_TO_ATEN[torch.float8_e4m3fn]}

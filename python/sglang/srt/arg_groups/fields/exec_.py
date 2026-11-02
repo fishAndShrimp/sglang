@@ -1076,6 +1076,9 @@ class ExecOffload(msgspec.Struct):
     # -------------------------------------------------------------------------
     # Offloading
     # -------------------------------------------------------------------------
+    moe_offload_config: A[
+        Optional[str], "Experimental Ascend Ops expert offload JSON configuration."
+    ] = None
     cpu_offload_gb: A[
         int,
         "How many GBs of RAM to reserve for CPU offloading.",

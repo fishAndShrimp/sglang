@@ -243,6 +243,9 @@ class AscendRunnerCore(MoeRunnerCore):
         """
         Execute the MoE layer using NPU‑specific grouped matmul ops.
         """
+        owner = getattr(self.config.layer, "_ascend_ops_offloader", None)
+        if owner is not None:
+            quant_info = owner.prepare_weights(self.config.layer.layer_id, runner_input)
         x = runner_input.hidden_states
         original_dtype = torch.float16 if x.dtype == torch.float16 else torch.bfloat16
         expert_tokens = runner_input.expert_tokens
@@ -293,6 +296,10 @@ class AscendRunnerCore(MoeRunnerCore):
                 hidden_states, pertoken_scale = self.activation._apply_activation(
                     hidden_states
                 )
+
+        # W2 transfer may overlap W13 projection and activation.
+        if owner is not None:
+            owner.wait_for_w2(self.config.layer.layer_id)
 
         # --- w2 (down) projection ---
         hidden_states = self.config.layer.w2_kernel.apply(

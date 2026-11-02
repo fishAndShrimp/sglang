@@ -1,0 +1,6 @@
+{
+  "cache_ratio": 0.28125,
+  "host_pool_gib": 64,
+  "offline_stats_path": "initial_profile.json",
+  "native_extension_directory": "/tmp/sglang-moe-native"
+}

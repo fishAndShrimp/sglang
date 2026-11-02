@@ -156,6 +156,12 @@ logger = logging.getLogger(__name__)
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
+    # The expert storage owner already performs bounded native conversion.
+    # Generic staging would copy its CPU parameter views to NPU and restore
+    # their checkpoint bytes over the newly repacked Host master afterwards.
+    if getattr(module, "_moe_offload_storage", None) is not None:
+        yield module
+        return
     if target_device.type == "cpu":
         yield module
         return
