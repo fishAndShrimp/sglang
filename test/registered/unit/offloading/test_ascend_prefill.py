@@ -853,6 +853,7 @@ class TestAscendPrefillIntegration(CustomTestCase):
         owner = object.__new__(AscendOpsOffloader)
         owner.ready, owner.step, owner.decode_active_rows = True, 0, None
         owner.weight_copy_stream = copy
+        owner.execution_keys = None
         owner.state = SimpleNamespace(
             step_access_count=torch.zeros(3, dtype=torch.int64),
             update_enabled=torch.tensor(False),
@@ -902,6 +903,17 @@ class TestAscendPrefillIntegration(CustomTestCase):
                 global_extend=global_extend, local_extend=local_extend, idle=idle
             ):
                 owner, context, banks, submitted = self._forward_owner()
+                # Decode identities become stale as soon as prefill overwrites
+                # the shared execution bank, including on locally idle ranks.
+                owner.execution_keys = torch.tensor([31, 32], dtype=torch.int64)
+                copy_keys = []
+                materialize = owner.prefill.host_ops.materialize_into
+
+                def snapshot_keys(plan, bank, stream):
+                    copy_keys.append(owner.execution_keys.clone())
+                    return materialize(plan, bank, stream)
+
+                owner.prefill.host_ops.materialize_into = snapshot_keys
                 batch = SimpleNamespace(
                     is_extend_in_batch=global_extend,
                     forward_mode=SimpleNamespace(
@@ -928,6 +940,13 @@ class TestAscendPrefillIntegration(CustomTestCase):
                 ):
                     with owner.forward_scope(batch):
                         self.assertEqual(submitted, [3, 4])
+                        self.assertEqual(len(copy_keys), 4)
+                        self.assertTrue(
+                            all(
+                                torch.equal(keys, torch.full_like(keys, -1))
+                                for keys in copy_keys
+                            )
+                        )
                         # Represents attention / resident MoE before the first
                         # offloaded dispatcher can consume a layer entry.
                         context.compute_stream.enqueue(
@@ -957,6 +976,8 @@ class TestAscendPrefillIntegration(CustomTestCase):
         ):
             with self.subTest(mode=name):
                 owner, context, _, submitted = self._forward_owner()
+                owner.execution_keys = torch.tensor([31, 32], dtype=torch.int64)
+                previous_keys = owner.execution_keys.clone()
                 batch = SimpleNamespace(
                     is_extend_in_batch=False,
                     forward_mode=SimpleNamespace(
@@ -979,6 +1000,7 @@ class TestAscendPrefillIntegration(CustomTestCase):
                         self.assertEqual(submitted, [])
                 self.assertEqual(submitted, [])
                 self.assertEqual(owner.step, 1)
+                self.assertTrue(torch.equal(owner.execution_keys, previous_keys))
 
     def test_initial_prefetch_failure_restores_hot_before_model_entry(self):
         """Failure in either Hot projection must restore decode's published bytes."""
@@ -1413,6 +1435,86 @@ class TestAscendPrefillIntegration(CustomTestCase):
             decoded = core.run(inputs, None, {})
         self.assertTrue(torch.equal(decoded.hidden_states, result.hidden_states))
         self.assertEqual(sequence, ["w13", "w2-ready", "w2"])
+
+    def test_activation_uses_logical_counts_for_prefill_and_direct_hot_decode(self):
+        """Physical decode slots must not leak into activation or later prefill."""
+        from sglang.srt.layers.moe.moe_runner import ascend
+
+        class CPUGroupedActivation(ascend.NPUSitu):
+            def _apply_activation(self, values, *, group_list, group_list_type):
+                if group_list_type == 0:
+                    counts = torch.diff(group_list, prepend=group_list.new_zeros(1))
+                elif group_list_type == 1:
+                    counts = group_list
+                else:
+                    raise AssertionError("Activation cannot consume physical slots")
+                multipliers = torch.repeat_interleave(torch.tensor([2.0, 5.0]), counts)
+                return values * multipliers[:, None], None
+
+        for prefill in (True, False):
+            for original_type in (0, 1):
+                with self.subTest(prefill=prefill, original_type=original_type):
+                    logical_counts = torch.tensor(
+                        [1, 3] if original_type == 0 else [1, 2], dtype=torch.int64
+                    )
+                    prepared_counts = (
+                        torch.tensor([1, 2], dtype=torch.int64)
+                        if prefill
+                        else torch.tensor([[1, 1], [5, 2], [0, 0]], dtype=torch.int64)
+                    )
+                    prepared_type = 1 if prefill else 2
+
+                    def prepare(layer, inputs):
+                        inputs.expert_tokens = prepared_counts
+                        inputs.group_list_type = prepared_type
+                        return None
+
+                    owner = SimpleNamespace(
+                        direct_hot=True,
+                        # A previous decode's logical counts are unrelated to
+                        # the next prefill, even though direct_hot stays enabled.
+                        fused_counts=(
+                            torch.tensor([3, 0], dtype=torch.int64)
+                            if prefill
+                            else logical_counts.clone()
+                        ),
+                        prepare_weights=prepare,
+                        wait_for_w2=lambda layer: None,
+                    )
+                    core = object.__new__(ascend.AscendRunnerCore)
+                    core.config = SimpleNamespace(
+                        layer=SimpleNamespace(
+                            layer_id=3,
+                            _ascend_ops_offloader=owner,
+                            w13_kernel=SimpleNamespace(
+                                apply=lambda q, x, c, **kw: x * 2
+                            ),
+                            w2_kernel=SimpleNamespace(
+                                apply=lambda q, x, c, **kw: x * 3
+                            ),
+                        )
+                    )
+                    core.activation = object.__new__(CPUGroupedActivation)
+                    inputs = SimpleNamespace(
+                        hidden_states=torch.ones((3, 1)),
+                        hidden_states_scale=None,
+                        expert_tokens=logical_counts,
+                        group_list_type=original_type,
+                    )
+                    with (
+                        patch.object(
+                            ascend, "get_is_extend_in_batch", return_value=prefill
+                        ),
+                        patch.object(ascend, "_uses_fused_gmm1", return_value=False),
+                    ):
+                        result = core.run(inputs, None, {})
+                    self.assertTrue(
+                        torch.equal(
+                            result.hidden_states, torch.tensor([[12.0], [30.0], [30.0]])
+                        )
+                    )
+                    self.assertIs(inputs.expert_tokens, prepared_counts)
+                    self.assertEqual(inputs.group_list_type, prepared_type)
 
     def test_prefill_dispatch_consumes_layer_entry_on_idle_rank(self):
         from sglang.srt.layers.moe.token_dispatcher.ascend_ops import (

@@ -114,7 +114,7 @@ class AscendRunnerInput(RunnerInput):
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]  # None for unquant
     expert_tokens: torch.Tensor
-    group_list_type: int  # 0 or 1 (passed to NPU ops)
+    group_list_type: int  # 0: cumulative, 1: counts, 2: physical-slot/count pairs
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -252,6 +252,7 @@ class AscendRunnerCore(MoeRunnerCore):
         """
         Execute the MoE layer using NPU‑specific grouped matmul ops.
         """
+        activation_group_type = runner_input.group_list_type
         owner = getattr(self.config.layer, "_ascend_ops_offloader", None)
         if owner is not None:
             quant_info = owner.prepare_weights(self.config.layer.layer_id, runner_input)
@@ -259,6 +260,12 @@ class AscendRunnerCore(MoeRunnerCore):
         original_dtype = torch.float16 if x.dtype == torch.float16 else torch.bfloat16
         expert_tokens = runner_input.expert_tokens
         group_list_type = runner_input.group_list_type
+        # Activation uses logical expert counts; GMM may address physical slots.
+        activation_tokens = expert_tokens
+        if owner is not None and group_list_type == 2:
+            activation_tokens = owner.fused_counts
+        else:
+            activation_group_type = group_list_type
 
         if owner is not None and get_is_extend_in_batch() and x.shape[0] == 0:
             return AscendRunnerOutput(hidden_states=x.to(original_dtype))
@@ -301,8 +308,8 @@ class AscendRunnerCore(MoeRunnerCore):
             ):
                 hidden_states, pertoken_scale = self.activation._apply_activation(
                     hidden_states,
-                    group_list=expert_tokens,
-                    group_list_type=group_list_type,
+                    group_list=activation_tokens,
+                    group_list_type=activation_group_type,
                 )
             else:
                 hidden_states, pertoken_scale = self.activation._apply_activation(

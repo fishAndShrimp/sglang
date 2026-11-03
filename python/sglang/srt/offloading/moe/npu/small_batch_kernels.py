@@ -1,4 +1,4 @@
-"""NPU metadata preparation for stably packed expert copies."""
+"""NPU metadata for packed decode, physical Hot slots, and whole-layer prefill."""
 
 import triton
 import triton.language as tl
@@ -75,3 +75,89 @@ def prepare_prefill_counts(
     accesses = tl.load(Access + e, inside, 0)
     enabled = tl.load(Enabled) != 0
     tl.store(Access + e, accesses + tl.where(enabled, count, 0), inside)
+
+
+@triton.jit
+def prepare_fixed_copies(
+    Counts,
+    Error,
+    Enabled,
+    Access,
+    Sources,
+    Lengths,
+    OutCounts,
+    OutSources,
+    OutLengths,
+    EXPERTS: tl.constexpr,
+    SOURCE_STRIDE: tl.constexpr,
+    START: tl.constexpr,
+    COMPONENT_COUNT: tl.constexpr,
+    SKIP_OFFSETS: tl.constexpr,
+    CUMULATIVE: tl.constexpr,
+    BLOCK: tl.constexpr,
+    DIRECT_HOT: tl.constexpr = False,
+    HotSlots=None,
+    HOT_CAPACITY: tl.constexpr = 0,
+    Groups=None,
+    ExecutionKeys=None,
+    KEY_START: tl.constexpr = 0,
+):
+    # Exactly one program owns the fault latch and this layer's access counters.
+    e = tl.arange(0, BLOCK)
+    raw = tl.load(Counts + e, e < EXPERTS, 0)
+    count = raw
+    if CUMULATIVE:
+        previous = tl.load(Counts + e - 1, (e > 0) & (e < EXPERTS), 0)
+        count = raw - previous
+    bad = tl.sum(((count < 0) & (e < EXPERTS)).to(tl.int32), 0) > 0
+    if DIRECT_HOT:
+        # Counts are packed through float32 below; reject inexact integers.
+        bad = bad | (tl.sum((count > 16777216).to(tl.int32), 0) > 0)
+        hot_slot = tl.load(HotSlots + KEY_START + e, e < EXPERTS, -1)
+        bad = bad | (
+            tl.sum(((hot_slot < -1) | (hot_slot >= HOT_CAPACITY)).to(tl.int32), 0) > 0
+        )
+    error = tl.load(Error) | bad.to(tl.int32)
+    tl.store(Error, error)
+    tl.store(OutCounts + e, tl.where(error == 0, raw, 0), e < EXPERTS)
+    enabled = tl.load(Enabled) != 0
+    accesses = tl.load(Access + START + e, e < EXPERTS, 0)
+    tl.store(
+        Access + START + e,
+        accesses + tl.where(enabled & (error == 0), count, 0),
+        e < EXPERTS,
+    )
+    needed = (count > 0) & (error == 0)
+    copy_needed = needed
+    if DIRECT_HOT:
+        hit = hot_slot >= 0
+        physical = tl.where(hit, EXPERTS + hot_slot, e)
+        position = tl.cumsum(needed.to(tl.int32), 0) - 1
+        pair = tl.arange(0, 2 * BLOCK)
+        match = (pair[:, None] // 2 == position[None, :]) & needed[None, :]
+        values = tl.where(
+            pair[:, None] % 2 == 0,
+            physical[None, :].to(tl.float32),
+            count[None, :].to(tl.float32),
+        )
+        packed = tl.sum(tl.where(match, values, 0), 1).to(tl.int64)
+        # The remaining descriptors stay zero from initialization. Clear the
+        # entire mutable prefix on every replay, including the empty case.
+        tl.store(Groups + pair, packed, pair < 2 * EXPERTS)
+        previous = tl.load(ExecutionKeys + e, e < EXPERTS, -1)
+        copy_needed = needed & ~hit & (previous != KEY_START + e)
+        # Hot reads must leave the Cold slot's identity untouched. Both weight
+        # copy phases finish before another layer can reuse this identity.
+        tl.store(ExecutionKeys + e, KEY_START + e, (e < EXPERTS) & copy_needed)
+    for position in tl.static_range(COMPONENT_COUNT):
+        component = (position // 2) * 3 + position % 2 if SKIP_OFFSETS else position
+        source = tl.load(
+            Sources + component * SOURCE_STRIDE + START + e, e < EXPERTS, 0
+        )
+        length = tl.load(Lengths + component * EXPERTS + e, e < EXPERTS, 0)
+        tl.store(OutSources + position * EXPERTS + e, source, e < EXPERTS)
+        tl.store(
+            OutLengths + position * EXPERTS + e,
+            tl.where(copy_needed, length, 0),
+            e < EXPERTS,
+        )

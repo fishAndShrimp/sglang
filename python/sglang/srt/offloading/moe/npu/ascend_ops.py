@@ -14,7 +14,13 @@ from pathlib import Path
 import torch
 
 from sglang.srt.distributed.parallel_state import get_moe_ep_group
-from sglang.srt.runtime_context import get_device, get_exec, get_parallel, get_schedule
+from sglang.srt.runtime_context import (
+    get_device,
+    get_exec,
+    get_parallel,
+    get_schedule,
+    get_spec,
+)
 from sglang.srt.utils.offloader import BaseOffloader
 
 from ...transfer import EventCompletion, TransferTicket
@@ -221,13 +227,41 @@ class AscendOpsOffloader(BaseOffloader):
             raise RuntimeError("Not all planned expert layers were intercepted")
         for storage in self.storages.values():
             storage.require_sealed()
-        self.execution = self.format.allocate_bank(
-            self.execution_slots, ResourceKind.EXECUTION_WEIGHTS, "ascend.execution"
+        # The physical-slot GMM API accepts at most 1024 weight groups.
+        # Extra execution slots retain the packed path: direct Hot addressing
+        # expects the Hot bank to start immediately after the local experts.
+        self.direct_hot = (
+            get_parallel().moe_ep_size == 4
+            and not get_spec().speculative_algorithm
+            and self.execution_slots == self.copy_capacity
+            and self.copy_capacity + self.hot_slots <= 1024
         )
-        self.hot = self.format.allocate_bank(
-            self.hot_slots, ResourceKind.HOT_WEIGHTS, "ascend.hot"
-        )
-        self.quant_info = self.execution.view(0, self.copy_capacity).quant_info()
+        self.execution_keys = None
+        if self.direct_hot:
+            self.union = self.format.allocate_bank(
+                self.copy_capacity + self.hot_slots,
+                ResourceKind.EXECUTION_WEIGHTS,
+                "ascend.union",
+            )
+            self.execution = self.union.view(0, self.copy_capacity)
+            self.hot = self.union.view(self.copy_capacity, self.hot_slots)
+            self.direct_groups = torch.zeros(
+                (self.copy_capacity + self.hot_slots, 2),
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self.execution_keys = torch.full(
+                (self.copy_capacity,), -1, dtype=torch.int64, device=self.device
+            )
+            self.quant_info = self.union.quant_info()
+        else:
+            self.execution = self.format.allocate_bank(
+                self.execution_slots, ResourceKind.EXECUTION_WEIGHTS, "ascend.execution"
+            )
+            self.hot = self.format.allocate_bank(
+                self.hot_slots, ResourceKind.HOT_WEIGHTS, "ascend.hot"
+            )
+            self.quant_info = self.execution.view(0, self.copy_capacity).quant_info()
         names = tuple(self.format.layouts)
         hosts = {
             name: tuple(
@@ -329,7 +363,8 @@ class AscendOpsOffloader(BaseOffloader):
         self._capture_cache_tails()
         self.ready = True
         logger.info(
-            "Ascend expert offload: local=%d hot=%d/%d execution=%.3f GiB host=%.3f GiB; packed expert copies, W2 overlap=%s, fused metadata=%s",
+            "Ascend expert offload: local=%d hot=%d/%d execution=%.3f GiB host=%.3f GiB; "
+            "W2 overlap=%s, fused metadata=%s, Hot direct/execution reuse=%s",
             self.local_experts,
             self.hot_slots,
             self.catalog.num_experts,
@@ -337,6 +372,7 @@ class AscendOpsOffloader(BaseOffloader):
             self.host_pool.used_bytes / 1024**3,
             True,
             True,
+            self.direct_hot,
         )
 
     def _retain(self, value):
@@ -394,6 +430,9 @@ class AscendOpsOffloader(BaseOffloader):
             for s in self.catalog.offloaded_layers
         }
         self.fused_components = tuple(selected)
+        if self.direct_hot:
+            self._init_direct_copy_plan(phases)
+            return
         self.fused_sources = torch.empty(
             (len(selected), self.copy_capacity),
             dtype=torch.int64,
@@ -428,10 +467,46 @@ class AscendOpsOffloader(BaseOffloader):
         # calls own separate outputs, especially W2 copies overlapping GMM1.
         self.packed_counts = self.fused_descriptors[0][0][-1]
 
+    def _init_direct_copy_plan(self, phases):
+        # Direct Hot GMM indices address fixed physical slots. Keep one copy
+        # group per slot, including zero-byte copies, so misses are never packed.
+        self.fixed_groups = torch.ones(256, dtype=torch.int64, device=self.device)
+        self.fused_sources = torch.empty(
+            len(self.fused_components) * self.copy_capacity,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self.fused_lengths = torch.empty_like(self.fused_sources, dtype=torch.uint32)
+        self.fused_counts = torch.empty(
+            self.copy_capacity, dtype=torch.int64, device=self.device
+        )
+        self.fused_descriptors = []
+        chunk = max(1, 256 // self.copy_capacity)
+        offset = 0
+        for phase in phases:
+            descriptors = []
+            for begin in range(0, len(phase), chunk):
+                components = torch.tensor(
+                    phase[begin : begin + chunk], device=self.device
+                )
+                count = components.numel() * self.copy_capacity
+                descriptors.append(
+                    (
+                        self.fused_sources[offset : offset + count],
+                        self.destinations.index_select(0, components).flatten(),
+                        self.fused_lengths[offset : offset + count],
+                        torch.tensor(count, dtype=torch.uint32, device=self.device),
+                        self.fixed_groups[:count],
+                        torch.zeros(count, dtype=torch.int64, device=self.device),
+                    )
+                )
+                offset += count
+            self.fused_descriptors.append(descriptors)
+
     def _prepare_fused(self, layer_id, runner_input):
         import triton
 
-        from .small_batch_kernels import prepare_packed_copies
+        from .small_batch_kernels import prepare_fixed_copies, prepare_packed_copies
 
         counts = runner_input.expert_tokens
         if (
@@ -446,34 +521,64 @@ class AscendOpsOffloader(BaseOffloader):
             raise ValueError("Unsupported group list type")
         start = self.catalog.key(layer_id, 0)
         end = start + self.local_experts
-        prepare_packed_copies[(1,)](
-            counts,
-            self.error,
-            self.state.update_enabled,
-            self.state.step_access_count[start:end],
-            self.published_sources[:, start:end],
-            self.copy_groups,
-            self.fused_sources,
-            EXPERTS=self.local_experts,
-            SOURCE_STRIDE=self.catalog.num_experts,
-            START=0,
-            COMPONENT_COUNT=len(self.fused_components),
-            SKIP_OFFSETS=True,
-            CUMULATIVE=runner_input.group_list_type == 0,
-            BLOCK=triton.next_power_of_2(self.local_experts),
-        )
+        if self.direct_hot:
+            prepare_fixed_copies[(1,)](
+                counts,
+                self.error,
+                self.state.update_enabled,
+                self.state.step_access_count[start:end],
+                self.published_sources[:, start:end],
+                self.lengths,
+                self.fused_counts,
+                self.fused_sources,
+                self.fused_lengths,
+                EXPERTS=self.local_experts,
+                SOURCE_STRIDE=self.catalog.num_experts,
+                START=0,
+                COMPONENT_COUNT=len(self.fused_components),
+                SKIP_OFFSETS=True,
+                CUMULATIVE=runner_input.group_list_type == 0,
+                BLOCK=triton.next_power_of_2(self.local_experts),
+                DIRECT_HOT=True,
+                HotSlots=self.state.key_to_slot,
+                HOT_CAPACITY=self.hot_slots,
+                Groups=self.direct_groups,
+                ExecutionKeys=self.execution_keys,
+                KEY_START=start,
+            )
+            runner_input.expert_tokens = self.direct_groups
+            runner_input.group_list_type = 2
+        else:
+            prepare_packed_copies[(1,)](
+                counts,
+                self.error,
+                self.state.update_enabled,
+                self.state.step_access_count[start:end],
+                self.published_sources[:, start:end],
+                self.copy_groups,
+                self.fused_sources,
+                EXPERTS=self.local_experts,
+                SOURCE_STRIDE=self.catalog.num_experts,
+                START=0,
+                COMPONENT_COUNT=len(self.fused_components),
+                SKIP_OFFSETS=True,
+                CUMULATIVE=runner_input.group_list_type == 0,
+                BLOCK=triton.next_power_of_2(self.local_experts),
+            )
+            # Dispatch already sorts rows by local expert. Removing zero-token
+            # groups preserves row order, including the original combine metadata.
+            runner_input.expert_tokens = self.packed_counts
+            runner_input.group_list_type = 1
         self._launch_copies(layer_id, self.fused_descriptors)
-        # Dispatch already sorts rows by local expert. Removing zero-token
-        # groups preserves row order, including the original combine metadata.
-        runner_input.expert_tokens = self.packed_counts
-        runner_input.group_list_type = 1
         return self.quant_info
 
     def _submit_copies(self, descriptors):
         for source, dst, lengths, scan, groups, packed in descriptors:
-            # Native packing leaves the unused tail untouched. GMM consumes a
-            # fixed-capacity count vector, so stale groups must be cleared.
-            packed.zero_()
+            # Packed GMM reads this fixed-capacity output, whose unused tail
+            # the copy kernel leaves untouched. Direct Hot GMM uses separate
+            # physical-slot metadata and never reads the copy output.
+            if not self.direct_hot:
+                packed.zero_()
             status = _group_pack_copy(
                 source, dst, lengths, scan, groups, packed, self.device
             )
@@ -589,6 +694,11 @@ class AscendOpsOffloader(BaseOffloader):
             # RuntimeContext's flag is installed later by _forward_raw; use this
             # batch's global phase, including locally idle/decode attention ranks.
             if forward_batch is not None and forward_batch.is_extend_in_batch:
+                # Prefill overwrites execution banks independently of decode's
+                # reuse keys. Invalidate before any prefetch, including on idle
+                # attention ranks, so the next decode cannot reuse stale bytes.
+                if self.execution_keys is not None:
+                    self.execution_keys.fill_(-1)
                 self.prefill.pipeline.begin_forward(self.context)
             yield
             self.prefill.pipeline.finish_forward(self.context)

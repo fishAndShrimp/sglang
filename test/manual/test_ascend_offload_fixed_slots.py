@@ -55,6 +55,7 @@ def main():
     owner = object.__new__(AscendOpsOffloader)
     owner.device, owner.ready, owner.local_experts, owner.hot_slots = device, True, n, h
     owner.copy_capacity = n
+    owner.direct_hot, owner.execution_keys = False, None
     owner.context = _Context()
     owner.catalog = SimpleNamespace(
         num_experts=n,
@@ -167,14 +168,18 @@ def main():
                     group_list=owner.packed_counts,
                     output_dtype=torch.bfloat16,
                 )[0]
-                expected = torch.tensor(
-                    [
-                        float(host[component, expert, 0]) / 8
-                        for expert, count in enumerate(values)
-                        for _ in range(count)
-                    ],
-                    dtype=torch.bfloat16,
-                ).unsqueeze(1).expand(-1, 32)
+                expected = (
+                    torch.tensor(
+                        [
+                            float(host[component, expert, 0]) / 8
+                            for expert, count in enumerate(values)
+                            for _ in range(count)
+                        ],
+                        dtype=torch.bfloat16,
+                    )
+                    .unsqueeze(1)
+                    .expand(-1, 32)
+                )
                 torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
 
     cases = [
@@ -230,6 +235,7 @@ def main():
     import triton
 
     from sglang.srt.offloading.moe.npu.small_batch_kernels import (
+        prepare_fixed_copies,
         prepare_packed_copies,
     )
 
@@ -265,6 +271,67 @@ def main():
     assert torch.equal(out_counts, raw)
     assert not access[:n].any().item() and not access[2 * n :].any().item()
     print("PASS: nonzero layer offset and strided published source table", flush=True)
+    # Physical Hot reads must not overwrite another layer's execution key.
+    raw.fill_(1)
+    fault.zero_()
+    slots = torch.full((width,), -1, dtype=torch.int64, device=device)
+    slots[2], slots[6] = 0, 1
+    keys = torch.full((n,), -1, dtype=torch.int64, device=device)
+    groups = torch.zeros((n + h, 2), dtype=torch.int64, device=device)
+    fixed_counts = torch.empty_like(raw)
+    fixed_sources = torch.empty(4 * n, dtype=torch.int64, device=device)
+    fixed_lengths = torch.empty(4 * n, dtype=torch.uint32, device=device)
+    graphs = {}
+    for layer in (0, 1):
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            prepare_fixed_copies[(1,)](
+                raw,
+                fault,
+                enabled,
+                access[layer * n : (layer + 1) * n],
+                table[:, layer * n : (layer + 1) * n],
+                owner.lengths,
+                fixed_counts,
+                fixed_sources,
+                fixed_lengths,
+                EXPERTS=n,
+                SOURCE_STRIDE=width,
+                START=0,
+                COMPONENT_COUNT=4,
+                SKIP_OFFSETS=True,
+                CUMULATIVE=False,
+                BLOCK=triton.next_power_of_2(n),
+                DIRECT_HOT=True,
+                HotSlots=slots,
+                HOT_CAPACITY=h,
+                Groups=groups,
+                ExecutionKeys=keys,
+                KEY_START=layer * n,
+            )
+        graphs[layer] = graph
+    torch.npu.synchronize()
+    keys.fill_(-1)
+    # Initial miss, same-layer reuse, cross-layer miss, Hot reads preserving
+    # layer one's slots, then reuse of those two preserved slots by layer one.
+    for layer, copies in ((0, n - 2), (0, 0), (1, n), (0, n - 2), (1, n - 2)):
+        graphs[layer].replay()
+        torch.npu.synchronize()
+        lengths = fixed_lengths.reshape(4, n).cpu().to(torch.int64)
+        assert int((lengths[0] > 0).sum()) == copies
+        assert torch.equal(lengths, lengths[:1].expand_as(lengths))
+        assert torch.equal(fixed_counts, raw)
+        assert torch.equal(
+            fixed_sources.reshape(4, n).cpu(),
+            table[[0, 1, 3, 4], layer * n : (layer + 1) * n].cpu(),
+        )
+        if layer == 0:
+            assert groups[2, 0].item() == n and groups[6, 0].item() == n + 1
+            assert lengths[:, [2, 6]].eq(0).all()
+        else:
+            assert torch.equal(keys.cpu(), torch.arange(n) + n)
+        assert fault.item() == 0
+    print("PASS: Hot slot addressing and cross-layer execution reuse", flush=True)
     # Pool lifetime deliberately extends beyond graph lifetime until process exit.
 
 
