@@ -1,8 +1,9 @@
 """Whole-layer eager prefill over two views of the native expert pools.
 
 Adapted from codex/moe-prefill-opt-20261102 (2dc7903d0b). Each bank is reused
-only after its final GMM reader. Borrowed Hot bytes are restored before decode
-or cache maintenance can consume the published cache addresses.
+only after its layer's combine, keeping the refill out of that return collective.
+Borrowed Hot bytes are restored before decode or cache maintenance can consume
+the published cache addresses.
 """
 
 
@@ -23,7 +24,7 @@ def whole_layer_bank_layout(local_experts, hot_slots, execution_slots):
 
 
 class LayerPrefetchPipeline:
-    """Ordered host submission with per-bank device reader dependencies."""
+    """Ordered host submission with per-bank device completion dependencies."""
 
     def __init__(self, layer_ids, *, load, copy_stream):
         self.layer_ids = tuple(layer_ids)
@@ -221,7 +222,10 @@ class AscendPrefillWeights:
         return self.quant_info[bank]
 
     def finish_layer(self, layer):
+        """Called after the dispatcher has enqueued the complete prefill combine."""
         owner = self.owner
+        # The compute stream already waits for the return collective and carries
+        # finalization. Gate bank reuse on that frontier, not just the last GMM.
         self.pipeline.retire(
             layer, owner.context.record_compute_completion(), owner.context
         )

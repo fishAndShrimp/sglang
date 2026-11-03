@@ -1,6 +1,7 @@
 """CPU stream contracts and interpreted Triton metadata; no NPU required."""
 
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -361,6 +362,82 @@ class TestPrefillAclDescriptors(CustomTestCase):
 
 
 class TestAscendPrefillIntegration(CustomTestCase):
+    def _combine_call(self, owner, layer, mode, values):
+        from sglang.srt.layers.moe.token_dispatcher.ascend_ops import (
+            AscendOpsCombineInput,
+            AscendOpsDispatcher,
+            _AllGatherState,
+            _AllToAllVState,
+            _MC2State,
+        )
+
+        dispatcher = object.__new__(AscendOpsDispatcher)
+        dispatcher._offload_layer = SimpleNamespace(layer_id=layer)
+        dispatcher.hidden_size = values.shape[1]
+        if owner is not None:
+            dispatcher._offload_layer._ascend_ops_offloader = owner
+        rows = values.shape[0]
+        if mode == "allgather":
+            state = _AllGatherState(object(), [rows], values.dtype)
+        elif mode == "alltoallv":
+            state = _AllToAllVState(
+                object(),
+                [rows],
+                [rows],
+                torch.ones((rows, 1)),
+                torch.zeros((rows, 1), dtype=torch.int32),
+                torch.arange(rows, dtype=torch.int32),
+                values.shape,
+            )
+        else:
+            dispatcher._ep_comm_name = "test"
+            dispatcher.ep_size = dispatcher.num_experts = 1
+            dispatcher.ep_rank = 0
+            dispatcher.moe_ascend_ops_config = SimpleNamespace(ll_combine_alg="")
+            state = _MC2State(max(0, rows - 1), None, None, None, None, None, None)
+        return dispatcher, AscendOpsCombineInput(values, state)
+
+    @contextmanager
+    def _combine_device(self, context, communication, trace):
+        """Model a collective's stream handoff, not the dispatcher's decisions."""
+
+        def collective(output, values, **kwargs):
+            trace.append("combine-submit")
+            communication.wait_stream(context.compute_stream)
+
+            def complete():
+                output.copy_(values)
+                trace.append("combine-done")
+
+            communication.enqueue(complete)
+            # Synchronous dist calls make their output available to subsequent
+            # work on the caller stream without waiting on the Python thread.
+            context.compute_stream.wait_stream(communication)
+
+        def finalize(values, *args, **kwargs):
+            context.compute_stream.enqueue(lambda: trace.append("finalize-done"))
+            return values
+
+        with (
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.dist.get_rank",
+                return_value=0,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.dist.all_to_all_single",
+                side_effect=collective,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.dist.reduce_scatter_tensor",
+                side_effect=collective,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.npu_moe_finalize_routing",
+                side_effect=finalize,
+            ),
+        ):
+            yield
+
     def _forward_owner(self, *, fail_second_load=False):
         from sglang.srt.offloading.moe.npu.ascend_ops import AscendOpsOffloader
 
@@ -549,45 +626,121 @@ class TestAscendPrefillIntegration(CustomTestCase):
         stream.wait_event.assert_called_once_with(event)
         owner.prefill.weights.assert_not_called()
 
-    def test_hot_restore_precedes_maintenance_and_following_decode(self):
-        from sglang.srt.offloading.moe.npu.ascend_ops import AscendOpsOffloader
+    def test_refill_waits_for_combine_submission_and_device_completion(self):
+        """Refilling a consumed bank must neither delay nor race its return collective."""
+        for mode in ("allgather", "alltoallv"):
+            for rows in (0, 2):
+                with self.subTest(mode=mode, received_rows=rows):
+                    owner, context, banks, submitted = self._forward_owner()
+                    owner.context = context
+                    communication, trace = _Stream(), []
+                    load = owner.prefill.host_ops.materialize_into
 
-        context, copy = _Context(), _Stream()
-        banks, observed = [torch.tensor([0]), torch.tensor([99])], []
-        owner = object.__new__(AscendOpsOffloader)
-        owner.ready, owner.step, owner.decode_active_rows = True, 3, None
-        owner.weight_copy_stream = copy
-        owner.state = SimpleNamespace(
-            step_access_count=torch.zeros(3, dtype=torch.int64),
-            update_enabled=torch.tensor(False),
-        )
-        owner.policy = SimpleNamespace(config=SimpleNamespace(update_interval=4))
-        owner._check_error = lambda: None
-        weights = object.__new__(AscendPrefillWeights)
-        owner.prefill, weights.owner = weights, owner
-        weights.borrows_hot, weights.hot_dirty = True, False
-        weights.banks, weights.plans = banks, {layer: layer for layer in (3, 4, 5)}
-        weights.restore_plan = SimpleNamespace(
-            valid=torch.tensor([True]), count=torch.zeros((), dtype=torch.int32)
-        )
-        weights.restore_bindings = object()
+                    def tracked_load(layer, bank, stream):
+                        trace.append(f"submit-{layer}")
+                        load(layer, bank, stream)
+                        stream.enqueue(lambda: trace.append(f"copy-{layer}"))
+                        return SimpleNamespace(completion=_Completion(stream.tail))
 
-        def load(layer, bank, stream):
-            stream.enqueue(lambda: bank.fill_(layer))
-            return SimpleNamespace(completion=_Completion(stream.tail))
+                    owner.prefill.host_ops.materialize_into = tracked_load
+                    owner.prefill.pipeline.begin_forward(context)
+                    owner.start_prefill_layer(3)
+                    bank = owner.prefill.pipeline.acquire(3, context)
+                    values = torch.zeros((rows, 2))
+                    context.compute_stream.enqueue(
+                        lambda: values.fill_(banks[bank].item())
+                    )
+                    trace.clear()
+                    dispatcher, inputs = self._combine_call(owner, 3, mode, values)
+                    with self._combine_device(context, communication, trace):
+                        result = dispatcher.combine(inputs)
+
+                    self.assertEqual(submitted, [3, 4, 5])
+                    self.assertLess(
+                        trace.index("combine-submit"), trace.index("submit-5")
+                    )
+                    self.assertFalse(communication.tail.done)
+                    self.assertEqual(owner.prefill.pipeline.current, 1)
+                    # Adversarial scheduling: run the copy stream first. Its new
+                    # H2D must still execute the queued return communication
+                    # before overwriting bank A, including on an empty rank.
+                    owner.weight_copy_stream.drain()
+                    self.assertTrue(communication.tail.done)
+                    self.assertLess(trace.index("combine-done"), trace.index("copy-5"))
+                    if mode == "alltoallv":
+                        self.assertLess(
+                            trace.index("finalize-done"), trace.index("copy-5")
+                        )
+                    self.assertTrue(torch.equal(result, torch.full_like(values, 3)))
+                    self.assertEqual(banks[0].item(), 5)
+
+    def test_combine_failure_leaves_bank_owned_by_current_layer(self):
+        """A failed return collective must not advance or overwrite its layer bank."""
+        owner, context, _, submitted = self._forward_owner()
+        owner.context = context
+        owner.prefill.pipeline.begin_forward(context)
+        owner.start_prefill_layer(3)
+        owner.prefill.pipeline.acquire(3, context)
+        copy_tail = owner.weight_copy_stream.tail
+        dispatcher, inputs = self._combine_call(
+            owner, 3, "alltoallv", torch.ones((2, 2))
+        )
+        with patch(
+            "sglang.srt.layers.moe.token_dispatcher.ascend_ops.dist.all_to_all_single",
+            side_effect=RuntimeError("collective enqueue failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "collective enqueue failed"):
+                dispatcher.combine(inputs)
+        self.assertEqual(owner.prefill.pipeline.current, 0)
+        self.assertTrue(owner.prefill.pipeline.started)
+        self.assertEqual(submitted, [3, 4])
+        self.assertIs(owner.weight_copy_stream.tail, copy_tail)
+
+    def test_decode_and_resident_combine_do_not_require_prefill_session(self):
+        from sglang.srt.layers.moe.token_dispatcher import ascend_ops
+
+        def unexpected_retire(layer):
+            raise AssertionError("decode cannot consume a prefill bank")
+
+        owner = SimpleNamespace(prefill=SimpleNamespace(finish_layer=unexpected_retire))
+        values = torch.tensor([[1.0, 2.0], [99.0, 99.0]])
+        dispatcher, inputs = self._combine_call(owner, 3, "mc2", values)
+        with patch.object(
+            ascend_ops,
+            "torch_npu",
+            SimpleNamespace(npu_moe_distribute_combine_v2=lambda x, *a, **kw: x * 2),
+            create=True,
+        ):
+            result = dispatcher.combine(inputs)
+        self.assertTrue(torch.equal(result, torch.tensor([[2.0, 4.0]])))
+
+        for mode in ("allgather", "alltoallv"):
+            with self.subTest(resident_mode=mode):
+                context, communication, trace = _Context(), _Stream(), []
+                dispatcher, inputs = self._combine_call(None, 0, mode, values)
+                with self._combine_device(context, communication, trace):
+                    result = dispatcher.combine(inputs)
+                context.compute_stream.drain()
+                self.assertTrue(torch.equal(result, values))
+
+    def test_hot_restore_follows_combine_and_precedes_maintenance_and_decode(self):
+        """Borrowed Hot must survive return communication, then be ready for cache users."""
+        owner, context, banks, _ = self._forward_owner()
+        owner.step = 3
+        weights, communication, trace, observed = owner.prefill, _Stream(), [], []
 
         def restore(plan, bindings, stream):
-            stream.enqueue(lambda: banks[1].fill_(99))
+            def complete():
+                banks[1].fill_(99)
+                trace.append("restore")
 
-        weights.host_ops = SimpleNamespace(materialize_into=load)
+            stream.enqueue(complete)
+
         weights.restore_ops = SimpleNamespace(materialize_into=restore)
-        weights.pipeline = LayerPrefetchPipeline(
-            (3, 4, 5), load=weights._load, copy_stream=copy
-        )
 
         def check_hot():
             self.assertEqual(banks[1].item(), 99)
-            observed.append("cache")
+            trace.append("cache")
 
         owner.cache_tail_graphs = {
             due: SimpleNamespace(
@@ -606,17 +759,32 @@ class TestAscendPrefillIntegration(CustomTestCase):
                 SimpleNamespace(current_stream=lambda: context.compute_stream),
                 create=True,
             ),
+            self._combine_device(context, communication, trace),
         ):
-            batch = SimpleNamespace(is_extend_in_batch=True)
-            with owner.forward_scope(batch):
+            with owner.forward_scope(SimpleNamespace(is_extend_in_batch=True)):
                 for layer in (3, 4, 5):
                     owner.start_prefill_layer(layer)
                     bank = weights.pipeline.acquire(layer, context)
+                    values = torch.zeros((1, 2))
                     context.compute_stream.enqueue(
-                        lambda bank=bank: observed.append(banks[bank].item())
+                        lambda bank=bank, values=values: values.fill_(
+                            banks[bank].item()
+                        )
                     )
-                    weights.finish_layer(layer)
-            self.assertEqual(observed, [3, 4, 5, "cache"])
+                    dispatcher, inputs = self._combine_call(
+                        owner, layer, "alltoallv", values
+                    )
+                    result = dispatcher.combine(inputs)
+                    context.compute_stream.enqueue(
+                        lambda result=result: observed.append(result[0, 0].item())
+                    )
+            self.assertEqual(observed, [3, 4, 5])
+            self.assertEqual(trace.count("combine-done"), 3)
+            self.assertGreater(
+                trace.index("restore"),
+                max(i for i, item in enumerate(trace) if item == "finalize-done"),
+            )
+            self.assertLess(trace.index("restore"), trace.index("cache"))
             self.assertFalse(weights.hot_dirty)
             self.assertIsNone(weights.pipeline.invocation_id)
             self.assertFalse(owner.state.update_enabled.item())
@@ -626,7 +794,7 @@ class TestAscendPrefillIntegration(CustomTestCase):
             context = _Context()
             with owner.forward_scope():
                 context.compute_stream.enqueue(check_hot)
-            self.assertEqual(observed, [3, 4, 5, "cache", "cache", "cache"])
+            self.assertEqual(trace[-3:], ["cache", "cache", "cache"])
 
     def test_allgather_keeps_native_capacity_without_host_count_read(self):
         from sglang.srt.layers.moe.moe_runner.ascend import _pre_permute_allgather
@@ -666,7 +834,7 @@ class TestAscendPrefillIntegration(CustomTestCase):
         self.assertEqual(output.forward_state.num_routes, 4)
         self.assertEqual(inputs.expert_tokens.tolist(), [1, 1])
 
-    def test_empty_receive_retires_bank_without_launching_ffn(self):
+    def test_empty_receive_leaves_bank_for_combine_without_launching_ffn(self):
         from sglang.srt.layers.moe.moe_runner.ascend import AscendRunnerCore
 
         retired = []
@@ -691,9 +859,9 @@ class TestAscendPrefillIntegration(CustomTestCase):
             result = core.run(inputs, None, {})
         self.assertEqual(tuple(result.hidden_states.shape), (0, 4))
         self.assertEqual(result.hidden_states.dtype, torch.bfloat16)
-        self.assertEqual(retired, [3])
+        self.assertEqual(retired, [])
 
-    def test_ffn_retires_weights_only_after_both_projections(self):
+    def test_ffn_preserves_results_without_refilling_before_combine(self):
         from sglang.srt.layers.moe.moe_runner.ascend import AscendRunnerCore
 
         sequence = []
@@ -743,7 +911,7 @@ class TestAscendPrefillIntegration(CustomTestCase):
         self.assertTrue(
             torch.equal(result.hidden_states, inputs.hidden_states.relu() * 6)
         )
-        self.assertEqual(sequence, ["w13", "w2-ready", "w2", "retired"])
+        self.assertEqual(sequence, ["w13", "w2-ready", "w2"])
 
         # The same runner must not retire/overwrite banks during Decode.
         sequence.clear()

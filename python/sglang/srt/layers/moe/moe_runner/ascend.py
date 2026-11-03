@@ -253,7 +253,6 @@ class AscendRunnerCore(MoeRunnerCore):
         group_list_type = runner_input.group_list_type
 
         if owner is not None and get_is_extend_in_batch() and x.shape[0] == 0:
-            owner.prefill.finish_layer(self.config.layer.layer_id)
             return AscendRunnerOutput(hidden_states=x.to(original_dtype))
 
         w13_kernel = self.config.layer.w13_kernel
@@ -316,8 +315,6 @@ class AscendRunnerCore(MoeRunnerCore):
             weight_prefix="w2",
             group_list_type=group_list_type,
         )
-        if owner is not None and get_is_extend_in_batch():
-            owner.prefill.finish_layer(self.config.layer.layer_id)
         return AscendRunnerOutput(hidden_states=hidden_states)
 
 

@@ -199,12 +199,20 @@ class AscendOpsDispatcher(BaseDispatcher):
             )
         state = combine_input.forward_state
         if isinstance(state, _AllGatherState):
-            return self._combine_allgather(combine_input.hidden_states, state)
-        if isinstance(state, _AllToAllVState):
-            return self._combine_alltoallv(combine_input.hidden_states, state)
-        if isinstance(state, _MC2State):
+            output = self._combine_allgather(combine_input.hidden_states, state)
+        elif isinstance(state, _AllToAllVState):
+            output = self._combine_alltoallv(combine_input.hidden_states, state)
+        elif isinstance(state, _MC2State):
             return self._combine_mc2(combine_input.hidden_states, state)
-        raise TypeError(f"unknown Ascend Ops forward state: {type(state)!r}")
+        else:
+            raise TypeError(f"unknown Ascend Ops forward state: {type(state)!r}")
+
+        owner = getattr(self._offload_layer, "_ascend_ops_offloader", None)
+        if owner is not None:
+            # Submit the return collective and finalization before flushing the
+            # ACL host queue. The refill also waits for this combine on device.
+            owner.prefill.finish_layer(self._offload_layer.layer_id)
+        return output
 
     # Decode (MC2 low latency)
 

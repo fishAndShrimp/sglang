@@ -40,6 +40,7 @@ class TestAscendOpsConfig(CustomTestCase):
 class TestAscendOpsDispatcherContracts(CustomTestCase):
     def _dispatcher_for_quant_mode(self, quant_config=None):
         dispatcher = AscendOpsDispatcher.__new__(AscendOpsDispatcher)
+        dispatcher._offload_layer = None
         dispatcher.quant_config = quant_config or {}
         return dispatcher
 

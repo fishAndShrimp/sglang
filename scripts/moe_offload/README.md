@@ -33,12 +33,12 @@ python3 scripts/moe_offload/test_requests.py --bench
 
 ## 保留的实现
 
-- Prefill 适配自 [codex/moe-prefill-opt-20261102](https://github.com/pachi-33/sglang/commit/2dc7903d0bebe6f003db2149f8a612e641a5e190)：在每次全局 prefill forward 的入口、任何模型层计算之前提交前两个卸载层的完整权重，以两个 bank 的整层视图交替执行；第 i 层 GMM2 的 reader event 记录后，向同一 bank 提交第 i+2 个卸载层的预取，覆盖前必须等待 reader 完成。每层仍使用原生一次 dispatch、一次 FFN、一次 combine，不按专家 wave 拆分。dispatch 入口只消费已启动的预取会话，不再延迟启动搬运。
+- Prefill 适配自 [codex/moe-prefill-opt-20261102](https://github.com/pachi-33/sglang/commit/2dc7903d0bebe6f003db2149f8a612e641a5e190)：在每次全局 prefill forward 的入口、任何模型层计算之前提交前两个卸载层的完整权重，以两个 bank 的整层视图交替执行；第 i 层的回传通信及最终合并提交后，才向同一 bank 提交第 i+2 个卸载层的预取，拷贝流等待该层 combine 完成事件后才能覆盖 bank。这样补充预取的 ACL host 提交不再挡在当前层 combine 前，新启动的 H2D 也不与该层 combine 重叠。此前已提交的 i+1 层预取仍可能在途；不额外让 combine 等待整个拷贝流。每层仍使用原生一次 dispatch、一次 FFN、一次 combine，不按专家 wave 拆分。dispatch 入口只消费已启动的预取会话，不再延迟启动搬运。
 - Prefill 是否启动由本轮 batch 的全局 `is_extend_in_batch` 判断；本地 IDLE / DECODE rank 仍参与其他 rank 的 prefill。不会读取上一轮残留的 RuntimeContext phase。每个 chunk 都重新全量预取；Decode / TARGET_VERIFY / 全局 IDLE 不启动 prefill 搬运，decode 缓存与图路径沿用原实现。
 - Prefill 的 ACL 完整 bundle 描述符在装配时准备，保留 W13/W2、scale 和 offset。AllToAllV 直接使用紧凑接收布局；AllGather 保留原生 payload / scale 容量及 post-permute 的无效行屏蔽，不增加逐层 `.sum().item()` 同步。空接收跳过 FFN，但继续处理预取依赖和通信。
 - Prefill 用一次 Triton 操作完成计数格式转换、错误屏蔽和访问统计，GMM 按完整本地专家顺序读取 bank。没有额外的专家打包、激活重排或重复量化；FFN 使用实验分支现有的 W13 → 激活 → W2 实现。
 - 每 rank 有 E 个本地专家时，A 使用 Execution 前 E 槽；B 优先借用 Hot 前 E 槽。Hot 不足 E 时，需在 offload JSON 显式设置 `execution_slots >= 2*E`，由 Execution 后 E 槽提供 B。默认 `execution_slots=E`，容量不足直接报错，不额外分配权重池。
-- 最后一个 prefill FFN 结束后回填借用的 Hot 前缀，异常退出也会在清理前回填并排空流。仅恢复被借用的槽位，保留缓存 owner / generation / LFU 状态，随后才执行缓存维护与 decode。
+- 最后一个 prefill combine 之后回填借用的 Hot 前缀，异常退出也会在清理前回填并排空流。仅恢复被借用的槽位，保留缓存 owner / generation / LFU 状态，随后才执行缓存维护与 decode。
 - Decode 保留固定执行区、活跃专家 W13/W2 和 scale 的稳定打包与清零尾部计数。有效 token mask 排除 padding 和空 rank。
 - 融合准备搬运地址、逐专家计数和访问统计，缓存更新后统一发布地址表；跳过已校验为零的 offset，各权重/scale 分别使用相同计数调用 `group_pack_copy`。
 - 独立流搬运 W13/W2，W2 与第一段专家计算重叠，第二段计算前等待完成。
@@ -49,5 +49,7 @@ python3 scripts/moe_offload/test_requests.py --bench
 CPU 契约测试：`python3 test/registered/unit/offloading/test_ascend_prefill.py`，覆盖 bank 容量、异步读写顺序、跨 forward event、逐专家计数、部分拷贝失败后的 Hot 恢复和 Prefill→Decode 切换。计数内核使用 Triton 的 CPU 解释模式执行生产函数；需要安装 Triton / NumPy。
 
 原适配在隔离 serving / NPU 依赖的 CPU harness 中通过了 21 项 UT。本次补充 forward 入口提前提交、全局 prefill 的 IDLE / DECODE rank、残留 phase 隔离和首次搬运部分失败的恢复回归；测试先在修复前复现入口未预取的问题，再验证修复。使用真实 runner / dispatcher / offloader Python 方法，通信、设备流和 FFN 内核由测试实现模拟；完整 serving 与原生计数内核仍按目标环境验证。
+
+combine 后推进预取的改动在隔离依赖的 CPU harness 中通过 19 项契约测试，覆盖正常/空 FFN 不提前退役、AllToAllV/AllGather 提交后才补充预取、独立通信流及最终合并完成前不覆盖 bank、combine 异常不推进、Hot 恢复先于缓存维护，以及 decode/常驻层不进入 prefill 生命周期。对应回归在旧实现上失败。此验证不包含原生 Triton 计数内核或 NPU 性能测试。
 
 本地主机没有 `torch_npu`，原生 ACL H2D、NZ bank 视图、AllToAllV / AllGather 数值、空 rank、prefill→decode 图重放与 TTFT 仍需在目标 NPU 验收。可继续使用上述请求检查脚本；请同时对比 offload 关闭时的输出与真实设备时间线。
