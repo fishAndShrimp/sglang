@@ -5,6 +5,7 @@
 #include <pybind11/stl.h>
 #include "torch_npu/csrc/core/npu/NPUGuard.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
+#include "torch_npu/csrc/framework/OpCommand.h"
 
 namespace py = pybind11;
 using sglang::moe::Batch;
@@ -24,11 +25,17 @@ void submit(const std::shared_ptr<Batch>& batch, int64_t expected_stream_id) {
   if (stream.id() != expected_stream_id) {
     throw std::runtime_error("ACL submit requires the caller's current torch_npu stream");
   }
-  // stream(true) drains host queue entries (including prior event waits) into
-  // the device stream. It does NOT wait for device execution. The pipeline owns
-  // exclusive submission rights to this stream until this function returns.
-  // The following Python event.record is submitted after this direct ACL call.
-  batch->submit(stream.stream(true));
+  // Queue the ACL launch between the preceding wait and following ready event.
+  // Direct submission with stream(false) would overtake queued waits; flushing
+  // with stream(true) would block the model thread on the host launch queue.
+  // Capture the stream and descriptor owner now: the queue worker has different
+  // thread-local stream state and may execute after this function returns.
+  const auto acl_stream = stream.stream(false);
+  at_npu::native::OpCommand::RunOpApi(
+      "SglangMoePrefillH2D", [batch, acl_stream]() -> int {
+        batch->submit(acl_stream);
+        return ACL_SUCCESS;
+      });
 }
 
 void validate_host_range(uint64_t address, uint64_t nbytes) {
@@ -116,8 +123,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       .def(py::init<const std::vector<uint64_t>&, const std::vector<uint64_t>&,
                     const std::vector<size_t>&, const std::vector<size_t>&, uint32_t,
                     const std::string&, uint32_t>());
-  // No Python objects are touched while GIL is released. Caller retains Batch
-  // and every allocation owner before submit, through completion or failure drain.
+  // No Python objects are touched in the queue worker or while GIL is released.
+  // The queued handler retains Batch; the caller retains allocation owners
+  // through device completion, including asynchronously reported failures.
   module.def("submit", &submit, py::call_guard<py::gil_scoped_release>());
   module.def("register_host", &register_host, py::arg("address"), py::arg("nbytes"),
              py::arg("device_index"), py::arg("mapped") = false,
@@ -129,7 +137,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("api_info", [] {
     py::dict result;
     result["batch_abi"] = SGLANG_ACL_BATCH_ABI;
-    result["queue_ordering"] = "torch_npu_stream_flush";
+    result["queue_ordering"] = "torch_npu_op_queue";
     result["device_synchronize"] = false;
 #if defined(ACL_HOST_REG_PINNED) && defined(ACL_HOST_REG_MAPPED)
     result["pinned_registration"] = true;

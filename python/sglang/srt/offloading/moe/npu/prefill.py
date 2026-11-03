@@ -1,7 +1,8 @@
 """Whole-layer eager prefill over two views of the native expert pools.
 
 Adapted from codex/moe-prefill-opt-20261102 (2dc7903d0b). Each bank is reused
-only after its layer's combine, keeping the refill out of that return collective.
+only after its layer's combine. Before the next offloaded dispatch, join all
+submitted copies so lookahead H2D cannot spill into its MoE communication.
 Borrowed Hot bytes are restored before decode or cache maintenance can consume
 the published cache addresses.
 """
@@ -68,6 +69,14 @@ class LayerPrefetchPipeline:
         self._require_current(layer, context)
         if self.started:
             raise RuntimeError("Prefill layer entry was already consumed")
+        # A single FIFO copy stream covers both banks. Waiting only for this
+        # layer at acquire() leaves the lookahead copy competing with dispatch
+        # and return AllToAllV. Join its latest submitted ticket before the
+        # dispatcher's existing count/row-size AllGather rendezvous. Every EP
+        # rank, including a locally idle one, then reaches payload communication
+        # with its outstanding prefetch complete. This enqueues a device wait;
+        # it does not synchronize the Python thread or add a collective.
+        self.ready[max(self.ready)].completion.wait_on(context.compute_stream)
         self.started = True
 
     def acquire(self, layer, context):

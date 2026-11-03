@@ -1,8 +1,9 @@
 """Build/load the header-matched ACL shim and bind it to eager prefill.
 
 Building is explicit and requires the installed CANN SDK and torch_npu. Importing
-this module on CPU does not import either library or start a build. A successful
-host-queue flush provides enqueue ordering, not device completion or graph proof.
+this module on CPU does not import either library or start a build. ACL launches
+join the torch_npu task queue; submission does not flush it or wait for the device.
+Rebuild the native extension on the target NPU host after updating this contract.
 """
 
 from __future__ import annotations
@@ -213,11 +214,12 @@ class AclHostTransferOps(HostTransferOps):
         if type(max_cached_plans) is not int or max_cached_plans < 0:
             raise ValueError("ACL descriptor cache capacity must be nonnegative")
         info = module.api_info()
-        if info.get("queue_ordering") != "torch_npu_stream_flush" or info.get(
+        if info.get("queue_ordering") != "torch_npu_op_queue" or info.get(
             "device_synchronize"
         ):
             raise ValueError(
-                "Loaded ACL shim lacks the expected host-queue ordering contract"
+                "Loaded ACL shim lacks torch_npu queued submission; rebuild the "
+                "native ACL extension on the target NPU host"
             )
         self.module, self.retain = module, retain
         self.source_location, self.source_location_id = (
@@ -313,8 +315,8 @@ class AclHostTransferOps(HostTransferOps):
         return tuple(batches)
 
     def materialize_into(self, plan, bindings, stream):
-        # Native Batch reuses a mutable fail_index while the GIL is released.
-        # Serialize submissions, including cache lookup and completion recording.
+        # Serialize cache lookup, queued launches, and ready-event recording.
+        # Native queued handlers own their descriptors and per-launch error state.
         with self._submission_lock:
             return self._materialize_into(plan, bindings, stream)
 

@@ -136,6 +136,44 @@ class TestLayerPrefetchPipeline(CustomTestCase):
                 self.assertEqual(len(copy.waits), 1 + max(0, count - 2))
                 self.assertEqual(pipeline.ready, {})
 
+    def test_dispatch_rendezvous_waits_for_lookahead_on_every_rank(self):
+        """A ready current bank must not let a slower future copy enter HCCL."""
+        contexts, copies, banks = [], [], []
+        for rank in range(2):
+            context, copy, bank_values = _Context(), _Stream(), [None, None]
+
+            def load(layer, bank, ctx, copy=copy, values=bank_values):
+                copy.enqueue(lambda: values.__setitem__(bank, layer))
+                return SimpleNamespace(completion=_Completion(copy.tail))
+
+            pipeline = LayerPrefetchPipeline((3, 4), load=load, copy_stream=copy)
+            pipeline.begin_forward(context)
+            # Both ranks have current weights. Only rank 1 has lookahead ready.
+            pipeline.ready[rank].completion.synchronize()
+            self.assertEqual(bank_values[0], 3)
+            pipeline.start(3, context)
+            if rank == 0:
+                self.assertIsNone(bank_values[1])  # The host must not wait.
+            contexts.append(context)
+            copies.append(copy)
+            banks.append(bank_values)
+
+        # The existing count AllGather joins the callers' device frontiers.
+        # Executing it first must pull in all earlier copies on both ranks.
+        communication, observations = _Stream(), []
+        communication.enqueue(
+            lambda: observations.append([list(values) for values in banks]),
+            tuple(
+                context.compute_stream.tail
+                for context in contexts
+                if context.compute_stream.tail is not None
+            ),
+        )
+        self.assertEqual(observations, [])  # No CPU synchronization at start.
+        communication.drain()
+        self.assertEqual(observations, [[[3, 4], [3, 4]]])
+        self.assertTrue(all(copy.tail.done for copy in copies))
+
     def test_partial_forward_and_wrong_layer_are_rejected(self):
         context, copy = _Context(), _Stream()
         pipeline = LayerPrefetchPipeline(
@@ -317,6 +355,15 @@ class TestAscendPrefillWeights(CustomTestCase):
 
 
 class TestPrefillAclDescriptors(CustomTestCase):
+    def test_old_extension_requires_rebuild_instead_of_silent_flush(self):
+        from sglang.srt.offloading.moe.npu.native_acl import AclHostTransferOps
+
+        old_native = SimpleNamespace(
+            api_info=lambda: {"queue_ordering": "torch_npu_stream_flush"}
+        )
+        with self.assertRaisesRegex(ValueError, "[Rr]ebuild"):
+            AclHostTransferOps(old_native, lambda value: None)
+
     def test_preparation_covers_complete_bundle_and_reuses_native_descriptors(self):
         from sglang.srt.offloading.moe.npu.native_acl import AclHostTransferOps
         from sglang.srt.offloading.moe.npu.transfer import DeviceMemoryRegion
@@ -331,7 +378,7 @@ class TestPrefillAclDescriptors(CustomTestCase):
             return object()
 
         native = SimpleNamespace(
-            api_info=lambda: {"queue_ordering": "torch_npu_stream_flush"},
+            api_info=lambda: {"queue_ordering": "torch_npu_op_queue"},
             Batch=batch,
         )
         ops = AclHostTransferOps(native, lambda value: None, max_batch_entries=3)
@@ -625,6 +672,50 @@ class TestAscendPrefillIntegration(CustomTestCase):
         owner._prepare_fused.assert_called_once_with(4, inputs)
         stream.wait_event.assert_called_once_with(event)
         owner.prefill.weights.assert_not_called()
+
+    def test_dispatch_joins_copy_before_collectives_even_for_empty_ranks(self):
+        """The dispatch entry must gate both prefill backends before HCCL."""
+        from sglang.srt.layers.moe.token_dispatcher.ascend_ops import (
+            AscendOpsDispatcher,
+        )
+
+        for mode in ("allgather", "alltoallv"):
+            for rows in (0, 2):
+                with self.subTest(mode=mode, local_rows=rows):
+                    owner, context, banks, _ = self._forward_owner()
+                    owner.context = context
+                    owner.prefill.pipeline.begin_forward(context)
+                    owner.prefill.pipeline.ready[0].completion.synchronize()
+                    self.assertEqual([b.item() for b in banks], [3, 99])
+                    communication, observed = _Stream(), []
+                    dispatcher = object.__new__(AscendOpsDispatcher)
+                    dispatcher._offload_layer = SimpleNamespace(
+                        layer_id=3, _ascend_ops_offloader=owner
+                    )
+                    dispatcher.moe_ascend_ops_config = SimpleNamespace(prefill=mode)
+                    dispatcher.tp_group = object()
+                    payload = torch.zeros((rows, 2))
+
+                    def dispatch_device(values, weights, ids, group):
+                        communication.wait_stream(context.compute_stream)
+                        communication.enqueue(
+                            lambda: observed.append([b.item() for b in banks])
+                        )
+                        context.compute_stream.wait_stream(communication)
+                        return values
+
+                    dispatcher._dispatch_allgather = dispatch_device
+                    dispatcher._dispatch_alltoallv = dispatch_device
+                    with patch(
+                        "sglang.srt.layers.moe.token_dispatcher.ascend_ops.get_is_extend_in_batch",
+                        return_value=True,
+                    ):
+                        result = dispatcher.dispatch(payload, (None, None, None))
+                    self.assertIs(result, payload)
+                    self.assertEqual([b.item() for b in banks], [3, 99])
+                    self.assertEqual(observed, [])
+                    communication.drain()
+                    self.assertEqual(observed, [[3, 4]])
 
     def test_refill_waits_for_combine_submission_and_device_completion(self):
         """Refilling a consumed bank must neither delay nor race its return collective."""

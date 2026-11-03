@@ -94,13 +94,15 @@ class Batch {
 
   void submit(aclrtStream stream) {
     if (stream == nullptr) {
-      throw std::runtime_error("torch_npu host queue flush returned a null stream");
+      throw std::runtime_error("torch_npu returned a null ACL stream");
     }
-    fail_index_ = std::numeric_limits<size_t>::max();
+    // Cached descriptors can outlive the Python submission lock in the queue.
+    // Failure output belongs to this launch, not to the shared descriptor.
+    size_t fail_index = std::numeric_limits<size_t>::max();
 #if SGLANG_ACL_BATCH_ABI == 10
     const auto status = batch_function(
         destinations_.data(), capacities_.data(), sources_.data(), sizes_.data(),
-        sizes_.size(), &attribute_, &attribute_index_, 1, &fail_index_, stream);
+        sizes_.size(), &attribute_, &attribute_index_, 1, &fail_index, stream);
 #else
     const auto status = batch_function(
         destinations_.data(), capacities_.data(), sources_.data(), sizes_.data(),
@@ -110,8 +112,8 @@ class Batch {
       throw std::runtime_error(
           "aclrtMemcpyBatchAsync failed, ACL status=" + std::to_string(status) +
           ", fail_index=" +
-          (fail_index_ == std::numeric_limits<size_t>::max()
-               ? std::string("unavailable") : std::to_string(fail_index_)) +
+          (fail_index == std::numeric_limits<size_t>::max()
+               ? std::string("unavailable") : std::to_string(fail_index)) +
           "; submission may be partial; retain and drain before reuse");
     }
   }
@@ -122,7 +124,6 @@ class Batch {
   uint32_t device_;
   aclrtMemcpyBatchAttr attribute_{};
   size_t attribute_index_ = 0;
-  size_t fail_index_ = std::numeric_limits<size_t>::max();
 };
 
 }  // namespace sglang::moe
