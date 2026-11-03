@@ -209,8 +209,8 @@ class AscendOpsDispatcher(BaseDispatcher):
 
         owner = getattr(self._offload_layer, "_ascend_ops_offloader", None)
         if owner is not None:
-            # Submit the return collective and finalization before flushing the
-            # ACL host queue. The refill also waits for this combine on device.
+            # Queue the return collective and finalization before the refill.
+            # The refill also waits for this combine before reusing its bank.
             owner.prefill.finish_layer(self._offload_layer.layer_id)
         return output
 

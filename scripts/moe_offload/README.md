@@ -33,9 +33,9 @@ python3 scripts/moe_offload/test_requests.py --bench
 
 ## 保留的实现
 
-- Prefill 适配自 [codex/moe-prefill-opt-20261102](https://github.com/pachi-33/sglang/commit/2dc7903d0bebe6f003db2149f8a612e641a5e190)：在每次全局 prefill forward 的入口、任何模型层计算之前提交前两个卸载层的完整权重，以两个 bank 的整层视图交替执行；第 i 层的回传通信及最终合并提交后，才向同一 bank 提交第 i+2 个卸载层的预取，拷贝流等待该层 combine 完成事件后才能覆盖 bank。这样补充预取的 ACL host 提交不再挡在当前层 combine 前，新启动的 H2D 也不与该层 combine 重叠。每个卸载层的 dispatch 入口会在设备流上等待当前已提交的全部预取（包括 i+1），再进入已有的 counts / row-size AllGather；所有 rank（包括本地 IDLE）在这个汇合点之后都已完成先前的 H2D，避免其继续竞争后面的 payload / return 通信。没有新增 collective 或 CPU synchronize。常驻层不触发该等待，保留 forward 首批预取借常驻层计算掩盖的机会。每层仍使用原生一次 dispatch、一次 FFN、一次 combine，不按专家 wave 拆分。dispatch 入口消费已启动的预取会话并等待预取完成，不在此处启动搬运。
+- Prefill 适配自 [codex/moe-prefill-opt-20261102](https://github.com/pachi-33/sglang/commit/2dc7903d0bebe6f003db2149f8a612e641a5e190)：每次全局 prefill forward 入口、任何模型层计算之前，提交前两个卸载层的全量专家权重，使用两个 bank 交替执行。第 i 层的回传及最终合并提交后，再提交同一 bank 的第 i+2 个卸载层；拷贝流等待第 i 层 combine 完成后才能覆盖 bank。dispatch 入口只校验层次顺序，不等待未来层权重；GMM1 前等待当前层 W13，GMM2 前等待当前层 W2。这样当前层的 dispatch / FFN / combine 可以与未来层 H2D 并行，W2 仍在传输时也能执行当前层 GMM1 和激活。每层仍使用原生一次 dispatch、一次 FFN、一次 combine，不按专家 wave 拆分。
 - Prefill 是否启动由本轮 batch 的全局 `is_extend_in_batch` 判断；本地 IDLE / DECODE rank 仍参与其他 rank 的 prefill。不会读取上一轮残留的 RuntimeContext phase。每个 chunk 都重新全量预取；Decode / TARGET_VERIFY / 全局 IDLE 不启动 prefill 搬运，decode 缓存与图路径沿用原实现。
-- Prefill 的 ACL 完整 bundle 描述符在装配时准备，保留 W13/W2、scale 和 offset。原生 batch 作为 `OpCommand::RunOpApi` 的有序任务提交，不再为每次 batch 在 Python 提交线程上执行 `stream(true)` 刷新 host 队列；等待事件、H2D、完成事件仍按同一流的队列顺序执行。AllToAllV 直接使用紧凑接收布局；AllGather 保留原生 payload / scale 容量及 post-permute 的无效行屏蔽，不增加逐层 `.sum().item()` 同步。空接收跳过 FFN，但继续处理预取依赖和通信。
+- Prefill 的 ACL 描述符在装配时按 W13/W2 分为两个阶段，每阶段包含对应的 weight、scale 和 offset，并独立记录完成事件。只合并同一源注册 owner / 目标 owner 中源、目标地址都连续的已验证范围；不能跨越 checkpoint FP32 scale 到运行时 BF16 scale 留下的源端间隙。对 32 专家、6 组件的典型 W8A8 布局，192 个 region 可合并为 68 个 ACL entry，实际取决于物理布局。所有原始 region 的越界、目标重叠和映射别名检查仍保留。原生 batch 继续通过 `OpCommand::RunOpApi` 有序提交，等待事件、H2D、完成事件依次入队。AllToAllV 使用紧凑接收布局；AllGather 保留原生 payload / scale 容量和无效行屏蔽。空接收跳过 FFN；同一 copy FIFO 仍保证旧 W2 完成后才覆盖 bank。
 - Prefill 用一次 Triton 操作完成计数格式转换、错误屏蔽和访问统计，GMM 按完整本地专家顺序读取 bank。没有额外的专家打包、激活重排或重复量化；FFN 使用实验分支现有的 W13 → 激活 → W2 实现。
 - 每 rank 有 E 个本地专家时，A 使用 Execution 前 E 槽；B 优先借用 Hot 前 E 槽。Hot 不足 E 时，需在 offload JSON 显式设置 `execution_slots >= 2*E`，由 Execution 后 E 槽提供 B。默认 `execution_slots=E`，容量不足直接报错，不额外分配权重池。
 - 最后一个 prefill combine 之后回填借用的 Hot 前缀，异常退出也会在清理前回填并排空流。仅恢复被借用的槽位，保留缓存 owner / generation / LFU 状态，随后才执行缓存维护与 decode。
@@ -48,13 +48,26 @@ python3 scripts/moe_offload/test_requests.py --bench
 
 CPU 契约测试：`python3 test/registered/unit/offloading/test_ascend_prefill.py`，覆盖 bank 容量、异步读写顺序、跨 forward event、逐专家计数、部分拷贝失败后的 Hot 恢复和 Prefill→Decode 切换。计数内核使用 Triton 的 CPU 解释模式执行生产函数；需要安装 Triton / NumPy。
 
-原适配在隔离 serving / NPU 依赖的 CPU harness 中通过了 21 项 UT。本次补充 forward 入口提前提交、全局 prefill 的 IDLE / DECODE rank、残留 phase 隔离和首次搬运部分失败的恢复回归；测试先在修复前复现入口未预取的问题，再验证修复。使用真实 runner / dispatcher / offloader Python 方法，通信、设备流和 FFN 内核由测试实现模拟；完整 serving 与原生计数内核仍按目标环境验证。
+本地隔离 serving / NPU 依赖后通过 30 项 CPU 契约测试；关键回归在旧实现上失败。测试执行真实生产 Python 生命周期与描述符逻辑，设备流 / collective / 内核使用测试边界。覆盖：未来层未就绪时当前层仍能完成计算并提交后续预取、W13 与 W2 各自的读取依赖、空 rank、独立通信流、combine 后 bank 复用、第二阶段提交失败时的 Hot 恢复，以及 decode 路径保持原有依赖。连续范围合并测试检查实际字节结果、源/目标间隙、owner 边界、越界和别名拒绝。CPU 测试不证明 NPU 数值或性能收益。
 
-combine 后推进预取的改动在隔离依赖的 CPU harness 中通过 19 项契约测试，覆盖正常/空 FFN 不提前退役、AllToAllV/AllGather 提交后才补充预取、独立通信流及最终合并完成前不覆盖 bank、combine 异常不推进、Hot 恢复先于缓存维护，以及 decode/常驻层不进入 prefill 生命周期。对应回归在旧实现上失败。此验证不包含原生 Triton 计数内核或 NPU 性能测试。
+### 2026-11-04 trace 定位
 
-本次 dispatch 前收敛和原生排队提交在本地通过 22 项 Python 契约测试及 4 项 C++ shim 契约测试（两种 CANN ABI 共 9 个子场景）。新回归能在旧实现上复现未完成的 lookahead 拷贝进入通信、host 队列强制刷新和共享错误位置状态的问题。C++ 测试编译完整生产 shim，但外部 SDK 与队列由测试桩提供，不能代替目标 torch_npu / CANN 链接与 NPU 性能验收。
+输入为 `trace_2407_2471ms_analysis.html`，NPU 4、`EXTEND bs=1 toks=2048`、EP=8。时间以下均相对 2407 ms 窗口起点。HTML 的 track 7 实际为物理 stream 31（HCCL），主计算流是 track 3 / stream 32，DMA 是 stream 39。
 
-本次通信隔离的权衡：卸载层的预取窗口主要保留在常驻层及 attention，不能再借本层 GMM 延长下一层 H2D。若 H2D 带宽本身不足，等待可能转移到 dispatch / metadata AllGather 前；必须同时比较稳定态 forward / TTFT、权重等待和 return A2A，不能只凭通信条变短判断加速。各 rank 的完成仍有尾部时间差：某 rank 本层 combine 完成后启动的新 H2D，可能与其他 rank 尚未完全退出的同次回传尾部交叠；本次不为此增加逐层 barrier。
+| 观察 | 实测时间 | 含义 |
+| --- | --- | --- |
+| 主计算流等待未来权重 | 19.359–36.268 ms，16.909 ms | H2D 完成事件在 36.267 ms，随后 counts AllGather 才能启动 |
+| 下一次同类等待 | 47.518–68.141 ms，20.623 ms | 跨出 64 ms 窗口；不能将整段加入窗口内统计 |
+| 一层完整 H2D | 8.742–36.267 ms，27.525 ms | 192 个 DMA，计算气泡期间拷贝仍忙 |
+| 下一层 H2D 启动 | 40.664 ms | 两批之间约 4.398 ms 的拷贝空档可通过恢复流水减少 |
+| 两次回传 AllToAllV | 0.528 / 0.480 ms | 条目缩短，但未来权重等待被提前到了 dispatch 前 |
+| 两次 native 队列任务 | 0.987 / 1.063 ms | Python 快速返回仍不能消除共享 launch worker 阻塞 |
+
+按窗口裁剪后，Computing / Communication / Free 分别是 17.756 / 2.161 / 44.083 ms，合计 64 ms。DMA 活跃约 54.972 ms，与这些分类重叠，不能相加；Free 并不表示 DMA 空闲。根据代码布局推算，一层每 rank 约搬运 769.5 MiB（含量化元数据），27.525 ms 对应约 27.3 GiB/s；trace 没有直接给出拷贝字节数，此带宽是推算值。
+
+本次取消 `dispatch(i) -> 等待 W(i+1)` 的过早依赖，将权重截止点恢复到实际使用它的投影。此举允许当前 combine 提前完成，使下一批 H2D 能更早排入 FIFO；同时用分阶段事件重叠 W2 和 GMM1，并合并连续范围减少提交开销。H2D 与通信会重新重叠，HCCL 条目可能变长，应比较稳定态 forward / TTFT 和完整层周期，而非单独优化通信条长度。27.5 ms 的整层传输表明当前也有带宽约束，不能承诺调度修改消除全部气泡。
+
+目标设备验收应同时确认：当前 dispatch 不再等待未来 ticket；GMM1 不读取未完成的 W13、GMM2 不读取未完成的 W2；相邻 H2D 批次的空档是否缩短；native 提交耗时是否降低；两种 prefill 通信模式、空 rank、prefill→decode 数值和 Hot 恢复正确。`serve_tp4.sh` 不需要新增参数。
 
 原生扩展需要重新构建：`python3 -m sglang.srt.offloading.moe.npu.native_acl --build-directory "$RUNTIME_DIR/native_acl"`（先按启动脚本设置环境）。`serve_tp4.sh` 已在每次启动时调用此构建步骤，无须修改启动参数。旧扩展的 `torch_npu_stream_flush` 协议会被拒绝，避免新 Python 静默加载旧提交路径。原生异步任务出错会由 torch_npu 队列在后续检查 / 同步时上报，owner 保留搬运资源直到流排空。
 

@@ -484,6 +484,7 @@ class AscendOpsOffloader(BaseOffloader):
         from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 
         if get_is_extend_in_batch():
+            self.prefill.pipeline.wait_for_w2(layer_id, self.context)
             return
         torch.npu.current_stream().wait_event(self.copy_events[layer_id][2])
 

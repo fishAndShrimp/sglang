@@ -296,11 +296,43 @@ class AclHostTransferOps(HostTransferOps):
                         dst,
                         region.nbytes,
                         destination.nbytes - region.destination_offset,
+                        source.registration,
+                        destination.owner,
                     )
                 )
         _reject_overlapping(destinations)
         if _ranges_overlap(mapped_sources, destinations):
             raise ValueError("Copy destination overlaps mapped immutable host storage")
+
+        # Whole-layer plans contain adjacent expert slices of the same weight
+        # allocation. Validate every original slice before merging descriptors;
+        # only contiguous bytes with the same allocation owners may be joined.
+        # In particular, BF16 scales can have FP32-sized host strides, whose
+        # padding must never be copied into the packed device scale allocation.
+        contiguous = []
+        for entry in entries:
+            if contiguous:
+                previous = contiguous[-1]
+                if (
+                    previous[0] + previous[2] == entry[0]
+                    and previous[1] + previous[2] == entry[1]
+                    and previous[4] is entry[4]
+                    and previous[5] is entry[5]
+                ):
+                    size = previous[2] + entry[2]
+                    # The merged capacity is exactly the validated byte union,
+                    # rather than either expert slice's remaining capacity.
+                    contiguous[-1] = (
+                        previous[0],
+                        previous[1],
+                        size,
+                        size,
+                        entry[4],
+                        entry[5],
+                    )
+                    continue
+            contiguous.append(entry)
+        entries = contiguous
         batches = []
         for begin in range(0, len(entries), self.max_batch_entries):
             chunk = entries[begin : begin + self.max_batch_entries]

@@ -1,5 +1,7 @@
 """CPU stream contracts and interpreted Triton metadata; no NPU required."""
 
+import ctypes
+import random
 import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -12,6 +14,7 @@ from triton.runtime.interpreter import InterpretedFunction
 from sglang.srt.offloading.moe.npu.prefill import (
     AscendPrefillWeights,
     LayerPrefetchPipeline,
+    PrefillLayerTransfer,
     whole_layer_bank_layout,
 )
 from sglang.srt.offloading.moe.npu.small_batch_kernels import prepare_prefill_counts
@@ -96,20 +99,21 @@ class TestLayerPrefetchPipeline(CustomTestCase):
                 whole_layer_bank_layout(*capacity)
 
     def test_delayed_copy_and_reader_preserve_complete_layer_results(self):
-        """Draining copies first must not overwrite a still-unread bank."""
+        """Draining copies first must not overwrite either projection still in use."""
         for count in (1, 2, 3, 6):
             with self.subTest(layers=count):
                 context, copy = _Context(), _Stream()
-                banks, output, submitted = [None, None], [], []
+                banks, output, submitted = [[None, None], [None, None]], [], []
                 layers = tuple(range(3, 3 + count))
 
                 def load(layer, bank, ctx):
                     submitted.append(layer)
-                    # Both projections and their scales share the same lifetime.
-                    copy.enqueue(
-                        lambda: banks.__setitem__(bank, (layer, layer + 1, 0.5, 2.0))
+                    copy.enqueue(lambda: banks[bank].__setitem__(0, (layer, 0.5)))
+                    first = SimpleNamespace(completion=_Completion(copy.tail))
+                    copy.enqueue(lambda: banks[bank].__setitem__(1, (layer + 1, 2.0)))
+                    return PrefillLayerTransfer(
+                        first, SimpleNamespace(completion=_Completion(copy.tail))
                     )
-                    return SimpleNamespace(completion=_Completion(copy.tail))
 
                 pipeline = LayerPrefetchPipeline(layers, load=load, copy_stream=copy)
                 pipeline.begin_forward(context)
@@ -118,13 +122,22 @@ class TestLayerPrefetchPipeline(CustomTestCase):
                     if index == 0:
                         self.assertEqual(submitted, list(layers[:2]))
                     bank = pipeline.acquire(layer, context)
+                    intermediate = []
 
-                    def read(layer=layer, bank=bank):
-                        w13, w2, s13, s2 = banks[bank]
-                        output.append((w13 * s13) * (w2 * s2))
-                        self.assertEqual((w13, w2), (layer, layer + 1))
+                    def first_read(layer=layer, bank=bank, intermediate=intermediate):
+                        w13, scale = banks[bank][0]
+                        self.assertEqual(w13, layer)
+                        intermediate.append(w13 * scale)
 
-                    context.compute_stream.enqueue(read)
+                    context.compute_stream.enqueue(first_read)
+                    pipeline.wait_for_w2(layer, context)
+
+                    def second_read(layer=layer, bank=bank, intermediate=intermediate):
+                        w2, scale = banks[bank][1]
+                        self.assertEqual(w2, layer + 1)
+                        output.append(intermediate[0] * w2 * scale)
+
+                    context.compute_stream.enqueue(second_read)
                     reader = context.record_compute_completion()
                     pipeline.retire(layer, reader, context)
                 pipeline.finish_forward(context)
@@ -136,49 +149,86 @@ class TestLayerPrefetchPipeline(CustomTestCase):
                 self.assertEqual(len(copy.waits), 1 + max(0, count - 2))
                 self.assertEqual(pipeline.ready, {})
 
-    def test_dispatch_rendezvous_waits_for_lookahead_on_every_rank(self):
-        """A ready current bank must not let a slower future copy enter HCCL."""
-        contexts, copies, banks = [], [], []
-        for rank in range(2):
-            context, copy, bank_values = _Context(), _Stream(), [None, None]
+    def test_current_layer_progresses_before_future_or_second_projection_copy(self):
+        """Future H2D must not gate dispatch; W2 must not gate the first GMM."""
+        context, copy = _Context(), _Stream()
+        banks, submitted, observed = [[None, None], [None, None]], [], []
 
-            def load(layer, bank, ctx, copy=copy, values=bank_values):
-                copy.enqueue(lambda: values.__setitem__(bank, layer))
-                return SimpleNamespace(completion=_Completion(copy.tail))
+        def load(layer, bank, ctx):
+            submitted.append(layer)
+            copy.enqueue(lambda: banks[bank].__setitem__(0, layer))
+            first = SimpleNamespace(completion=_Completion(copy.tail))
+            copy.enqueue(lambda: banks[bank].__setitem__(1, layer + 1))
+            return PrefillLayerTransfer(
+                first, SimpleNamespace(completion=_Completion(copy.tail))
+            )
 
-            pipeline = LayerPrefetchPipeline((3, 4), load=load, copy_stream=copy)
-            pipeline.begin_forward(context)
-            # Both ranks have current weights. Only rank 1 has lookahead ready.
-            pipeline.ready[rank].completion.synchronize()
-            self.assertEqual(bank_values[0], 3)
-            pipeline.start(3, context)
-            if rank == 0:
-                self.assertIsNone(bank_values[1])  # The host must not wait.
-            contexts.append(context)
-            copies.append(copy)
-            banks.append(bank_values)
+        pipeline = LayerPrefetchPipeline((3, 4, 5), load=load, copy_stream=copy)
+        pipeline.begin_forward(context)
+        current, future = pipeline.ready[0], pipeline.ready[1]
+        pipeline.start(3, context)
+        context.compute_stream.enqueue(lambda: observed.append("dispatch"))
+        context.compute_stream.drain()
+        self.assertEqual(observed, ["dispatch"])
+        self.assertEqual(banks, [[None, None], [None, None]])
 
-        # The existing count AllGather joins the callers' device frontiers.
-        # Executing it first must pull in all earlier copies on both ranks.
-        communication, observations = _Stream(), []
-        communication.enqueue(
-            lambda: observations.append([list(values) for values in banks]),
-            tuple(
-                context.compute_stream.tail
-                for context in contexts
-                if context.compute_stream.tail is not None
-            ),
+        bank = pipeline.acquire(3, context)
+        context.compute_stream.enqueue(lambda: observed.append(banks[bank][0] * 2))
+        context.compute_stream.drain()
+        self.assertEqual(observed, ["dispatch", 6])
+        self.assertFalse(current.w2.completion.command.done)
+        self.assertFalse(future.w13.completion.command.done)
+
+        pipeline.wait_for_w2(3, context)
+        context.compute_stream.enqueue(
+            lambda: observed.append(observed[-1] * banks[bank][1])
         )
-        self.assertEqual(observations, [])  # No CPU synchronization at start.
-        communication.drain()
-        self.assertEqual(observations, [[[3, 4], [3, 4]]])
-        self.assertTrue(all(copy.tail.done for copy in copies))
+        context.compute_stream.enqueue(lambda: observed.append("combine"))
+        context.compute_stream.drain()
+        self.assertEqual(observed, ["dispatch", 6, 24, "combine"])
+        self.assertFalse(future.w13.completion.command.done)
+        self.assertFalse(future.w2.completion.command.done)
+        pipeline.retire(3, context.record_compute_completion(), context)
+        # The next refill is submitted while the existing lookahead is pending,
+        # so this layer's compute/combine can fill that transfer's idle window.
+        self.assertEqual(submitted, [3, 4, 5])
+        self.assertFalse(future.w2.completion.command.done)
+        copy.drain()
+        self.assertEqual(banks, [[5, 6], [4, 5]])
+
+    def test_empty_layer_reuses_bank_safely_without_waiting_for_w2(self):
+        """An empty EP rank skips GMM2 but FIFO still protects both bank phases."""
+        context, copy, writes = _Context(), _Stream(), []
+
+        def load(layer, bank, ctx):
+            copy.enqueue(lambda: writes.append((bank, layer, "w13")))
+            first = SimpleNamespace(completion=_Completion(copy.tail))
+            copy.enqueue(lambda: writes.append((bank, layer, "w2")))
+            return PrefillLayerTransfer(
+                first, SimpleNamespace(completion=_Completion(copy.tail))
+            )
+
+        pipeline = LayerPrefetchPipeline((3, 4, 5), load=load, copy_stream=copy)
+        pipeline.begin_forward(context)
+        pending = pipeline.ready[0].w2.completion.command
+        pipeline.start(3, context)
+        pipeline.acquire(3, context)
+        context.compute_stream.enqueue(lambda: writes.append((0, 3, "combine")))
+        context.compute_stream.drain()
+        self.assertFalse(pending.done)
+        pipeline.retire(3, context.record_compute_completion(), context)
+        copy.drain()
+        self.assertLess(writes.index((0, 3, "combine")), writes.index((0, 5, "w13")))
+        self.assertLess(writes.index((0, 3, "w2")), writes.index((0, 5, "w13")))
 
     def test_partial_forward_and_wrong_layer_are_rejected(self):
         context, copy = _Context(), _Stream()
         pipeline = LayerPrefetchPipeline(
             (3, 4),
-            load=lambda *args: SimpleNamespace(completion=_Completion(None)),
+            load=lambda *args: PrefillLayerTransfer(
+                SimpleNamespace(completion=_Completion(None)),
+                SimpleNamespace(completion=_Completion(None)),
+            ),
             copy_stream=copy,
         )
         with self.assertRaisesRegex(RuntimeError, "forward entry"):
@@ -203,7 +253,10 @@ class TestLayerPrefetchPipeline(CustomTestCase):
 
         def load(layer, bank, context):
             submitted.append(context.invocation_id)
-            return SimpleNamespace(completion=_Completion(None))
+            return PrefillLayerTransfer(
+                SimpleNamespace(completion=_Completion(None)),
+                SimpleNamespace(completion=_Completion(None)),
+            )
 
         pipeline = LayerPrefetchPipeline((3,), load=load, copy_stream=copy)
         for _ in range(2):
@@ -216,6 +269,82 @@ class TestLayerPrefetchPipeline(CustomTestCase):
             pipeline.reset()
         self.assertEqual(len(submitted), 2)
         self.assertIsNot(submitted[0], submitted[1])
+
+
+class TestPrefillProjectionPlans(CustomTestCase):
+    def test_phase_completion_includes_projection_scales_and_offsets(self):
+        """An early W13 event must publish its quantization bytes, but not await W2."""
+        from sglang.srt.offloading.moe.npu.prefill import _projection_copy_plans
+
+        names = (
+            "w2_weight",
+            "w13_weight",
+            "w2_scale",
+            "w13_scale",
+            "w2_offset",
+            "w13_offset",
+        )
+        layouts = {name: SimpleNamespace(nbytes=8) for name in names}
+        sources = {
+            name: tuple(
+                SimpleNamespace(
+                    nbytes=8,
+                    payload=torch.full(
+                        (8,), 10 * index + expert + 1, dtype=torch.uint8
+                    ),
+                )
+                for expert in range(2)
+            )
+            for index, name in enumerate(names)
+        }
+        destinations = {
+            name: tuple(
+                SimpleNamespace(nbytes=8, payload=torch.zeros(8, dtype=torch.uint8))
+                for _ in range(2)
+            )
+            for name in names
+        }
+        storage = SimpleNamespace(component_capabilities=sources)
+        bank = SimpleNamespace(component_regions=destinations)
+        plans = _projection_copy_plans(storage, bank, layouts)
+        copy = _Stream()
+
+        def submit(plan, bank, stream):
+            for region in plan.regions:
+                stream.enqueue(
+                    lambda region=region: region.destination.payload.copy_(
+                        region.source.payload
+                    )
+                )
+            return SimpleNamespace(completion=_Completion(stream.tail))
+
+        weights = object.__new__(AscendPrefillWeights)
+        weights.borrows_hot, weights.hot_dirty = False, False
+        weights.owner = SimpleNamespace(weight_copy_stream=copy)
+        weights.banks, weights.plans = (bank,), {3: plans}
+        weights.host_ops = SimpleNamespace(materialize_into=submit)
+        transfer = weights._load(3, 0, _Context())
+        transfer.w13.completion.synchronize()
+        for name in names:
+            for source, destination in zip(sources[name], destinations[name]):
+                if name.startswith("w13_"):
+                    self.assertTrue(torch.equal(source.payload, destination.payload))
+                else:
+                    self.assertEqual(destination.payload.count_nonzero().item(), 0)
+        self.assertFalse(transfer.w2.completion.command.done)
+        transfer.w2.completion.synchronize()
+        for name in names:
+            for source, destination in zip(sources[name], destinations[name]):
+                self.assertTrue(torch.equal(source.payload, destination.payload))
+
+        # A format change must not silently omit an unclassified component or
+        # create a ready event for an absent projection.
+        for invalid in (
+            {"w13_weight": layouts["w13_weight"]},
+            {**layouts, "unexpected_scale": layouts["w13_scale"]},
+        ):
+            with self.subTest(components=tuple(invalid)), self.assertRaises(ValueError):
+                _projection_copy_plans(storage, bank, invalid)
 
 
 class TestAscendPrefillWeights(CustomTestCase):
@@ -324,7 +453,7 @@ class TestAscendPrefillWeights(CustomTestCase):
         keys, valid = torch.tensor([2, 0]), torch.tensor([True, True])
         weights.owner = SimpleNamespace(weight_copy_stream=copy)
         weights.borrows_hot, weights.hot_dirty = True, False
-        weights.banks, weights.plans = (object(), object()), {4: object()}
+        weights.banks, weights.plans = (object(), object()), {4: (object(), object())}
         weights.restore_plan = SimpleNamespace(
             source_index=keys, valid=valid, count=torch.zeros((), dtype=torch.int32)
         )
@@ -384,7 +513,7 @@ class TestPrefillAclDescriptors(CustomTestCase):
         ops = AclHostTransferOps(native, lambda value: None, max_batch_entries=3)
         regions = tuple(
             HostCopyRegion(
-                HostMemoryCapability(4096 + index * 64, 64, True, None, native),
+                HostMemoryCapability(4096 + index * 128, 64, True, None, native),
                 DeviceMemoryRegion(16384 + index * 64, 64, device, native),
                 0,
                 0,
@@ -406,6 +535,237 @@ class TestPrefillAclDescriptors(CustomTestCase):
         self.assertEqual([size for b in batches for size in b[2]], [64] * 12)
         ops.prepare(plan, device)
         self.assertEqual(len(batches), 4)
+
+    def _lower_copy_regions(self, regions, *, max_batch_entries=256):
+        from sglang.srt.offloading.moe.npu.native_acl import AclHostTransferOps
+        from sglang.srt.offloading.transfer import HostCopyPlan
+
+        device = SimpleNamespace(type="npu", index=0)
+        batches = []
+
+        def batch(*args):
+            batches.append(args)
+            return args
+
+        native = SimpleNamespace(
+            api_info=lambda: {"queue_ordering": "torch_npu_op_queue"}, Batch=batch
+        )
+        ops = AclHostTransferOps(
+            native, lambda value: None, max_batch_entries=max_batch_entries
+        )
+        plan = HostCopyPlan(regions)
+        ops.prepare(plan, device)
+        return batches, ops, plan, device
+
+    def _copy_regions_for_buffers(self, source, destination, ranges, *, offsets=False):
+        from sglang.srt.offloading.moe.npu.transfer import DeviceMemoryRegion
+        from sglang.srt.offloading.moe.storage import HostMemoryCapability
+        from sglang.srt.offloading.transfer import HostCopyRegion
+
+        device = SimpleNamespace(type="npu", index=0)
+        return tuple(
+            HostCopyRegion(
+                HostMemoryCapability(
+                    ctypes.addressof(source) + (0 if offsets else src),
+                    len(source) if offsets else max(1, size),
+                    True,
+                    None,
+                    source,
+                ),
+                DeviceMemoryRegion(
+                    ctypes.addressof(destination) + (0 if offsets else dst),
+                    len(destination) if offsets else max(1, size),
+                    device,
+                    destination,
+                ),
+                src if offsets else 0,
+                dst if offsets else 0,
+                size,
+            )
+            for src, dst, size in ranges
+        )
+
+    def _execute_copy_descriptors(self, batches):
+        for srcs, dsts, sizes, capacities, *_ in batches:
+            for src, dst, size, capacity in zip(srcs, dsts, sizes, capacities):
+                self.assertLessEqual(size, capacity)
+                ctypes.memmove(dst, src, size)
+
+    def test_coalesced_ranges_preserve_bytes_and_untouched_gaps(self):
+        rng = random.Random(24072471)
+        for case in range(32):
+            with self.subTest(case=case):
+                source = (ctypes.c_ubyte * 1024)(
+                    *range(256), *range(256), *range(256), *range(256)
+                )
+                destination = (ctypes.c_ubyte * 1024)(*([0xA5] * 1024))
+                ranges, src, dst = [], 3, 5
+                expected = bytearray(destination)
+                for _ in range(32):
+                    size = rng.randrange(1, 17)
+                    ranges.append((src, dst, size))
+                    expected[dst : dst + size] = bytes(source)[src : src + size]
+                    src += size + rng.choice((0, 0, 0, 1, 3))
+                    dst += size + rng.choice((0, 0, 0, 2, 4))
+                regions = self._copy_regions_for_buffers(
+                    source, destination, ranges, offsets=bool(case % 2)
+                )
+                batches, ops, plan, device = self._lower_copy_regions(
+                    regions, max_batch_entries=3
+                )
+                self.assertTrue(all(len(batch[0]) <= 3 for batch in batches))
+                self.assertEqual(
+                    sum(sum(batch[2]) for batch in batches),
+                    sum(size for _, _, size in ranges),
+                )
+                self._execute_copy_descriptors(batches)
+                self.assertEqual(bytes(destination), bytes(expected))
+                self.assertIs(ops._prepared[(device.index, id(plan))][0], plan)
+                self.assertEqual(plan.regions, regions)
+                # Repeated use must reuse the lowered descriptor owners.
+                descriptor_batches = len(batches)
+                ops.prepare(plan, device)
+                self.assertEqual(len(batches), descriptor_batches)
+
+    def test_w8a8_scale_padding_stays_out_of_packed_destinations(self):
+        regions, allocations, expected = [], [], []
+        # Reduced byte extents preserve the real layout's FP32-host/BF16-runtime
+        # scale stride, six components and 32 experts, without a large allocation.
+        for component, (size, stride) in enumerate(
+            ((16, 16), (2, 4), (4, 4), (8, 8), (2, 4), (4, 4))
+        ):
+            source = (ctypes.c_ubyte * (32 * stride))(*([0xCD] * (32 * stride)))
+            destination = (ctypes.c_ubyte * (32 * size + 8))(
+                *([0xA5] * (32 * size + 8))
+            )
+            valid = bytearray()
+            for expert in range(32):
+                payload = bytes(
+                    (component * 31 + expert * 7 + byte) % 251 for byte in range(size)
+                )
+                source[expert * stride : expert * stride + size] = payload
+                valid.extend(payload)
+            ranges = [
+                (expert * stride, expert * size + 4, size) for expert in range(32)
+            ]
+            regions.extend(self._copy_regions_for_buffers(source, destination, ranges))
+            allocations.append((source, destination))
+            expected.append(b"\xa5" * 4 + valid + b"\xa5" * 4)
+        batches, _, _, _ = self._lower_copy_regions(regions)
+        self.assertEqual(len(regions), 192)
+        self.assertEqual(sum(len(batch[0]) for batch in batches), 68)
+        self._execute_copy_descriptors(batches)
+        for (_, destination), reference in zip(allocations, expected):
+            self.assertEqual(bytes(destination), reference)
+
+    def test_contiguous_addresses_do_not_merge_across_allocation_owners(self):
+        from dataclasses import replace
+
+        source = (ctypes.c_ubyte * 16)(*range(16))
+        destination = (ctypes.c_ubyte * 16)()
+        regions = list(
+            self._copy_regions_for_buffers(
+                source, destination, [(i * 4, i * 4, 4) for i in range(4)]
+            )
+        )
+        # Identity is required: owners may compare equal despite being distinct.
+        registrations = (
+            SimpleNamespace(storage=source),
+            SimpleNamespace(storage=source),
+        )
+        owners = (
+            SimpleNamespace(storage=destination),
+            SimpleNamespace(storage=destination),
+        )
+        for i in range(4):
+            regions[i] = replace(
+                regions[i],
+                source=replace(
+                    regions[i].source, registration=registrations[0 if i < 2 else 1]
+                ),
+                destination=replace(
+                    regions[i].destination, owner=owners[0 if i == 0 else 1]
+                ),
+            )
+        batches, _, _, _ = self._lower_copy_regions(regions)
+        self.assertEqual([size for batch in batches for size in batch[2]], [4, 4, 8])
+        self._execute_copy_descriptors(batches)
+        self.assertEqual(bytes(destination), bytes(source))
+
+    def test_invalid_late_regions_are_rejected_before_native_descriptors(self):
+        from dataclasses import replace
+
+        from sglang.srt.offloading.moe.npu.native_acl import AclHostTransferOps
+        from sglang.srt.offloading.transfer import HostCopyPlan
+
+        source = (ctypes.c_ubyte * 16)(*range(16))
+        destination = (ctypes.c_ubyte * 16)()
+        regions = self._copy_regions_for_buffers(
+            source, destination, [(0, 0, 4), (4, 4, 4)]
+        )
+        cases = (
+            (
+                "host reads",
+                replace(
+                    regions[1],
+                    source=replace(regions[1].source, acl_async_readable=False),
+                ),
+            ),
+            (
+                "submitting stream device",
+                replace(
+                    regions[1],
+                    destination=replace(
+                        regions[1].destination,
+                        device=SimpleNamespace(type="npu", index=1),
+                    ),
+                ),
+            ),
+            (
+                "destinations overlap",
+                replace(
+                    regions[1],
+                    destination=replace(
+                        regions[1].destination,
+                        address=ctypes.addressof(destination) + 2,
+                    ),
+                ),
+            ),
+            (
+                "immutable host storage",
+                replace(
+                    regions[1],
+                    source=replace(
+                        regions[1].source, device_address=ctypes.addressof(destination)
+                    ),
+                ),
+            ),
+        )
+        for error, invalid in cases:
+            with self.subTest(error=error):
+                batches = []
+                native = SimpleNamespace(
+                    api_info=lambda: {"queue_ordering": "torch_npu_op_queue"},
+                    Batch=lambda *args: batches.append(args),
+                )
+                ops = AclHostTransferOps(native, lambda value: None)
+                with self.assertRaisesRegex(ValueError, error):
+                    ops.prepare(
+                        HostCopyPlan((regions[0], invalid)),
+                        regions[0].destination.device,
+                    )
+                self.assertEqual(batches, [])
+
+    def test_empty_region_does_not_copy_or_change_adjacent_extent(self):
+        source = (ctypes.c_ubyte * 8)(*range(8))
+        destination = (ctypes.c_ubyte * 10)(*([0xA5] * 10))
+        regions = self._copy_regions_for_buffers(
+            source, destination, [(0, 1, 4), (4, 5, 0), (4, 5, 4)]
+        )
+        batches, _, _, _ = self._lower_copy_regions(regions)
+        self.assertEqual([size for batch in batches for size in batch[2]], [8])
+        self._execute_copy_descriptors(batches)
+        self.assertEqual(bytes(destination), b"\xa5" + bytes(source) + b"\xa5")
 
 
 class TestAscendPrefillIntegration(CustomTestCase):
@@ -485,7 +845,7 @@ class TestAscendPrefillIntegration(CustomTestCase):
         ):
             yield
 
-    def _forward_owner(self, *, fail_second_load=False):
+    def _forward_owner(self, *, fail_second_load=False, fail_w2=False):
         from sglang.srt.offloading.moe.npu.ascend_ops import AscendOpsOffloader
 
         context, copy = _Context(), _Stream()
@@ -505,16 +865,19 @@ class TestAscendPrefillIntegration(CustomTestCase):
         weights = object.__new__(AscendPrefillWeights)
         owner.prefill, weights.owner = weights, owner
         weights.borrows_hot, weights.hot_dirty = True, False
-        weights.banks, weights.plans = banks, {layer: layer for layer in (3, 4, 5)}
+        weights.banks = banks
+        weights.plans = {layer: ((layer, "w13"), (layer, "w2")) for layer in (3, 4, 5)}
         weights.restore_plan = SimpleNamespace(
             valid=torch.tensor([True]), count=torch.zeros((), dtype=torch.int32)
         )
         weights.restore_bindings = object()
 
-        def load(layer, bank, stream):
-            submitted.append(layer)
+        def load(plan, bank, stream):
+            layer, phase = plan
+            if phase == "w13":
+                submitted.append(layer)
             stream.enqueue(lambda: bank.fill_(layer))
-            if fail_second_load and layer == 4:
+            if layer == 4 and (fail_second_load or (fail_w2 and phase == "w2")):
                 raise RuntimeError("partial initial H2D")
             return SimpleNamespace(completion=_Completion(stream.tail))
 
@@ -618,31 +981,58 @@ class TestAscendPrefillIntegration(CustomTestCase):
                 self.assertEqual(owner.step, 1)
 
     def test_initial_prefetch_failure_restores_hot_before_model_entry(self):
-        owner, context, banks, submitted = self._forward_owner(fail_second_load=True)
-        batch = SimpleNamespace(is_extend_in_batch=True)
-        entered = False
-        with (
-            patch(
-                "sglang.srt.offloading.moe.npu.ascend_ops._Context",
-                return_value=context,
-            ),
-            patch.object(
-                torch,
-                "npu",
-                SimpleNamespace(current_stream=lambda: context.compute_stream),
-                create=True,
-            ),
+        """Failure in either Hot projection must restore decode's published bytes."""
+        for phase in ("w13", "w2"):
+            with self.subTest(failed_phase=phase):
+                owner, context, banks, submitted = self._forward_owner(
+                    fail_second_load=phase == "w13", fail_w2=phase == "w2"
+                )
+                batch = SimpleNamespace(is_extend_in_batch=True)
+                entered = False
+                with (
+                    patch(
+                        "sglang.srt.offloading.moe.npu.ascend_ops._Context",
+                        return_value=context,
+                    ),
+                    patch.object(
+                        torch,
+                        "npu",
+                        SimpleNamespace(current_stream=lambda: context.compute_stream),
+                        create=True,
+                    ),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "partial initial H2D"):
+                        with owner.forward_scope(batch):
+                            entered = True
+                self.assertFalse(entered)
+                self.assertEqual(submitted, [3, 4])
+                self.assertEqual(banks[1].item(), 99)
+                self.assertFalse(owner.prefill.hot_dirty)
+                self.assertIsNone(owner.prefill.pipeline.invocation_id)
+                self.assertFalse(owner.state.update_enabled.item())
+                self.assertEqual(owner.step, 0)
+
+    def test_prefill_w2_wait_does_not_pull_in_future_layer(self):
+        from sglang.srt.offloading.moe.npu.ascend_ops import AscendOpsOffloader
+
+        owner, context, banks, _ = self._forward_owner()
+        owner.context = context
+        owner.prefill.pipeline.begin_forward(context)
+        owner.start_prefill_layer(3)
+        owner.prefill.pipeline.acquire(3, context)
+        context.compute_stream.drain()
+        current = owner.prefill.pipeline.ready[0]
+        future = owner.prefill.pipeline.ready[1]
+        self.assertFalse(current.w2.completion.command.done)
+        with patch(
+            "sglang.srt.layers.dp_attention.get_is_extend_in_batch",
+            return_value=True,
         ):
-            with self.assertRaisesRegex(RuntimeError, "partial initial H2D"):
-                with owner.forward_scope(batch):
-                    entered = True
-        self.assertFalse(entered)
-        self.assertEqual(submitted, [3, 4])
-        self.assertEqual(banks[1].item(), 99)
-        self.assertFalse(owner.prefill.hot_dirty)
-        self.assertIsNone(owner.prefill.pipeline.invocation_id)
-        self.assertFalse(owner.state.update_enabled.item())
-        self.assertEqual(owner.step, 0)
+            AscendOpsOffloader.wait_for_w2(owner, 3)
+        context.compute_stream.drain()
+        self.assertTrue(current.w2.completion.command.done)
+        self.assertFalse(future.w13.completion.command.done)
+        self.assertEqual([bank.item() for bank in banks], [3, 99])
 
     def test_decode_keeps_packed_preparation_and_w2_event(self):
         from sglang.srt.offloading.moe.npu.ascend_ops import AscendOpsOffloader
@@ -673,8 +1063,8 @@ class TestAscendPrefillIntegration(CustomTestCase):
         stream.wait_event.assert_called_once_with(event)
         owner.prefill.weights.assert_not_called()
 
-    def test_dispatch_joins_copy_before_collectives_even_for_empty_ranks(self):
-        """The dispatch entry must gate both prefill backends before HCCL."""
+    def test_dispatch_progresses_with_pending_prefetch_even_for_empty_ranks(self):
+        """Count collectives must not inherit a dependency on future weights."""
         from sglang.srt.layers.moe.token_dispatcher.ascend_ops import (
             AscendOpsDispatcher,
         )
@@ -685,7 +1075,7 @@ class TestAscendPrefillIntegration(CustomTestCase):
                     owner, context, banks, _ = self._forward_owner()
                     owner.context = context
                     owner.prefill.pipeline.begin_forward(context)
-                    owner.prefill.pipeline.ready[0].completion.synchronize()
+                    owner.prefill.pipeline.ready[0].w2.completion.synchronize()
                     self.assertEqual([b.item() for b in banks], [3, 99])
                     communication, observed = _Stream(), []
                     dispatcher = object.__new__(AscendOpsDispatcher)
@@ -715,7 +1105,8 @@ class TestAscendPrefillIntegration(CustomTestCase):
                     self.assertEqual([b.item() for b in banks], [3, 99])
                     self.assertEqual(observed, [])
                     communication.drain()
-                    self.assertEqual(observed, [[3, 4]])
+                    self.assertEqual(observed, [[3, 99]])
+                    self.assertFalse(owner.weight_copy_stream.tail.done)
 
     def test_refill_waits_for_combine_submission_and_device_completion(self):
         """Refilling a consumed bank must neither delay nor race its return collective."""
@@ -727,10 +1118,11 @@ class TestAscendPrefillIntegration(CustomTestCase):
                     communication, trace = _Stream(), []
                     load = owner.prefill.host_ops.materialize_into
 
-                    def tracked_load(layer, bank, stream):
-                        trace.append(f"submit-{layer}")
-                        load(layer, bank, stream)
-                        stream.enqueue(lambda: trace.append(f"copy-{layer}"))
+                    def tracked_load(plan, bank, stream):
+                        layer, phase = plan
+                        trace.append(f"submit-{layer}-{phase}")
+                        load(plan, bank, stream)
+                        stream.enqueue(lambda: trace.append(f"copy-{layer}-{phase}"))
                         return SimpleNamespace(completion=_Completion(stream.tail))
 
                     owner.prefill.host_ops.materialize_into = tracked_load
@@ -748,7 +1140,7 @@ class TestAscendPrefillIntegration(CustomTestCase):
 
                     self.assertEqual(submitted, [3, 4, 5])
                     self.assertLess(
-                        trace.index("combine-submit"), trace.index("submit-5")
+                        trace.index("combine-submit"), trace.index("submit-5-w13")
                     )
                     self.assertFalse(communication.tail.done)
                     self.assertEqual(owner.prefill.pipeline.current, 1)
@@ -757,10 +1149,12 @@ class TestAscendPrefillIntegration(CustomTestCase):
                     # before overwriting bank A, including on an empty rank.
                     owner.weight_copy_stream.drain()
                     self.assertTrue(communication.tail.done)
-                    self.assertLess(trace.index("combine-done"), trace.index("copy-5"))
+                    self.assertLess(
+                        trace.index("combine-done"), trace.index("copy-5-w13")
+                    )
                     if mode == "alltoallv":
                         self.assertLess(
-                            trace.index("finalize-done"), trace.index("copy-5")
+                            trace.index("finalize-done"), trace.index("copy-5-w13")
                         )
                     self.assertTrue(torch.equal(result, torch.full_like(values, 3)))
                     self.assertEqual(banks[0].item(), 5)

@@ -1,11 +1,45 @@
 """Whole-layer eager prefill over two views of the native expert pools.
 
 Adapted from codex/moe-prefill-opt-20261102 (2dc7903d0b). Each bank is reused
-only after its layer's combine. Before the next offloaded dispatch, join all
-submitted copies so lookahead H2D cannot spill into its MoE communication.
+only after its layer's combine. Dispatch never waits for future weights;
+each projection joins its own copy immediately before consuming that bank.
 Borrowed Hot bytes are restored before decode or cache maintenance can consume
 the published cache addresses.
 """
+
+from dataclasses import dataclass
+
+from ...transfer import HostCopyPlan, HostCopyRegion, TransferTicket
+
+
+@dataclass(frozen=True)
+class PrefillLayerTransfer:
+    w13: TransferTicket
+    w2: TransferTicket
+
+
+def _projection_copy_plans(storage, bank, layouts):
+    groups = tuple(
+        tuple(name for name in layouts if name.startswith(prefix))
+        for prefix in ("w13_", "w2_")
+    )
+    if not all(groups) or sum(map(len, groups)) != len(layouts):
+        raise ValueError("Prefill requires complete W13 and W2 component groups")
+    return tuple(
+        HostCopyPlan(
+            tuple(
+                HostCopyRegion(source, destination, 0, 0, layouts[name].nbytes)
+                for name in group
+                for source, destination in zip(
+                    storage.component_capabilities[name],
+                    bank.component_regions[name],
+                    strict=True,
+                )
+            ),
+            (storage, bank),
+        )
+        for group in groups
+    )
 
 
 def whole_layer_bank_layout(local_experts, hot_slots, execution_slots):
@@ -69,22 +103,23 @@ class LayerPrefetchPipeline:
         self._require_current(layer, context)
         if self.started:
             raise RuntimeError("Prefill layer entry was already consumed")
-        # A single FIFO copy stream covers both banks. Waiting only for this
-        # layer at acquire() leaves the lookahead copy competing with dispatch
-        # and return AllToAllV. Join its latest submitted ticket before the
-        # dispatcher's existing count/row-size AllGather rendezvous. Every EP
-        # rank, including a locally idle one, then reaches payload communication
-        # with its outstanding prefetch complete. This enqueues a device wait;
-        # it does not synchronize the Python thread or add a collective.
-        self.ready[max(self.ready)].completion.wait_on(context.compute_stream)
+        # Dispatch consumes tokens, not weights. Waiting here for the next
+        # layer would also stall the host at the dispatcher's count readback,
+        # serializing this layer's MoE with an unrelated future H2D.
         self.started = True
 
     def acquire(self, layer, context):
         self._require_current(layer, context)
         if not self.started:
             raise RuntimeError("Start the prefill layer before acquiring weights")
-        self.ready[self.current].completion.wait_on(context.compute_stream)
+        self.ready[self.current].w13.completion.wait_on(context.compute_stream)
         return self.current % 2
+
+    def wait_for_w2(self, layer, context):
+        self._require_current(layer, context)
+        if not self.started:
+            raise RuntimeError("Start the prefill layer before acquiring weights")
+        self.ready[self.current].w2.completion.wait_on(context.compute_stream)
 
     def retire(self, layer, reader, context):
         self._require_current(layer, context)
@@ -109,7 +144,6 @@ class AscendPrefillWeights:
     def __init__(self, owner):
         import torch
 
-        from ...transfer import HostCopyPlan, HostCopyRegion
         from .native_acl import AclHostTransferOps
 
         self.owner = owner
@@ -133,21 +167,10 @@ class AscendPrefillWeights:
         self.plans = {}
         for index, spec in enumerate(owner.catalog.offloaded_layers):
             storage, bank = owner.storages[spec.layer_id], self.banks[index % 2]
-            plan = HostCopyPlan(
-                tuple(
-                    HostCopyRegion(
-                        source, destination, 0, 0, owner.format.layouts[name].nbytes
-                    )
-                    for name in owner.format.layouts
-                    for source, destination in zip(
-                        storage.component_capabilities[name],
-                        bank.component_regions[name],
-                    )
-                ),
-                (storage, bank),
-            )
-            self.plans[spec.layer_id] = plan
-            self.host_ops.prepare(plan, owner.device)
+            plans = _projection_copy_plans(storage, bank, owner.format.layouts)
+            self.plans[spec.layer_id] = plans
+            for plan in plans:
+                self.host_ops.prepare(plan, owner.device)
         self.pipeline = LayerPrefetchPipeline(
             (spec.layer_id for spec in owner.catalog.offloaded_layers),
             load=self._load,
@@ -193,9 +216,15 @@ class AscendPrefillWeights:
         if bank == 1 and self.borrows_hot:
             # Mark before submission, which may enqueue only a partial bundle.
             self.hot_dirty = True
-        return self.host_ops.materialize_into(
-            self.plans[layer], self.banks[bank], self.owner.weight_copy_stream
+        # Record W13 readiness before enqueueing W2 on the same FIFO stream.
+        # GMM1 and activation may then execute while W2 is still being copied.
+        w13, w2 = (
+            self.host_ops.materialize_into(
+                plan, self.banks[bank], self.owner.weight_copy_stream
+            )
+            for plan in self.plans[layer]
         )
+        return PrefillLayerTransfer(w13, w2)
 
     def weights(self, layer, runner_input):
         import torch
