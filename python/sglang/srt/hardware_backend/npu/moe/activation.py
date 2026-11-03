@@ -51,6 +51,23 @@ class NPUSwigluQuant(BaseActivation):
         return hidden_states, swiglu_out_scale
 
 
+class NPUSwigluInt8QuantWithLimit(BaseActivation):
+    """Clip gate/up before SiLU, then requantize each row for INT8 GMM2.
+
+    DSV4's swiglu_limit is distinct from the SwiGLU-OAI alpha/limit/bias
+    convention. Use the same clipped activation as its shared experts.
+    """
+
+    def __init__(self, limit: float):
+        self.limit = float(limit)
+
+    def _apply_activation(self, hidden_states: torch.Tensor):
+        activated = torch.ops.npu.npu_clipped_swiglu(
+            hidden_states, alpha=1, limit=self.limit, bias=0, interleaved=False
+        )
+        return torch.ops.npu.npu_dynamic_quant(activated, dst_type=torch.int8)
+
+
 class NPUSwigluQuantWithScales(BaseActivation):
     def _apply_activation(
         self,

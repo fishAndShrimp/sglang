@@ -17,6 +17,7 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
     NPUSituMXFP8Quant,
     NPUSwiglu,
     NPUSwigluDeepEPKernel,
+    NPUSwigluInt8QuantWithLimit,
     NPUSwigluMxfp8Quant,
     NPUSwigluOAI,
     NPUSwigluQuant,
@@ -154,6 +155,13 @@ class AscendRunnerCore(MoeRunnerCore):
             # for each transport: routing may quantize the input, while BF16
             # dispatcher output is quantized before gmm1 when scales are absent.
             self.activation = None
+        elif (
+            isinstance(kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod))
+            and config.activation == "silu"
+            and config.swiglu_limit is not None
+            and config.swiglu_limit > 0
+        ):
+            self.activation = NPUSwigluInt8QuantWithLimit(config.swiglu_limit)
         elif (
             isinstance(kernel, (NPUW4A8MXFP4MoEMethod, NPUMXFP8MoEMethod))
             and config.swiglu_limit is not None
