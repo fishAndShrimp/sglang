@@ -35,7 +35,6 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUW4A8MXFP4MoEMethod,
     NPUW8A8Int8MoEMethod,
 )
-from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -252,10 +251,6 @@ class AscendRunnerCore(MoeRunnerCore):
         expert_tokens = runner_input.expert_tokens
         group_list_type = runner_input.group_list_type
 
-        if owner is not None and get_is_extend_in_batch() and x.shape[0] == 0:
-            owner.prefill.finish_layer(self.config.layer.layer_id)
-            return AscendRunnerOutput(hidden_states=x.to(original_dtype))
-
         w13_kernel = self.config.layer.w13_kernel
 
         if _uses_fused_gmm1(w13_kernel, self.config):
@@ -316,8 +311,6 @@ class AscendRunnerCore(MoeRunnerCore):
             weight_prefix="w2",
             group_list_type=group_list_type,
         )
-        if owner is not None and get_is_extend_in_batch():
-            owner.prefill.finish_layer(self.config.layer.layer_id)
         return AscendRunnerOutput(hidden_states=hidden_states)
 
 
@@ -543,15 +536,9 @@ def _pre_permute_allgather(
     state.expert_tokens = routed.expert_tokens
     state.num_routes = local_ids.numel()
     running_state["ascend_ops_forward_state"] = state
-    hidden_states, scale = routed.hidden_states, routed.scale
-    if getattr(runner_config.layer, "_ascend_ops_offloader", None) is not None:
-        rows = int(routed.expert_tokens.sum().item())
-        hidden_states = hidden_states[:rows]
-        if scale is not None:
-            scale = scale[:rows]
     return AscendRunnerInput(
-        hidden_states=hidden_states,
-        hidden_states_scale=scale,
+        hidden_states=routed.hidden_states,
+        hidden_states_scale=routed.scale,
         expert_tokens=routed.expert_tokens,
         group_list_type=dispatch_output.group_list_type,
     )

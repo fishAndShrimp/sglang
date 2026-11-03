@@ -178,9 +178,6 @@ class AscendOpsDispatcher(BaseDispatcher):
     ) -> DispatchOutput:
         topk_weights, topk_ids, _ = topk_output
         if get_is_extend_in_batch():
-            owner = getattr(self._offload_layer, "_ascend_ops_offloader", None)
-            if owner is not None:
-                owner.start_prefill_layer(self._offload_layer.layer_id)
             if self.moe_ascend_ops_config.prefill == "allgather":
                 return self._dispatch_allgather(
                     hidden_states, topk_weights, topk_ids, self.tp_group
