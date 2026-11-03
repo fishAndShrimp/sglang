@@ -51,18 +51,19 @@ class LayerPrefetchPipeline:
             reader.completion.wait_on(self.copy_stream)
         self.ready[index] = self.load(self.layer_ids[index], index % 2, context)
 
+    def begin_forward(self, context):
+        if self.invocation_id is not None:
+            raise RuntimeError("Reset the previous prefill before beginning a forward")
+        self.invocation_id = context.invocation_id
+        # Record before any model work so resident layers and attention can hide H2D.
+        context.record_compute_completion().completion.wait_on(self.copy_stream)
+        self._submit(0, context)
+        if len(self.layer_ids) > 1:
+            self._submit(1, context)
+
     def start(self, layer, context):
-        if self.current == len(self.layer_ids):
-            self.reset()
         if self.invocation_id is None:
-            if layer != self.layer_ids[0]:
-                raise RuntimeError("Start prefill at the first offloaded layer")
-            self.invocation_id = context.invocation_id
-            # This is the only global compute-to-copy frontier in the prefetch.
-            context.record_compute_completion().completion.wait_on(self.copy_stream)
-            self._submit(0, context)
-            if len(self.layer_ids) > 1:
-                self._submit(1, context)
+            raise RuntimeError("Begin prefill at forward entry before starting a layer")
         self._require_current(layer, context)
         if self.started:
             raise RuntimeError("Prefill layer entry was already consumed")

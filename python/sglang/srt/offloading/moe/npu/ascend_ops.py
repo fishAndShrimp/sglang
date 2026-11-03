@@ -585,6 +585,10 @@ class AscendOpsOffloader(BaseOffloader):
         self.state.step_access_count.zero_()
         self.state.update_enabled.fill_(True)
         try:
+            # RuntimeContext's flag is installed later by _forward_raw; use this
+            # batch's global phase, including locally idle/decode attention ranks.
+            if forward_batch is not None and forward_batch.is_extend_in_batch:
+                self.prefill.pipeline.begin_forward(self.context)
             yield
             self.prefill.pipeline.finish_forward(self.context)
             self.step += 1

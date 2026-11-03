@@ -111,6 +111,7 @@ class TestLayerPrefetchPipeline(CustomTestCase):
                     return SimpleNamespace(completion=_Completion(copy.tail))
 
                 pipeline = LayerPrefetchPipeline(layers, load=load, copy_stream=copy)
+                pipeline.begin_forward(context)
                 for index, layer in enumerate(layers):
                     pipeline.start(layer, context)
                     if index == 0:
@@ -141,8 +142,13 @@ class TestLayerPrefetchPipeline(CustomTestCase):
             load=lambda *args: SimpleNamespace(completion=_Completion(None)),
             copy_stream=copy,
         )
-        with self.assertRaisesRegex(RuntimeError, "first offloaded"):
+        with self.assertRaisesRegex(RuntimeError, "forward entry"):
+            pipeline.start(3, context)
+        pipeline.begin_forward(context)
+        with self.assertRaisesRegex(RuntimeError, "model order"):
             pipeline.start(4, context)
+        with self.assertRaisesRegex(RuntimeError, "previous prefill"):
+            pipeline.begin_forward(_Context())
         pipeline.start(3, context)
         with self.assertRaisesRegex(RuntimeError, "already consumed"):
             pipeline.start(3, context)
@@ -163,10 +169,12 @@ class TestLayerPrefetchPipeline(CustomTestCase):
         pipeline = LayerPrefetchPipeline((3,), load=load, copy_stream=copy)
         for _ in range(2):
             context = _Context()
+            pipeline.begin_forward(context)
             pipeline.start(3, context)
             pipeline.acquire(3, context)
             pipeline.retire(3, context.record_compute_completion(), context)
             pipeline.finish_forward(context)
+            pipeline.reset()
         self.assertEqual(len(submitted), 2)
         self.assertIsNot(submitted[0], submitted[1])
 
@@ -353,6 +361,165 @@ class TestPrefillAclDescriptors(CustomTestCase):
 
 
 class TestAscendPrefillIntegration(CustomTestCase):
+    def _forward_owner(self, *, fail_second_load=False):
+        from sglang.srt.offloading.moe.npu.ascend_ops import AscendOpsOffloader
+
+        context, copy = _Context(), _Stream()
+        banks, submitted = [torch.tensor([0]), torch.tensor([99])], []
+        owner = object.__new__(AscendOpsOffloader)
+        owner.ready, owner.step, owner.decode_active_rows = True, 0, None
+        owner.weight_copy_stream = copy
+        owner.state = SimpleNamespace(
+            step_access_count=torch.zeros(3, dtype=torch.int64),
+            update_enabled=torch.tensor(False),
+        )
+        owner.policy = SimpleNamespace(config=SimpleNamespace(update_interval=4))
+        owner._check_error = lambda: None
+        owner.cache_tail_graphs = {
+            due: SimpleNamespace(replay=lambda: None) for due in (False, True)
+        }
+        weights = object.__new__(AscendPrefillWeights)
+        owner.prefill, weights.owner = weights, owner
+        weights.borrows_hot, weights.hot_dirty = True, False
+        weights.banks, weights.plans = banks, {layer: layer for layer in (3, 4, 5)}
+        weights.restore_plan = SimpleNamespace(
+            valid=torch.tensor([True]), count=torch.zeros((), dtype=torch.int32)
+        )
+        weights.restore_bindings = object()
+
+        def load(layer, bank, stream):
+            submitted.append(layer)
+            stream.enqueue(lambda: bank.fill_(layer))
+            if fail_second_load and layer == 4:
+                raise RuntimeError("partial initial H2D")
+            return SimpleNamespace(completion=_Completion(stream.tail))
+
+        def restore(plan, bindings, stream):
+            stream.enqueue(lambda: banks[1].fill_(99))
+
+        weights.host_ops = SimpleNamespace(materialize_into=load)
+        weights.restore_ops = SimpleNamespace(materialize_into=restore)
+        weights.pipeline = LayerPrefetchPipeline(
+            (3, 4, 5), load=weights._load, copy_stream=copy
+        )
+        return owner, context, banks, submitted
+
+    def test_forward_entry_prefetch_precedes_model_on_all_prefill_ranks(self):
+        """Initial copies must be submitted before even resident-layer attention."""
+        for global_extend, local_extend, idle in (
+            (True, True, False),
+            (True, False, True),
+            (True, False, False),
+        ):
+            with self.subTest(
+                global_extend=global_extend, local_extend=local_extend, idle=idle
+            ):
+                owner, context, banks, submitted = self._forward_owner()
+                batch = SimpleNamespace(
+                    is_extend_in_batch=global_extend,
+                    forward_mode=SimpleNamespace(
+                        is_extend_without_speculative=lambda: local_extend,
+                        is_idle=lambda: idle,
+                    ),
+                )
+                observed = []
+                with (
+                    patch(
+                        "sglang.srt.offloading.moe.npu.ascend_ops._Context",
+                        return_value=context,
+                    ),
+                    patch(
+                        "sglang.srt.layers.dp_attention.get_is_extend_in_batch",
+                        return_value=False,
+                    ),
+                    patch.object(
+                        torch,
+                        "npu",
+                        SimpleNamespace(current_stream=lambda: context.compute_stream),
+                        create=True,
+                    ),
+                ):
+                    with owner.forward_scope(batch):
+                        self.assertEqual(submitted, [3, 4])
+                        # Represents attention / resident MoE before the first
+                        # offloaded dispatcher can consume a layer entry.
+                        context.compute_stream.enqueue(
+                            lambda: observed.append("resident")
+                        )
+                        owner.weight_copy_stream.drain()
+                        self.assertEqual(observed, [])
+                        self.assertEqual([bank.item() for bank in banks], [3, 4])
+                        for layer in (3, 4, 5):
+                            owner.start_prefill_layer(layer)
+                            bank = owner.prefill.pipeline.acquire(layer, context)
+                            context.compute_stream.enqueue(
+                                lambda bank=bank: observed.append(banks[bank].item())
+                            )
+                            owner.prefill.finish_layer(layer)
+                self.assertEqual(submitted, [3, 4, 5])
+                self.assertEqual(observed, ["resident", 3, 4, 5])
+                self.assertEqual(banks[1].item(), 99)
+                self.assertIsNone(owner.prefill.pipeline.invocation_id)
+
+    def test_decode_verify_and_global_idle_ignore_stale_prefill_flag(self):
+        for name, idle in (
+            ("decode", False),
+            ("target_verify", False),
+            ("idle", True),
+            ("local_extend_label", False),
+        ):
+            with self.subTest(mode=name):
+                owner, context, _, submitted = self._forward_owner()
+                batch = SimpleNamespace(
+                    is_extend_in_batch=False,
+                    forward_mode=SimpleNamespace(
+                        is_extend_without_speculative=lambda: name
+                        == "local_extend_label",
+                        is_idle=lambda: idle,
+                    ),
+                )
+                with (
+                    patch(
+                        "sglang.srt.offloading.moe.npu.ascend_ops._Context",
+                        return_value=context,
+                    ),
+                    patch(
+                        "sglang.srt.layers.dp_attention.get_is_extend_in_batch",
+                        return_value=True,
+                    ),
+                ):
+                    with owner.forward_scope(batch):
+                        self.assertEqual(submitted, [])
+                self.assertEqual(submitted, [])
+                self.assertEqual(owner.step, 1)
+
+    def test_initial_prefetch_failure_restores_hot_before_model_entry(self):
+        owner, context, banks, submitted = self._forward_owner(fail_second_load=True)
+        batch = SimpleNamespace(is_extend_in_batch=True)
+        entered = False
+        with (
+            patch(
+                "sglang.srt.offloading.moe.npu.ascend_ops._Context",
+                return_value=context,
+            ),
+            patch.object(
+                torch,
+                "npu",
+                SimpleNamespace(current_stream=lambda: context.compute_stream),
+                create=True,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "partial initial H2D"):
+                with owner.forward_scope(batch):
+                    entered = True
+        self.assertFalse(entered)
+        self.assertEqual(submitted, [3, 4])
+        self.assertEqual(banks[1].item(), 99)
+        self.assertFalse(owner.prefill.hot_dirty)
+        self.assertIsNone(owner.prefill.pipeline.invocation_id)
+        self.assertFalse(owner.state.update_enabled.item())
+        self.assertEqual(owner.step, 0)
+
     def test_decode_keeps_packed_preparation_and_w2_event(self):
         from sglang.srt.offloading.moe.npu.ascend_ops import AscendOpsOffloader
 
@@ -440,7 +607,8 @@ class TestAscendPrefillIntegration(CustomTestCase):
                 create=True,
             ),
         ):
-            with owner.forward_scope():
+            batch = SimpleNamespace(is_extend_in_batch=True)
+            with owner.forward_scope(batch):
                 for layer in (3, 4, 5):
                     owner.start_prefill_layer(layer)
                     bank = weights.pipeline.acquire(layer, context)
@@ -593,7 +761,7 @@ class TestAscendPrefillIntegration(CustomTestCase):
         self.assertTrue(torch.equal(decoded.hidden_states, result.hidden_states))
         self.assertEqual(sequence, ["w13", "w2-ready", "w2"])
 
-    def test_prefetch_starts_before_prefill_communication_on_idle_rank(self):
+    def test_prefill_dispatch_consumes_layer_entry_on_idle_rank(self):
         from sglang.srt.layers.moe.token_dispatcher.ascend_ops import (
             AscendOpsDispatcher,
         )
@@ -603,7 +771,7 @@ class TestAscendPrefillIntegration(CustomTestCase):
         dispatcher._offload_layer = SimpleNamespace(
             layer_id=3,
             _ascend_ops_offloader=SimpleNamespace(
-                start_prefill_layer=lambda layer: sequence.append("prefetch")
+                start_prefill_layer=lambda layer: sequence.append("enter-prefill")
             ),
         )
         dispatcher.moe_ascend_ops_config = SimpleNamespace(prefill="alltoallv")
@@ -622,7 +790,7 @@ class TestAscendPrefillIntegration(CustomTestCase):
                 torch.empty((0, 4)), (torch.empty((0, 2)), torch.empty((0, 2)), None)
             )
         self.assertEqual(result, "received peer tokens")
-        self.assertEqual(sequence, ["prefetch", "dispatch"])
+        self.assertEqual(sequence, ["enter-prefill", "dispatch"])
 
         sequence.clear()
         dispatcher._dispatch_low_latency = dispatch
