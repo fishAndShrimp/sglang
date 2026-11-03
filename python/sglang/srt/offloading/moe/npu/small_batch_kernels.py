@@ -47,3 +47,31 @@ def prepare_packed_copies(
             Sources + component * SOURCE_STRIDE + START + e, e < EXPERTS, 0
         )
         tl.store(OutSources + position * EXPERTS + e, source, e < EXPERTS)
+
+
+@triton.jit
+def prepare_prefill_counts(
+    Counts,
+    Error,
+    Enabled,
+    Access,
+    OutCounts,
+    EXPERTS: tl.constexpr,
+    CUMULATIVE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Keep full-layer expert order; normalize counts and observe usage once."""
+    e = tl.arange(0, BLOCK)
+    inside = e < EXPERTS
+    count = tl.load(Counts + e, inside, 0)
+    if CUMULATIVE:
+        previous = tl.load(Counts + e - 1, (e > 0) & inside, 0)
+        count = count - previous
+    bad = tl.sum(((count < 0) & inside).to(tl.int32), 0) > 0
+    error = tl.load(Error) | bad.to(tl.int32)
+    tl.store(Error, error)
+    count = tl.where(error == 0, count, 0)
+    tl.store(OutCounts + e, count, inside)
+    accesses = tl.load(Access + e, inside, 0)
+    enabled = tl.load(Enabled) != 0
+    tl.store(Access + e, accesses + tl.where(enabled, count, 0), inside)
