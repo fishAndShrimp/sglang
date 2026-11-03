@@ -7,6 +7,7 @@ AllGather, AllToAllV, and MC2 communication paths.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Any, NamedTuple, Optional
 
 import torch
@@ -98,6 +99,7 @@ class _MC2State:
     """Per-forward metadata required by MC2 combine."""
 
     num_tokens: int
+    num_experts: int
     assist_info_for_combine: torch.Tensor
     ep_send_counts: torch.Tensor
     x_active_mask: Optional[torch.Tensor]
@@ -152,11 +154,15 @@ class AscendOpsDispatcher(BaseDispatcher):
         self.num_experts = moe_runner_config.num_experts
         self.num_local_experts = moe_runner_config.num_local_experts
         self.top_k = moe_runner_config.top_k
+        self._offload_layer = moe_runner_config.layer
         self.hidden_size = moe_runner_config.hidden_size
         self.quant_config: Optional[dict] = None
         self._ep_comm_name: Optional[str] = None
         self._pad_buffers: dict[tuple, tuple] = {}
-        if self.moe_ascend_ops_config.prefill == "allgather":
+        if (
+            self.moe_ascend_ops_config.prefill == "allgather"
+            or self.moe_ascend_ops_config.decode.startswith("allgather")
+        ):
             if not (
                 parallel.tp_size == parallel.moe_ep_size
                 and self.num_local_experts * self.ep_size == self.num_experts
@@ -167,6 +173,13 @@ class AscendOpsDispatcher(BaseDispatcher):
                     "and no fused shared experts"
                 )
 
+        if self.moe_ascend_ops_config.decode.startswith("allgather") and (
+            parallel.attn_dp_size != self.ep_size or parallel.attn_cp_size != 1
+        ):
+            raise ValueError(
+                "Experimental AllGather decode requires TP=EP=attention-DP and CP=1"
+            )
+
     def set_quant_config(self, quant_config: dict) -> None:
         """Store quantization settings used by the routing kernels."""
 
@@ -176,6 +189,13 @@ class AscendOpsDispatcher(BaseDispatcher):
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> DispatchOutput:
         topk_weights, topk_ids, _ = topk_output
+        if self.ep_size == 1 and get_parallel().tp_size == 1:
+            # Local routing still uses the common permute/GMM/finalize path.
+            # No MC2 or one-rank collectives are needed for TP=EP=1.
+            return self._dispatch_allgather(
+                hidden_states, topk_weights, topk_ids, self.ep_group,
+                row_sizes=[hidden_states.shape[0]],
+            )
         if get_is_extend_in_batch():
             if self.moe_ascend_ops_config.prefill == "allgather":
                 return self._dispatch_allgather(
@@ -185,6 +205,26 @@ class AscendOpsDispatcher(BaseDispatcher):
                 hidden_states, topk_weights, topk_ids, self.tp_group
             )
 
+        if self.moe_ascend_ops_config.decode.startswith("allgather"):
+            from sglang.srt.model_executor.runner_utils.capture_mode import (
+                get_is_capture_mode,
+            )
+
+            # Full-graph capture gives every DP rank the same static row bucket.
+            # Eager fallback still exchanges actual row sizes for uneven shards.
+            row_sizes = (
+                [hidden_states.shape[0]] * self.ep_size
+                if get_is_capture_mode()
+                else None
+            )
+            return self._dispatch_allgather(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                self.ep_group,
+                row_sizes=row_sizes,
+                packed=self.moe_ascend_ops_config.decode == "allgather_packed",
+            )
         return self._dispatch_low_latency(hidden_states, topk_weights, topk_ids)
 
     def combine(self, combine_input: CombineInput) -> torch.Tensor:
@@ -237,10 +277,36 @@ class AscendOpsDispatcher(BaseDispatcher):
         quant_mode = self._quant_mode("mc2", dtype_mode)
 
         x_active_mask = None
+        physical_experts = self.num_experts
+        owner = getattr(self._offload_layer, "_ascend_ops_decode_mask_owner", None)
+        if owner is None:
+            owner = getattr(self._offload_layer, "_ascend_ops_offloader", None)
+        if owner is not None:
+            live_mask = owner.decode_row_mask(padded_bs)
+            if live_mask is not None:
+                x_active_mask = live_mask
+            replica = getattr(owner, "static_replica", None)
+            if replica is not None:
+                topk_ids = replica.route(self._offload_layer.layer_id, topk_ids, x_active_mask)
+                physical_experts = owner.copy_capacity * self.ep_size
         if padded_bs != num_tokens:
-            hidden_states, topk_ids, topk_weights, x_active_mask = self._pad_batch(
-                hidden_states, topk_ids, topk_weights, num_tokens, padded_bs
+            # Experimental offload-only small-prefix packing. The authoritative
+            # device mask excludes stale rows left by other graph buckets.
+            pack_mask = (
+                x_active_mask
+                if os.environ.get("SGLANG_NPU_FUSED_MC2_PAD", "0") == "1"
+                and getattr(self._offload_layer, "_ascend_ops_offloader", None) is not None
+                and hidden_states.dtype == torch.bfloat16
+                and 0 < num_tokens <= 8
+                and 0 < topk_ids.shape[1] <= 32
+                else None
             )
+            hidden_states, topk_ids, topk_weights, pad_mask = self._pad_batch(
+                hidden_states, topk_ids, topk_weights, num_tokens, padded_bs,
+                authoritative_mask=pack_mask,
+            )
+            if x_active_mask is None:
+                x_active_mask = pad_mask
 
         mxfp8_args = (
             {"y_dtype": _TORCH_DTYPE_TO_ATEN[torch.float8_e4m3fn]}
@@ -262,7 +328,7 @@ class AscendOpsDispatcher(BaseDispatcher):
             self._get_ep_comm_name(),
             self.ep_size,
             self.ep_rank,
-            self.num_experts,
+            physical_experts,
             x_active_mask=x_active_mask,
             quant_mode=quant_mode,
             global_bs=0,
@@ -284,8 +350,16 @@ class AscendOpsDispatcher(BaseDispatcher):
 
         expand_scales = None
 
+        observer = getattr(self._offload_layer, "_resident_dispatch_observer", None)
+        if observer is not None:
+            observer.observe(self._offload_layer.layer_id, expert_token_nums)
+        predictor = getattr(self._offload_layer, "_dispatch_prefetch", None)
+        if predictor is not None:
+            predictor.on_dispatch(self._offload_layer.layer_id, expand_x, expert_token_nums, dynamic_scales)
+
         state = _MC2State(
             num_tokens=num_tokens,
+            num_experts=physical_experts,
             assist_info_for_combine=assist_info_for_combine,
             ep_send_counts=ep_recv_counts,
             x_active_mask=x_active_mask,
@@ -315,6 +389,7 @@ class AscendOpsDispatcher(BaseDispatcher):
         topk_weights: torch.Tensor,
         num_tokens: int,
         padded_bs: int,
+        authoritative_mask: Optional[torch.Tensor] = None,
     ):
         """Copy a possibly shorter batch into reusable padded buffers."""
         key = (padded_bs, hidden_states.shape[1], topk_ids.shape[1])
@@ -328,6 +403,18 @@ class AscendOpsDispatcher(BaseDispatcher):
                 0,
             )
         padded_x, padded_ids, padded_weights, mask, filled = bufs
+
+        if authoritative_mask is not None:
+            from sglang.srt.offloading.moe.npu.dispatch_pack import pack_prefix
+
+            pack_prefix(hidden_states, topk_ids, topk_weights,
+                        padded_x, padded_ids, padded_weights)
+            # Force a later generic capture to clear the entire unused suffix.
+            # The device live mask, not this host-side watermark, guards replay.
+            self._pad_buffers[key] = (
+                padded_x, padded_ids, padded_weights, mask, padded_bs
+            )
+            return padded_x, padded_ids, padded_weights, authoritative_mask
 
         padded_x[:num_tokens] = hidden_states
         padded_ids[:num_tokens] = topk_ids
@@ -362,7 +449,7 @@ class AscendOpsDispatcher(BaseDispatcher):
             self._get_ep_comm_name(),
             self.ep_size,
             self.ep_rank,
-            self.num_experts,
+            state.num_experts,
             x_active_mask=state.x_active_mask,
             expand_scales=state.expand_scales,
             global_bs=0,
@@ -426,7 +513,16 @@ class AscendOpsDispatcher(BaseDispatcher):
         dist.all_gather(gathered_rows, local_rows_tensor, group=group)
         return [int(rows.item()) for rows in gathered_rows]
 
-    def _dispatch_allgather(self, hidden_states, topk_weights, topk_ids, group):
+    def _dispatch_allgather(
+        self,
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        group,
+        *,
+        row_sizes=None,
+        packed=False,
+    ):
         """Gather the full batch on every TP rank."""
         input_dtype = hidden_states.dtype
         quant_mode = self._quant_mode("routing")
@@ -439,9 +535,10 @@ class AscendOpsDispatcher(BaseDispatcher):
         # equal split and becomes incorrect as soon as CP is enabled.  Exchange
         # the actual local row count so the subsequent padded all-gather and
         # reduce-scatter use the exact layout produced by the attention path.
-        row_sizes = self._allgather_row_sizes(
-            hidden_states.shape[0], group, hidden_states.device
-        )
+        if row_sizes is None:
+            row_sizes = self._allgather_row_sizes(
+                hidden_states.shape[0], group, hidden_states.device
+            )
         world_size = len(row_sizes)
         max_rows = max(row_sizes)
         if max_rows == 0:
@@ -450,6 +547,8 @@ class AscendOpsDispatcher(BaseDispatcher):
         equal_rows = min(row_sizes) == max_rows
 
         def gather_rows(tensor):
+            if world_size == 1:
+                return tensor
             if equal_rows:
                 padded = tensor.contiguous()
             else:
@@ -482,16 +581,55 @@ class AscendOpsDispatcher(BaseDispatcher):
                     (0, (self.hidden_size + 63) // 64, 2), dtype=torch.uint8
                 )
 
+        gathered_scales = None
+        if packed:
+            if quant_mode not in (-1, INT8_QUANT_MODE):
+                raise NotImplementedError(
+                    "Packed decode AllGather supports BF16/INT8 routing only"
+                )
+            # Bit-preserving packet: one collective instead of independent
+            # feature / weight / ID collectives. The ordinary runner still
+            # performs routing, quantization, expert compute and weighted sum.
+            feature_bytes = hidden_states.shape[1] * hidden_states.element_size()
+            weight_bytes = topk_weights.shape[1] * 4
+            packet = torch.cat(
+                (
+                    hidden_states.contiguous().view(torch.uint8),
+                    topk_weights.float().contiguous().view(torch.uint8),
+                    topk_ids.to(torch.int32).contiguous().view(torch.uint8),
+                ),
+                dim=1,
+            )
+            gathered = gather_rows(packet)
+            gathered_x = (
+                gathered[:, :feature_bytes].contiguous().view(hidden_states.dtype)
+            )
+            gathered_weights = (
+                gathered[:, feature_bytes : feature_bytes + weight_bytes]
+                .contiguous()
+                .view(torch.float32)
+            )
+            gathered_ids = (
+                gathered[:, feature_bytes + weight_bytes :]
+                .contiguous()
+                .view(torch.int32)
+            )
+        else:
+            gathered_x = gather_rows(hidden_states)
+            gathered_scales = gather_rows(scales) if scales is not None else None
+            gathered_weights = gather_rows(topk_weights.float())
+            gathered_ids = gather_rows(topk_ids.to(torch.int32))
+
         state = _AllGatherState(
             group=group,
             row_sizes=row_sizes,
             input_dtype=input_dtype,
         )
         return AscendOpsDispatchOutput(
-            hidden_states=gather_rows(hidden_states),
-            hidden_states_scale=gather_rows(scales) if scales is not None else None,
-            topk_weights=gather_rows(topk_weights.float()),
-            topk_ids=gather_rows(topk_ids.to(torch.int32)),
+            hidden_states=gathered_x,
+            hidden_states_scale=gathered_scales,
+            topk_weights=gathered_weights,
+            topk_ids=gathered_ids,
             expert_tokens=None,
             group_list_type=1,
             exec_mode="allgather",
@@ -504,6 +642,8 @@ class AscendOpsDispatcher(BaseDispatcher):
     ) -> torch.Tensor:
         """ReduceScatter contributions back to the local shard."""
         sizes = state.row_sizes
+        if len(sizes) == 1:
+            return contributions[:sizes[0]].to(state.input_dtype)
         group = state.group
         max_rows = max(sizes)
         if min(sizes) == max_rows:

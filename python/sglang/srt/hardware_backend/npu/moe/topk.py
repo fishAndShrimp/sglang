@@ -2,7 +2,10 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_distribution import (
+    get_global_expert_distribution_recorder,
+    skip_noop_expert_distribution_recording,
+)
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
@@ -144,6 +147,8 @@ def _finalize_topk_npu(
     # NPU dispatch retains valid IDs; duplicating a padded row's routes onto
     # expert zero can exceed per-expert capacity in fused dispatch backends.
     _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
+    if skip_noop_expert_distribution_recording():
+        return StandardTopKOutput(topk_weights, topk_ids, router_logits)
     recorder_ids = routed_ids
     if num_token_non_padded is not None:
         rows = torch.arange(topk_ids.shape[0], device=topk_ids.device)

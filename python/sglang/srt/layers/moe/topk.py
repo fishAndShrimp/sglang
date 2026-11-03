@@ -2845,7 +2845,13 @@ def _post_process_topk_ids(
 
     if _is_npu:
         _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
-        if recorder_topk_ids is not None and num_token_non_padded is not None:
+        from sglang.srt.eplb.expert_distribution import (
+            skip_noop_expert_distribution_recording,
+        )
+
+        if skip_noop_expert_distribution_recording():
+            recorder_topk_ids = None
+        elif recorder_topk_ids is not None and num_token_non_padded is not None:
             rows = torch.arange(topk_ids.shape[0], device=topk_ids.device)
             recorder_topk_ids = recorder_topk_ids.masked_fill(
                 (rows >= num_token_non_padded)[:, None], -1

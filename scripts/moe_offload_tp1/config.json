@@ -1,0 +1,18 @@
+{
+  "cache_ratio": 0.2,
+  "offline_model_id": "DeepSeek-V4-Flash",
+  "host_pool_gib": 128,
+  "skip_zero_offsets": false,
+  "cached_source_tables": true,
+  "fixed_copy_lengths": true,
+  "bundle_copies": true,
+  "overlap_w2": true,
+  "graph_cache_tail": true,
+  "fused_copy_metadata": true,
+  "fused_cache_transfer": true,
+  "incremental_cache": true,
+  "mask_decode_padding": true,
+  "dispatch_prefetch_mode": "off",
+  "static_replica_mode": "off",
+  "sparse_hot_gmm": false
+}

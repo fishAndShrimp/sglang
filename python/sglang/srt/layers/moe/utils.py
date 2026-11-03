@@ -118,7 +118,8 @@ class AscendOpsConfig:
     - ``prefill``: ``allgather`` (TP AllGather -> local compute -> TP ReduceScatter)
       or ``alltoallv`` (TP AllToAllv -> compute -> TP AllToAllv).
     - ``decode``: ``low_latency`` (EP MC2 dispatch_v2 -> gmm -> activation ->
-      gmm -> combine_v2) or ``fused_op`` (single dispatch_ffn_combine).
+      gmm -> combine_v2), experimental ``allgather`` for TP=EP=attention-DP,
+      or ``fused_op`` (single dispatch_ffn_combine).
     - ``ll_dispatch_alg`` / ``ll_combine_alg``: the ``comm_alg`` handed to the
       MC2 dispatch/combine ops of the ``low_latency`` path. The defaults are the
       ones recommended by the operator owners (full-mesh dispatch, default
@@ -126,7 +127,7 @@ class AscendOpsConfig:
     """
 
     PREFILL_CHOICES = ("allgather", "alltoallv")
-    DECODE_CHOICES = ("low_latency", "fused_op")
+    DECODE_CHOICES = ("low_latency", "allgather", "allgather_packed", "fused_op")
 
     prefill: str = "alltoallv"
     decode: str = "low_latency"

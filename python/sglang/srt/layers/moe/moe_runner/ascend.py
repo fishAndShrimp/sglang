@@ -17,6 +17,7 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
     NPUSituMXFP8Quant,
     NPUSwiglu,
     NPUSwigluDeepEPKernel,
+    NPUSwigluInt8QuantWithLimit,
     NPUSwigluMxfp8Quant,
     NPUSwigluOAI,
     NPUSwigluQuant,
@@ -155,6 +156,13 @@ class AscendRunnerCore(MoeRunnerCore):
             # dispatcher output is quantized before gmm1 when scales are absent.
             self.activation = None
         elif (
+            isinstance(kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod))
+            and config.activation == "silu"
+            and config.swiglu_limit is not None
+            and config.swiglu_limit > 0
+        ):
+            self.activation = NPUSwigluInt8QuantWithLimit(config.swiglu_limit)
+        elif (
             isinstance(kernel, (NPUW4A8MXFP4MoEMethod, NPUMXFP8MoEMethod))
             and config.swiglu_limit is not None
             and config.swiglu_limit > 0
@@ -243,10 +251,21 @@ class AscendRunnerCore(MoeRunnerCore):
         """
         Execute the MoE layer using NPU‑specific grouped matmul ops.
         """
+        # Activation consumes logical expert counts; GMM may address physical cache slots.
+        activation_tokens = runner_input.expert_tokens
+        activation_group_type = runner_input.group_list_type
+        owner = getattr(self.config.layer, "_ascend_ops_offloader", None)
+        if owner is not None:
+            quant_info = owner.prepare_weights(self.config.layer.layer_id, runner_input)
         x = runner_input.hidden_states
         original_dtype = torch.float16 if x.dtype == torch.float16 else torch.bfloat16
         expert_tokens = runner_input.expert_tokens
         group_list_type = runner_input.group_list_type
+        if owner is None or not getattr(owner, "sparse_hot", False):
+            activation_tokens = expert_tokens
+            activation_group_type = group_list_type
+        else:
+            activation_tokens = owner.fused_counts
 
         w13_kernel = self.config.layer.w13_kernel
 
@@ -286,13 +305,17 @@ class AscendRunnerCore(MoeRunnerCore):
             ):
                 hidden_states, pertoken_scale = self.activation._apply_activation(
                     hidden_states,
-                    group_list=expert_tokens,
-                    group_list_type=group_list_type,
+                    group_list=activation_tokens,
+                    group_list_type=activation_group_type,
                 )
             else:
                 hidden_states, pertoken_scale = self.activation._apply_activation(
                     hidden_states
                 )
+
+        # W2 transfer may overlap W13 projection and activation.
+        if owner is not None:
+            owner.wait_for_w2(self.config.layer.layer_id)
 
         # --- w2 (down) projection ---
         hidden_states = self.config.layer.w2_kernel.apply(
@@ -649,7 +672,14 @@ def post_permute_ascend_to_ascend_ops(
                 hidden_states, local_expanded_row_idx
             )
     elif isinstance(state, _AllGatherState):
-        hidden_states = _allgather_weighted_sum(runner_output, runner_config, state)
+        owner = getattr(runner_config.layer, "_ascend_ops_offloader", None)
+        hidden_states = (
+            owner.combine_allgather(runner_output.hidden_states, state)
+            if owner is not None
+            else None
+        )
+        if hidden_states is None:
+            hidden_states = _allgather_weighted_sum(runner_output, runner_config, state)
     else:
         # MC2 / decode: the combine op applies the top-k weights itself.
         hidden_states = runner_output.hidden_states

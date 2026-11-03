@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -230,6 +231,10 @@ class MLPSyncBatchInfo:
         use_all_reduce: bool = False,
     ):
         sync_start = time.perf_counter()
+        fixed_mask = (
+            os.environ.get("SGLANG_NPU_FIXED_DP_INFO_MASK", "0") == "1"
+            and str(device).startswith("npu")
+        )
         local_info_tensor = self._get_local_tensor(device=device)
         fallback_tensor = self._get_fallback_tensor(device=device)
         info_width = local_info_tensor.numel()
@@ -255,7 +260,10 @@ class MLPSyncBatchInfo:
                 group=group,
             )
             missing = flat_info.abs().sum(dim=1) == 0
-            flat_info[missing] = fallback_tensor
+            if fixed_mask:
+                torch.where(missing[:, None], fallback_tensor, flat_info, out=flat_info)
+            else:
+                flat_info[missing] = fallback_tensor
         else:
             exchange_sync_rows(
                 global_info_tensor.flatten(),
@@ -277,7 +285,13 @@ class MLPSyncBatchInfo:
                 dtype=tp_active_ranks.dtype,
                 device=tp_active_ranks.device,
             )
-        tp_info[tp_active_ranks[:num_ranks_in_tp_info] == 0] = fallback_tensor
+        inactive = tp_active_ranks[:num_ranks_in_tp_info] == 0
+        if fixed_mask:
+            # Preserve all 11 fields with a fixed-shape selection. Boolean
+            # indexing can require a host-visible nonzero-count on NPU.
+            torch.where(inactive[:, None], fallback_tensor, tp_info, out=tp_info)
+        else:
+            tp_info[inactive] = fallback_tensor
 
         # One D2H for every field: each `.item()` / `.tolist()` on a device
         # tensor is its own stream sync. Copy the whole tensor, not the

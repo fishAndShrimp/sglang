@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from abc import ABC
 from collections import deque
@@ -208,6 +209,19 @@ class ExpertDistributionRecorder(ABC):
 
 class _ExpertDistributionRecorderNoop(ExpertDistributionRecorder):
     pass
+
+
+def skip_noop_expert_distribution_recording():
+    """Experimental: omit recorder-only tensors, never real routing masks.
+
+    A real recorder can start recording after graph capture; its current
+    ``recording`` flag is not sufficient to authorize removing its inputs.
+    """
+    return (
+        os.environ.get("SGLANG_NPU_SKIP_NOOP_RECORDER", "0") == "1"
+        and type(get_global_expert_distribution_recorder())
+        is _ExpertDistributionRecorderNoop
+    )
 
 
 class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):

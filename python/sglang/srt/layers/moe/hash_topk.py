@@ -9,6 +9,7 @@ from torch import nn
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
+    skip_noop_expert_distribution_recording,
 )
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
@@ -317,14 +318,16 @@ class HashTopK(nn.Module):
                 _mask_topk_ids_padded_region(recorder_topk_ids, num_token_non_padded)
         if recorder_topk_ids is None:
             recorder_topk_ids = topk_ids
-        if _is_npu and num_token_non_padded is not None:
+        skip_recorder = _is_npu and skip_noop_expert_distribution_recording()
+        if _is_npu and num_token_non_padded is not None and not skip_recorder:
             rows = torch.arange(topk_ids.shape[0], device=topk_ids.device)
             recorder_topk_ids = recorder_topk_ids.masked_fill(
                 (rows >= num_token_non_padded)[:, None], -1
             )
-        get_global_expert_distribution_recorder().on_select_experts(
-            topk_ids=recorder_topk_ids
-        )
+        if not skip_recorder:
+            get_global_expert_distribution_recorder().on_select_experts(
+                topk_ids=recorder_topk_ids
+            )
         topk_output = StandardTopKOutput(
             topk_weights=topk_weights, topk_ids=topk_ids, router_logits=router_logits
         )
