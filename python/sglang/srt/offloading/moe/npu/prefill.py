@@ -1,0 +1,224 @@
+"""Whole-layer eager prefill over two views of the native expert pools.
+
+Adapted from codex/moe-prefill-opt-20261102 (2dc7903d0b). Each bank is reused
+only after its final GMM reader. Borrowed Hot bytes are restored before decode
+or cache maintenance can consume the published cache addresses.
+"""
+
+
+def whole_layer_bank_layout(local_experts, hot_slots, execution_slots):
+    if local_experts <= 0 or execution_slots < local_experts:
+        raise ValueError(
+            "Whole-layer prefill requires execution_slots >= local_experts"
+        )
+    first = ("execution", 0, local_experts)
+    if hot_slots >= local_experts:
+        return first, ("hot", 0, local_experts)
+    if execution_slots >= 2 * local_experts:
+        return first, ("execution", local_experts, local_experts)
+    raise ValueError(
+        "Whole-layer prefill needs a second bank: provide Hot slots >= "
+        "local_experts or execution_slots >= 2 * local_experts"
+    )
+
+
+class LayerPrefetchPipeline:
+    """Ordered host submission with per-bank device reader dependencies."""
+
+    def __init__(self, layer_ids, *, load, copy_stream):
+        self.layer_ids = tuple(layer_ids)
+        if not self.layer_ids or len(set(self.layer_ids)) != len(self.layer_ids):
+            raise ValueError("Prefill requires unique ordered offloaded layers")
+        self.load, self.copy_stream = load, copy_stream
+        self.reset()
+
+    def reset(self):
+        self.invocation_id = None
+        self.current = 0
+        self.started = False
+        self.ready = {}
+
+    def _require_current(self, layer, context):
+        if (
+            self.invocation_id is not context.invocation_id
+            or self.current >= len(self.layer_ids)
+            or self.layer_ids[self.current] != layer
+        ):
+            raise RuntimeError("Consume prefetched layers once in model order")
+
+    def _submit(self, index, context, reader=None):
+        if reader is not None:
+            reader.completion.wait_on(self.copy_stream)
+        self.ready[index] = self.load(self.layer_ids[index], index % 2, context)
+
+    def start(self, layer, context):
+        if self.current == len(self.layer_ids):
+            self.reset()
+        if self.invocation_id is None:
+            if layer != self.layer_ids[0]:
+                raise RuntimeError("Start prefill at the first offloaded layer")
+            self.invocation_id = context.invocation_id
+            # This is the only global compute-to-copy frontier in the prefetch.
+            context.record_compute_completion().completion.wait_on(self.copy_stream)
+            self._submit(0, context)
+            if len(self.layer_ids) > 1:
+                self._submit(1, context)
+        self._require_current(layer, context)
+        if self.started:
+            raise RuntimeError("Prefill layer entry was already consumed")
+        self.started = True
+
+    def acquire(self, layer, context):
+        self._require_current(layer, context)
+        if not self.started:
+            raise RuntimeError("Start the prefill layer before acquiring weights")
+        self.ready[self.current].completion.wait_on(context.compute_stream)
+        return self.current % 2
+
+    def retire(self, layer, reader, context):
+        self._require_current(layer, context)
+        if not self.started:
+            raise RuntimeError("Cannot retire a prefill layer before its entry")
+        following = self.current + 2
+        if following < len(self.layer_ids):
+            self._submit(following, context, reader)
+        del self.ready[self.current]
+        self.current += 1
+        self.started = False
+
+    def finish_forward(self, context):
+        if self.invocation_id is not None and (
+            self.invocation_id is not context.invocation_id
+            or self.current != len(self.layer_ids)
+        ):
+            raise RuntimeError("Prefill ended before every offloaded layer completed")
+
+
+class AscendPrefillWeights:
+    def __init__(self, owner):
+        from ...transfer import HostCopyPlan, HostCopyRegion
+        from .native_acl import AclHostTransferOps
+
+        self.owner = owner
+        layout = whole_layer_bank_layout(
+            owner.local_experts, owner.hot_slots, owner.execution.capacity
+        )
+        pools = {"execution": owner.execution, "hot": owner.hot}
+        self.banks = tuple(
+            pools[pool].view(offset, count) for pool, offset, count in layout
+        )
+        self.quant_info = tuple(bank.quant_info() for bank in self.banks)
+        self.borrows_hot = layout[1][0] == "hot"
+        self.hot_dirty = False
+        self.host_ops = AclHostTransferOps(
+            owner.format.adapter.native_acl, owner._retain
+        )
+        self.plans = {}
+        for index, spec in enumerate(owner.catalog.offloaded_layers):
+            storage, bank = owner.storages[spec.layer_id], self.banks[index % 2]
+            plan = HostCopyPlan(
+                tuple(
+                    HostCopyRegion(
+                        source, destination, 0, 0, owner.format.layouts[name].nbytes
+                    )
+                    for name in owner.format.layouts
+                    for source, destination in zip(
+                        storage.component_capabilities[name],
+                        bank.component_regions[name],
+                    )
+                ),
+                (storage, bank),
+            )
+            self.plans[spec.layer_id] = plan
+            self.host_ops.prepare(plan, owner.device)
+        self.pipeline = LayerPrefetchPipeline(
+            (spec.layer_id for spec in owner.catalog.offloaded_layers),
+            load=self._load,
+            copy_stream=owner.weight_copy_stream,
+        )
+        if self.borrows_hot:
+            self._init_hot_restore()
+
+    def _init_hot_restore(self):
+        import torch
+
+        from ...transfer import CopySourceKind, DeviceCopyPlan
+        from .cache_transfer import FixedSlotCacheTransfer
+        from .transfer import MemFabricTransferBindings
+
+        owner, count = self.owner, self.owner.local_experts
+        self.restore_bindings = MemFabricTransferBindings(
+            owner.addresses,
+            self.banks[1].component_regions,
+            capacity=count,
+            hot_generations=owner.state.slot_generation,
+            error_status=owner.error,
+        )
+        self.restore_ops = FixedSlotCacheTransfer(
+            self.restore_bindings, retain=owner._retain
+        )
+        self.restore_plan = DeviceCopyPlan(
+            torch.full(
+                (count,),
+                int(CopySourceKind.HOST),
+                dtype=torch.int64,
+                device=owner.device,
+            ),
+            owner.state.slot_to_key[:count],
+            torch.arange(count, dtype=torch.int64, device=owner.device),
+            owner.state.slot_valid[:count],
+            owner.state.slot_generation[:count],
+            torch.zeros((), dtype=torch.int32, device=owner.device),
+            count,
+        )
+
+    def _load(self, layer, bank, context):
+        if bank == 1 and self.borrows_hot:
+            # Mark before submission, which may enqueue only a partial bundle.
+            self.hot_dirty = True
+        return self.host_ops.materialize_into(
+            self.plans[layer], self.banks[bank], self.owner.weight_copy_stream
+        )
+
+    def weights(self, layer, runner_input):
+        import torch
+
+        owner = self.owner
+        counts = runner_input.expert_tokens
+        if counts.shape != (owner.local_experts,) or counts.dtype != torch.int64:
+            raise ValueError("Prefill requires one int64 count per local expert")
+        if runner_input.group_list_type == 0:
+            counts = torch.diff(counts, prepend=counts.new_zeros(1))
+        elif runner_input.group_list_type != 1:
+            raise ValueError("Unsupported prefill group list type")
+        counts = counts.masked_fill(owner.error != 0, 0)
+        start = owner.catalog.key(layer, 0)
+        owner.state.step_access_count[start : start + owner.local_experts].add_(
+            torch.where(owner.state.update_enabled, counts, 0)
+        )
+        runner_input.expert_tokens, runner_input.group_list_type = counts, 1
+        owner.context.retain(counts)
+        bank = self.pipeline.acquire(layer, owner.context)
+        return self.quant_info[bank]
+
+    def finish_layer(self, layer):
+        owner = self.owner
+        self.pipeline.retire(
+            layer, owner.context.record_compute_completion(), owner.context
+        )
+        if self.pipeline.current == len(self.pipeline.layer_ids):
+            self.restore_hot()
+
+    def restore_hot(self):
+        if not self.hot_dirty:
+            return
+        import torch
+
+        owner = self.owner
+        stream = torch.npu.current_stream()
+        stream.wait_stream(owner.weight_copy_stream)
+        self.restore_plan.count.copy_(self.restore_plan.valid.sum(dtype=torch.int32))
+        self.restore_ops.materialize_into(
+            self.restore_plan, self.restore_bindings, stream
+        )
+        self.hot_dirty = False

@@ -234,6 +234,13 @@ class AclHostTransferOps(HostTransferOps):
         with self._submission_lock:
             self._prepared.clear()
 
+    def prepare(self, plan, device):
+        """Lower immutable ACL descriptors before serving, without copying."""
+        if not isinstance(plan, HostCopyPlan):
+            raise TypeError("ACL descriptor preparation requires HostCopyPlan")
+        with self._submission_lock:
+            self._prepared_batches(plan, device)
+
     def _prepared_batches(self, plan, device):
         # HostCopyPlan/regions/capabilities are immutable. Keep the plan alive in
         # each entry so its identity cannot be reused for unrelated addresses.

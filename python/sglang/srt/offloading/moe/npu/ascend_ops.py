@@ -99,6 +99,7 @@ class AscendOpsOffloader(BaseOffloader):
             "offline_model_id",
             "native_extension_directory",
             "decode_mask_capacity",
+            "execution_slots",
             "update_interval",
             "min_usage",
             "replacement_min_gain",
@@ -132,12 +133,13 @@ class AscendOpsOffloader(BaseOffloader):
         )
         self.local_experts = self.catalog.offloaded_layers[0].local_experts
         self.copy_capacity = self.local_experts
+        self.execution_slots = cfg.get("execution_slots", self.local_experts)
+        if type(self.execution_slots) is not int:
+            raise ValueError("execution_slots must be an integer")
         # MemFabric batches use at most 256 entries on A3. Larger local expert
         # counts need explicit chunking; never overrun the native metadata UB.
         if self.copy_capacity > 256:
-            raise ValueError(
-                "Packed expert copies support at most 256 local experts"
-            )
+            raise ValueError("Packed expert copies support at most 256 local experts")
         self.hot_slots = int(self.catalog.num_experts * ratio)
         if self.hot_slots < 1:
             raise ValueError("The initial implementation requires a nonempty Hot cache")
@@ -145,6 +147,11 @@ class AscendOpsOffloader(BaseOffloader):
             raise ValueError(
                 "Cache maintenance supports at most 1280 Hot slots and 8192 expert keys per rank"
             )
+        from .prefill import whole_layer_bank_layout
+
+        whole_layer_bank_layout(
+            self.local_experts, self.hot_slots, self.execution_slots
+        )
         self.device = torch.device("npu", get_device().gpu_id)
         self.storages = {}
         self.format = self.host_pool = None
@@ -215,12 +222,12 @@ class AscendOpsOffloader(BaseOffloader):
         for storage in self.storages.values():
             storage.require_sealed()
         self.execution = self.format.allocate_bank(
-            self.copy_capacity, ResourceKind.EXECUTION_WEIGHTS, "ascend.execution"
+            self.execution_slots, ResourceKind.EXECUTION_WEIGHTS, "ascend.execution"
         )
         self.hot = self.format.allocate_bank(
             self.hot_slots, ResourceKind.HOT_WEIGHTS, "ascend.hot"
         )
-        self.quant_info = self.execution.quant_info()
+        self.quant_info = self.execution.view(0, self.copy_capacity).quant_info()
         names = tuple(self.format.layouts)
         hosts = {
             name: tuple(
@@ -240,7 +247,13 @@ class AscendOpsOffloader(BaseOffloader):
             [torch.cat(pair) for pair in self.addresses.source_tables]
         )
         self.destinations = torch.tensor(
-            [[r.address for r in self.execution.component_regions[n]] for n in names],
+            [
+                [
+                    r.address
+                    for r in self.execution.component_regions[n][: self.copy_capacity]
+                ]
+                for n in names
+            ],
             dtype=torch.int64,
             device=self.device,
         )
@@ -310,6 +323,9 @@ class AscendOpsOffloader(BaseOffloader):
         self.decode_active_rows = torch.zeros(
             capacity, dtype=torch.bool, device=self.device
         )
+        from .prefill import AscendPrefillWeights
+
+        self.prefill = AscendPrefillWeights(self)
         self._capture_cache_tails()
         self.ready = True
         logger.info(
@@ -317,7 +333,7 @@ class AscendOpsOffloader(BaseOffloader):
             self.local_experts,
             self.hot_slots,
             self.catalog.num_experts,
-            self.format.expert_nbytes * self.local_experts / 1024**3,
+            self.format.expert_nbytes * self.execution_slots / 1024**3,
             self.host_pool.used_bytes / 1024**3,
             True,
             True,
@@ -333,9 +349,16 @@ class AscendOpsOffloader(BaseOffloader):
             raise ValueError("MC2 padded batch exceeds decode_mask_capacity")
         return self.decode_active_rows[:padded_bs]
 
+    def start_prefill_layer(self, layer_id):
+        self.prefill.pipeline.start(layer_id, self.context)
+
     def prepare_weights(self, layer_id, runner_input):
         if not self.ready:
             raise RuntimeError("Expert bank is not initialized")
+        from sglang.srt.layers.dp_attention import get_is_extend_in_batch
+
+        if get_is_extend_in_batch():
+            return self.prefill.weights(layer_id, runner_input)
         return self._prepare_fused(layer_id, runner_input)
 
     def _launch_copies(self, layer_id, copies):
@@ -458,6 +481,10 @@ class AscendOpsOffloader(BaseOffloader):
                 raise RuntimeError(f"Expert copy submission failed: {status}")
 
     def wait_for_w2(self, layer_id):
+        from sglang.srt.layers.dp_attention import get_is_extend_in_batch
+
+        if get_is_extend_in_batch():
+            return
         torch.npu.current_stream().wait_event(self.copy_events[layer_id][2])
 
     def _publish_sources(self):
@@ -559,6 +586,7 @@ class AscendOpsOffloader(BaseOffloader):
         self.state.update_enabled.fill_(True)
         try:
             yield
+            self.prefill.pipeline.finish_forward(self.context)
             self.step += 1
             maintenance = self.step % self.policy.config.update_interval == 0
             self.cache_tail_graphs[maintenance].replay()
@@ -566,7 +594,11 @@ class AscendOpsOffloader(BaseOffloader):
             # It also retires cache transactions before shared-bank reuse.
             self._check_error()
         finally:
-            self.context.compute_stream.wait_stream(self.weight_copy_stream)
-            self.context.record_compute_completion().completion.synchronize()
-            self.context.resources.clear()
-            self.state.update_enabled.fill_(False)
+            try:
+                self.prefill.restore_hot()
+            finally:
+                self.context.compute_stream.wait_stream(self.weight_copy_stream)
+                self.context.record_compute_completion().completion.synchronize()
+                self.context.resources.clear()
+                self.prefill.pipeline.reset()
+                self.state.update_enabled.fill_(False)
