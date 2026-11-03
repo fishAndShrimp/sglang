@@ -24,7 +24,8 @@ python3 scripts/moe_offload/test_requests.py --bench
 ## 当前边界
 
 - 已验证 A3、DeepSeek V4 Flash ModelSlim W8A8、TP=EP=Attention DP=4；MoE TP、CP、PP 均为 1。要求专家形状一致、量化 offset 为零。
-- 已验证请求并发 1～8、28.125%/50% 缓存及 MTP 开关；MTP 使用 EAGLE steps=2、topk=1、draft tokens=3。基础回归不替代完整精度评测。
+- 原固定槽路径已验证请求并发 1～8、28.125%/50% 缓存及 MTP 开关；MTP 使用 EAGLE steps=2、topk=1、draft tokens=3。基础回归不替代完整精度评测。
+- 新增 Hot 直算与执行槽复用在四 rank、无 MTP、Hot 加执行槽不超过 1024 时自动启用；默认 28.125% 缓存满足条件，50% 缓存或 MTP 使用原固定槽路径，无需额外开关。当前快速对照主要改善 BS1/4，BS8 可能略慢，不保证所有 batch 都加速。
 - 共享专家、最前面的 `max(3, num_hash_layers)` 层和 MTP draft 权重常驻。Host 预算每 rank 64 GiB，四 rank 合计 256 GiB。
 - 每 rank 上限为 256 个执行槽、1280 个 Hot 槽、8192 个专家 key；有效行 mask 默认容纳 128 个本地 padded/验证 token，不等于请求 BS。
 - 不支持与 EPLB、冗余专家、batch overlap、模块 CPU offloader 或 MemFabric HiCache 同时使用。
@@ -34,4 +35,6 @@ python3 scripts/moe_offload/test_requests.py --bench
 - 复用主线 dispatch、combine 和专家 GMM；固定执行区跨层复用，有效 token mask 排除 padding 和空 rank。
 - 融合搬运地址、长度和访问计数，缓存更新后统一发布地址表；跳过已校验为零的 offset，合并搬运。
 - 独立流搬运 W13/W2，W2 与第一段专家计算重叠，第二段计算前等待完成。
-- 周期 LFU、固定槽缓存搬运、融合缓存更新及维护图重放。Hot 命中仍需 D2D 到执行区，miss 从 Host 搬入。
+- 周期 LFU、固定槽缓存搬运、融合缓存更新及维护图重放。命中直算路径直接读取 Hot；miss 只在执行槽未保留同层同专家权重时从 Host 搬入，使用完整专家 key 防止跨层误复用。其他配置仍将 Hot 命中 D2D 到执行区。
+
+INT8 专家激活遵守模型的 `swiglu_limit`，截断后再量化；该正确性修复与两项搬运优化分开对照。

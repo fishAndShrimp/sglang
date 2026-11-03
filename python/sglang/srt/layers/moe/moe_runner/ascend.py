@@ -251,6 +251,7 @@ class AscendRunnerCore(MoeRunnerCore):
         """
         Execute the MoE layer using NPU‑specific grouped matmul ops.
         """
+        activation_group_type = runner_input.group_list_type
         owner = getattr(self.config.layer, "_ascend_ops_offloader", None)
         if owner is not None:
             quant_info = owner.prepare_weights(self.config.layer.layer_id, runner_input)
@@ -258,6 +259,12 @@ class AscendRunnerCore(MoeRunnerCore):
         original_dtype = torch.float16 if x.dtype == torch.float16 else torch.bfloat16
         expert_tokens = runner_input.expert_tokens
         group_list_type = runner_input.group_list_type
+        # Activation uses logical expert counts; GMM may address physical slots.
+        activation_tokens = expert_tokens
+        if owner is not None and owner.direct_hot:
+            activation_tokens = owner.fused_counts
+        else:
+            activation_group_type = group_list_type
 
         w13_kernel = self.config.layer.w13_kernel
 
@@ -297,8 +304,8 @@ class AscendRunnerCore(MoeRunnerCore):
             ):
                 hidden_states, pertoken_scale = self.activation._apply_activation(
                     hidden_states,
-                    group_list=expert_tokens,
-                    group_list_type=group_list_type,
+                    group_list=activation_tokens,
+                    group_list_type=activation_group_type,
                 )
             else:
                 hidden_states, pertoken_scale = self.activation._apply_activation(

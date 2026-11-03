@@ -14,7 +14,13 @@ from pathlib import Path
 import torch
 
 from sglang.srt.distributed.parallel_state import get_moe_ep_group
-from sglang.srt.runtime_context import get_device, get_exec, get_parallel, get_schedule
+from sglang.srt.runtime_context import (
+    get_device,
+    get_exec,
+    get_parallel,
+    get_schedule,
+    get_spec,
+)
 from sglang.srt.utils.offloader import BaseOffloader
 
 from ...transfer import EventCompletion, TransferTicket
@@ -214,13 +220,40 @@ class AscendOpsOffloader(BaseOffloader):
             raise RuntimeError("Not all planned expert layers were intercepted")
         for storage in self.storages.values():
             storage.require_sealed()
-        self.execution = self.format.allocate_bank(
-            self.copy_capacity, ResourceKind.EXECUTION_WEIGHTS, "ascend.execution"
+        # The physical-slot GMM API accepts at most 1024 weight groups.
+        # Enable the validated four-rank, non-speculative path automatically;
+        # larger caches and speculative decoding keep the fixed-slot path.
+        self.direct_hot = (
+            get_parallel().moe_ep_size == 4
+            and not get_spec().speculative_algorithm
+            and self.copy_capacity + self.hot_slots <= 1024
         )
-        self.hot = self.format.allocate_bank(
-            self.hot_slots, ResourceKind.HOT_WEIGHTS, "ascend.hot"
-        )
-        self.quant_info = self.execution.quant_info()
+        self.execution_keys = None
+        if self.direct_hot:
+            self.union = self.format.allocate_bank(
+                self.copy_capacity + self.hot_slots,
+                ResourceKind.EXECUTION_WEIGHTS,
+                "ascend.union",
+            )
+            self.execution = self.union.view(0, self.copy_capacity)
+            self.hot = self.union.view(self.copy_capacity, self.hot_slots)
+            self.direct_groups = torch.zeros(
+                (self.copy_capacity + self.hot_slots, 2),
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self.execution_keys = torch.full(
+                (self.copy_capacity,), -1, dtype=torch.int64, device=self.device
+            )
+            self.quant_info = self.union.quant_info()
+        else:
+            self.execution = self.format.allocate_bank(
+                self.copy_capacity, ResourceKind.EXECUTION_WEIGHTS, "ascend.execution"
+            )
+            self.hot = self.format.allocate_bank(
+                self.hot_slots, ResourceKind.HOT_WEIGHTS, "ascend.hot"
+            )
+            self.quant_info = self.execution.quant_info()
         names = tuple(self.format.layouts)
         hosts = {
             name: tuple(
@@ -313,7 +346,8 @@ class AscendOpsOffloader(BaseOffloader):
         self._capture_cache_tails()
         self.ready = True
         logger.info(
-            "Ascend expert offload: local=%d hot=%d/%d execution=%.3f GiB host=%.3f GiB; fixed-slot copies, W2 overlap=%s, fused metadata=%s",
+            "Ascend expert offload: local=%d hot=%d/%d execution=%.3f GiB host=%.3f GiB; "
+            "fixed-slot copies, W2 overlap=%s, fused metadata=%s, Hot direct/execution reuse=%s",
             self.local_experts,
             self.hot_slots,
             self.catalog.num_experts,
@@ -321,6 +355,7 @@ class AscendOpsOffloader(BaseOffloader):
             self.host_pool.used_bytes / 1024**3,
             True,
             True,
+            self.direct_hot,
         )
 
     def _retain(self, value):
@@ -458,8 +493,18 @@ class AscendOpsOffloader(BaseOffloader):
             SKIP_OFFSETS=True,
             CUMULATIVE=runner_input.group_list_type == 0,
             BLOCK=triton.next_power_of_2(self.local_experts),
+            DIRECT_HOT=self.direct_hot,
+            HotSlots=self.state.key_to_slot,
+            HOT_CAPACITY=self.hot_slots,
+            Groups=self.direct_groups if self.direct_hot else self.fused_counts,
+            ExecutionKeys=self.execution_keys,
+            KEY_START=start,
         )
-        runner_input.expert_tokens = self.fused_counts
+        if self.direct_hot:
+            runner_input.expert_tokens = self.direct_groups
+            runner_input.group_list_type = 2
+        else:
+            runner_input.expert_tokens = self.fused_counts
         self._launch_copies(layer_id, self.fused_descriptors)
         return self.quant_info
 
