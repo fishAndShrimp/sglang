@@ -421,6 +421,23 @@ class ModelSlimConfig(QuantizationConfig):
                     f"Unsupported scheme '{name}' for layer {resolved_prefix}"
                 )
                 return None
+            if cls is ModelSlimW4A8Int8MoE:
+                # AscendV1 records the W4A8 grouping at the description root;
+                # older exporters also emitted decimal strings. Without it,
+                # preserve the resident per-channel default (group_size=0).
+                group_size = self.quant_description.get("group_size", 0)
+                if isinstance(group_size, str):
+                    try:
+                        group_size = int(group_size)
+                    except ValueError:
+                        raise ValueError(
+                            "ModelSlim W4A8 group_size must be a nonnegative integer"
+                        ) from None
+                if type(group_size) is not int or group_size < 0:
+                    raise ValueError(
+                        "ModelSlim W4A8 group_size must be a nonnegative integer"
+                    )
+                return cls(self, weight_group, group_size=group_size)
             return cls(self, weight_group)
 
         w13_scheme = instantiate(w13_scheme_name, weight_group="w13")
@@ -539,7 +556,7 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         storage = getattr(layer, "_moe_offload_storage", None)
         if storage is not None:
             storage.finalize()
-            # Preserve the mainline W8A8 communication quantization contract.
+            # Preserve the mainline INT8 activation communication contract.
             layer.w13_kernel._set_moe_dispatch_dtype(layer, "int8")
             return
         layer.w13_scheme.process_weights_after_loading(layer)

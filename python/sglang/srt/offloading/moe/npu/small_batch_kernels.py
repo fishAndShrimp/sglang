@@ -20,6 +20,7 @@ def prepare_packed_copies(
     SKIP_OFFSETS: tl.constexpr,
     CUMULATIVE: tl.constexpr,
     BLOCK: tl.constexpr,
+    COMPONENTS: tl.constexpr = None,
 ):
     # Exactly one program owns the fault latch and this layer's access counters.
     e = tl.arange(0, BLOCK)
@@ -42,7 +43,10 @@ def prepare_packed_copies(
         e < EXPERTS,
     )
     for position in tl.static_range(COMPONENT_COUNT):
-        component = (position // 2) * 3 + position % 2 if SKIP_OFFSETS else position
+        if COMPONENTS is not None:
+            component = COMPONENTS[position]
+        else:
+            component = (position // 2) * 3 + position % 2 if SKIP_OFFSETS else position
         source = tl.load(
             Sources + component * SOURCE_STRIDE + START + e, e < EXPERTS, 0
         )
@@ -101,6 +105,7 @@ def prepare_fixed_copies(
     Groups=None,
     ExecutionKeys=None,
     KEY_START: tl.constexpr = 0,
+    COMPONENTS: tl.constexpr = None,
 ):
     # Exactly one program owns the fault latch and this layer's access counters.
     e = tl.arange(0, BLOCK)
@@ -150,7 +155,10 @@ def prepare_fixed_copies(
         # copy phases finish before another layer can reuse this identity.
         tl.store(ExecutionKeys + e, KEY_START + e, (e < EXPERTS) & copy_needed)
     for position in tl.static_range(COMPONENT_COUNT):
-        component = (position // 2) * 3 + position % 2 if SKIP_OFFSETS else position
+        if COMPONENTS is not None:
+            component = COMPONENTS[position]
+        else:
+            component = (position // 2) * 3 + position % 2 if SKIP_OFFSETS else position
         source = tl.load(
             Sources + component * SOURCE_STRIDE + START + e, e < EXPERTS, 0
         )

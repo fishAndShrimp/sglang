@@ -24,13 +24,14 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils.offloader import BaseOffloader
 
 from ...transfer import EventCompletion, TransferTicket
-from ..config import ExpertCatalog, ExpertLayerSpec, Phase
+from ..config import Phase
 from ..execution import CacheUpdateCoordinator, ExpertWeightAccess
 from ..periodic_lfu import PeriodicLFUConfig, PeriodicLFUPolicy
 from ..residency import TensorResidencyOps
 from ..resources import ResourceKind
 from ..state import ResidencyState
 from .format import ExpertLayerStorage
+from .model_adapter import build_expert_catalog, get_model_id, get_quant_spec
 from .native_acl import get_native_acl
 from .storage import MemFabricHostPool
 from .transfer import (
@@ -93,10 +94,7 @@ class AscendOpsOffloader(BaseOffloader):
             raise ValueError(
                 "Initial fixed-slot offload requires trivial expert placement and does not support EPLB, redundant experts, or batch overlap"
             )
-        if hf_config.model_type != "deepseek_v4":
-            raise ValueError(
-                "Initial format/model adapter supports DeepSeek V4 W8A8 only"
-            )
+        self.model_id = get_model_id(hf_config)
         cfg = json.loads(Path(path).read_text())
         allowed = {
             "cache_ratio",
@@ -117,26 +115,14 @@ class AscendOpsOffloader(BaseOffloader):
                 "Unknown offload configuration keys; experimental switches are not supported"
             )
         self.cfg, self.hf_config = cfg, hf_config
-        ratio = cfg.get("cache_ratio", 0.28125)
+        ratio = cfg.get("cache_ratio", 0.25 if self.model_id == "GLM-5.2" else 0.28125)
         if (
             not isinstance(ratio, (int, float))
             or not math.isfinite(ratio)
             or not 0 < ratio <= 1
         ):
             raise ValueError("cache_ratio must be in (0, 1]")
-        resident = max(3, getattr(hf_config, "num_hash_layers", 0))
-        self.catalog = ExpertCatalog(
-            tuple(
-                ExpertLayerSpec(
-                    i,
-                    hf_config.n_routed_experts,
-                    p.moe_ep_size,
-                    p.moe_ep_rank,
-                    resident=i < resident,
-                )
-                for i in range(hf_config.num_hidden_layers)
-            )
-        )
+        self.catalog = build_expert_catalog(hf_config, p.moe_ep_size, p.moe_ep_rank)
         self.local_experts = self.catalog.offloaded_layers[0].local_experts
         self.copy_capacity = self.local_experts
         self.execution_slots = cfg.get("execution_slots", self.local_experts)
@@ -184,33 +170,64 @@ class AscendOpsOffloader(BaseOffloader):
             self.catalog,
         )
         self.initial_keys = self.policy.initial_keys(
-            self.hot_slots, cfg.get("offline_model_id", "DeepSeek-V4-Flash")
+            self.hot_slots, cfg.get("offline_model_id", self.model_id)
         )
 
     def prepare_layer(self, layer, num_experts, hidden_size, intermediate_size, attrs):
         spec = self.catalog.layer(layer.layer_id)
         if spec.resident:
             return False
-        if (
-            num_experts != spec.local_experts
-            or type(layer.w13_scheme).__name__ != "ModelSlimW8A8Int8MoE"
-            or type(layer.w2_scheme).__name__ != "ModelSlimW8A8Int8MoE"
-        ):
-            raise ValueError("Offload expects local routed experts with ModelSlim W8A8")
+        if num_experts != spec.local_experts:
+            raise ValueError(
+                "Offload expects only rank-local routed experts; "
+                "use --disable-shared-experts-fusion"
+            )
+        quant_spec = get_quant_spec(layer.w13_scheme, layer.w2_scheme)
+        if self.model_id != "GLM-5.2" and quant_spec.kind != "w8a8":
+            raise ValueError(
+                "DeepSeek V4 offload currently supports ModelSlim W8A8 only"
+            )
         if self.format is None:
             native = get_native_acl(self.cfg.get("native_extension_directory"))
-            self.format = NpuV4W8A8Format(
-                hidden_size, intermediate_size, self.device, native_acl=native
-            )
+            self.quant_spec = quant_spec
+            if quant_spec.kind == "w4a8":
+                from .w4a8_format import NpuW4A8Format
+
+                self.format = NpuW4A8Format(
+                    hidden_size,
+                    intermediate_size,
+                    self.device,
+                    native_acl=native,
+                    group_size=quant_spec.group_size,
+                    tp_size=quant_spec.tp_size,
+                    activation_use_clip=quant_spec.activation_use_clip,
+                )
+            else:
+                self.format = NpuV4W8A8Format(
+                    hidden_size, intermediate_size, self.device, native_acl=native
+                )
             total = sum(
                 self.format.host_nbytes(s.local_experts)
                 for s in self.catalog.offloaded_layers
             )
+            host_gib = self.cfg.get("host_pool_gib", 64)
+            if type(host_gib) is not int or host_gib <= 0:
+                raise ValueError("host_pool_gib must be a positive integer per rank")
+            if total > host_gib * 1024**3:
+                raise ValueError(
+                    f"{self.model_id} {quant_spec.kind} needs at least "
+                    f"{math.ceil(total / 1024**3)} GiB host_pool_gib per rank "
+                    f"for expert storage; configured {host_gib} GiB"
+                )
             self.host_pool = MemFabricHostPool(
                 total,
                 self.device.index,
-                physical_bytes=int(self.cfg.get("host_pool_gib", 64)) * 1024**3,
+                physical_bytes=host_gib * 1024**3,
                 native_acl=native,
+            )
+        if quant_spec != self.quant_spec:
+            raise ValueError(
+                "This execution bank requires identical expert quantization"
             )
         if (hidden_size, intermediate_size) != (
             self.format.hidden_size,
@@ -231,7 +248,8 @@ class AscendOpsOffloader(BaseOffloader):
         # Extra execution slots retain the packed path: direct Hot addressing
         # expects the Hot bank to start immediately after the local experts.
         self.direct_hot = (
-            get_parallel().moe_ep_size == 4
+            self.quant_spec.supports_direct_hot
+            and get_parallel().moe_ep_size == 4
             and not get_spec().speculative_algorithm
             and self.execution_slots == self.copy_capacity
             and self.copy_capacity + self.hot_slots <= 1024
@@ -412,10 +430,12 @@ class AscendOpsOffloader(BaseOffloader):
         compute.wait_event(first)
 
     def _init_copy_plan(self, names):
-        # Zero offsets are a checked invariant of this format, not an assumption
-        # about arbitrary quantized checkpoints. They remain valid in every slot.
+        # Checkpoint-only W4 metadata is not read by GMM. W8 offsets are
+        # separately validated as zero and remain valid without decode copies.
         selected = []
         for i, name in enumerate(names):
+            if self.format.layouts[name].runtime_name is None:
+                continue
             if name.endswith("_offset"):
                 self.execution.tensors[name].zero_()
             else:
@@ -537,6 +557,7 @@ class AscendOpsOffloader(BaseOffloader):
                 START=0,
                 COMPONENT_COUNT=len(self.fused_components),
                 SKIP_OFFSETS=True,
+                COMPONENTS=self.fused_components,
                 CUMULATIVE=runner_input.group_list_type == 0,
                 BLOCK=triton.next_power_of_2(self.local_experts),
                 DIRECT_HOT=True,
@@ -562,6 +583,7 @@ class AscendOpsOffloader(BaseOffloader):
                 START=0,
                 COMPONENT_COUNT=len(self.fused_components),
                 SKIP_OFFSETS=True,
+                COMPONENTS=self.fused_components,
                 CUMULATIVE=runner_input.group_list_type == 0,
                 BLOCK=triton.next_power_of_2(self.local_experts),
             )

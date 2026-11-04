@@ -363,6 +363,49 @@ class TestAscendPrefillWeights(CustomTestCase):
         sum_patch.start()
         self.addCleanup(sum_patch.stop)
 
+    def test_w4_decode_metadata_selects_bias_and_folded_scale_components(self):
+        """A W8 triplet assumption must not route W4 checkpoint-only metadata."""
+        from sglang.srt.offloading.moe.npu.small_batch_kernels import (
+            prepare_packed_copies,
+        )
+
+        kernel = InterpretedFunction(prepare_packed_copies.fn)
+        experts, stride, start = 4, 12, 4
+        components = (0, 3, 4, 6, 9, 10)
+        sources = torch.arange(12 * stride, dtype=torch.int64).reshape(12, stride)
+        counts = torch.tensor([3, 0, 2, 0], dtype=torch.int64)
+        groups = torch.full_like(counts, -1)
+        selected = torch.full((len(components) * experts,), -1, dtype=torch.int64)
+        accesses = torch.full((stride,), 7, dtype=torch.int64)
+        error = torch.zeros((), dtype=torch.int32)
+        enabled = torch.ones((), dtype=torch.bool)
+        kernel[(1,)](
+            counts,
+            error,
+            enabled,
+            accesses,
+            sources,
+            groups,
+            selected,
+            EXPERTS=experts,
+            SOURCE_STRIDE=stride,
+            START=start,
+            COMPONENT_COUNT=len(components),
+            SKIP_OFFSETS=False,
+            CUMULATIVE=False,
+            BLOCK=experts,
+            COMPONENTS=components,
+        )
+        torch.testing.assert_close(groups, counts)
+        torch.testing.assert_close(
+            selected.reshape(len(components), experts),
+            sources[list(components), start : start + experts],
+        )
+        expected_accesses = torch.full((stride,), 7, dtype=torch.int64)
+        expected_accesses[start : start + experts] += counts
+        torch.testing.assert_close(accesses, expected_accesses)
+        self.assertEqual(error.item(), 0)
+
     def test_cumulative_counts_keep_zero_groups_and_cache_usage_in_layer_order(self):
         weights = object.__new__(AscendPrefillWeights)
         weights.counts = torch.empty(4, dtype=torch.int64)
@@ -1232,7 +1275,7 @@ class TestAscendPrefillIntegration(CustomTestCase):
 
     def test_hot_restore_follows_combine_and_precedes_maintenance_and_decode(self):
         """Borrowed Hot must survive return communication, then be ready for cache users."""
-        owner, context, banks, _ = self._forward_owner()
+        owner, context, banks, submitted = self._forward_owner()
         owner.step = 3
         weights, communication, trace, observed = owner.prefill, _Stream(), [], []
 
@@ -1297,11 +1340,33 @@ class TestAscendPrefillIntegration(CustomTestCase):
             self.assertFalse(owner.state.update_enabled.item())
             self.assertEqual(context.resources, [])
 
-            # No prefill hook runs in the next decode forward.
+            # MTP verifies every candidate row, not merely batch_size rows.
+            # It uses the restored decode bank without submitting a new
+            # prefill transfer; a following idle forward clears the row mask.
             context = _Context()
-            with owner.forward_scope():
+            previous_submitted = list(submitted)
+            owner.decode_active_rows = torch.ones(16, dtype=torch.bool)
+            verify = SimpleNamespace(
+                is_extend_in_batch=False,
+                batch_size=1,
+                input_ids=torch.arange(6),
+                forward_mode=SimpleNamespace(is_idle=lambda: False),
+            )
+            with owner.forward_scope(verify):
+                self.assertEqual(
+                    owner.decode_active_rows.tolist(), [True] * 6 + [False] * 10
+                )
                 context.compute_stream.enqueue(check_hot)
             self.assertEqual(trace[-3:], ["cache", "cache", "cache"])
+            self.assertEqual(submitted, previous_submitted)
+            idle = SimpleNamespace(
+                is_extend_in_batch=False,
+                input_ids=torch.arange(6),
+                forward_mode=SimpleNamespace(is_idle=lambda: True),
+            )
+            with owner.forward_scope(idle):
+                self.assertFalse(owner.decode_active_rows.any().item())
+            self.assertEqual(submitted, previous_submitted)
 
     def test_allgather_keeps_native_capacity_without_host_count_read(self):
         from sglang.srt.layers.moe.moe_runner.ascend import _pre_permute_allgather

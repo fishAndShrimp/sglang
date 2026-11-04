@@ -84,3 +84,62 @@ INT8 专家激活遵守模型的 `swiglu_limit`，截断后再量化；该正确
 本次 CPU 回归额外验证全局 prefill 在提交前清除 execution key（包含本地 IDLE / DECODE）、decode 保留 key，以及激活按实际 GMM 分组格式选择逻辑计数。移除失效操作或恢复错误的计数选择后，对应用例均失败。
 
 目标 NPU 上运行 `test/manual/test_ascend_clipped_int8_activation.py` 和 `test/manual/test_ascend_offload_fixed_slots.py`，并检查 prefill→decode、空 rank、额外 execution 槽、MTP 和大缓存回退。CPU 契约只能验证生命周期和调度选择，不能替代真实权重搬运、GMM 数值或 Graph 验收。
+
+## GLM-5.2 ModelSlim W8A8 / W4A8
+
+GLM-5.2 的 offload 接入已实现，尚未在目标 NPU 上完成整模型数值、Graph 和性能验证。上文 DeepSeek V4 的已验证结果不能直接作为 GLM 验收结果。本节使用独立启动脚本，不修改原 `serve_tp4.sh`，也不继续调整 prefill 调度。
+
+支持 checkpoint 中的 `W8A8_DYNAMIC` 与 `W4A8_DYNAMIC`，均使用 INT8 激活。`--quantization modelslim` 根据 checkpoint 的量化描述选择格式，无须增加 W4/W8 启动开关。W4 支持 per-channel 和 metadata 声明 `group_size` 的 per-group；W13/W2 量化格式、分组和激活配置须一致。不支持 `W4A8_MXFP`、`activation_use_clip=True` 或混合 W4/W8 专家投影。W8 仍要求量化 offset 为零；W4 保留并加载其 scale、offset、`scale_bias` 及 per-group second scale/offset，按 resident 转换生成运行时权重与 scale/bias。
+
+GLM 按实际 routed MoE 层分布建立专家目录，最前面的 routed MoE 层、dense 层及共享专家常驻。W4 decode 使用 packed 执行区路径；W8 在满足原有限制时可使用 Hot 直算。Prefill 沿用当前的双 bank 全层预取和 W13/W2 分阶段等待。
+
+在仓库根目录启动 W8A8：
+
+```bash
+MODEL_PATH=/models/GLM-5.2-W8A8 \
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
+HOST_POOL_GIB=192 CACHE_RATIO=0.25 \
+bash scripts/moe_offload/serve_glm52_tp4.sh
+```
+
+W4A8 per-channel 使用同一脚本，并显式调整 Host 预算：
+
+```bash
+MODEL_PATH=/models/GLM-5.2-W4A8 \
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
+HOST_POOL_GIB=96 CACHE_RATIO=0.25 \
+bash scripts/moe_offload/serve_glm52_tp4.sh
+```
+
+`HOST_POOL_GIB` 默认 192，单位是 **每 rank 的 GiB**。脚本不从目录名推断量化位数；W4 的 96 GiB 仅为 per-channel 的配置参考。Per-group 还要计入 INT64 second scale 和 offset 等 metadata，例如该模型 group size 128 时估算约需 100 GiB/rank，96 GiB 不够。请按启动日志和实际 schema 核算调大；预算不足时 loader 会明确报告所需 GiB 并拒绝启动。
+
+按本次 GLM-5.2 配置、TP=EP=4 估算，卸载专家的权重本体约为 W8 的 **166.5 GiB/rank**、W4 的 **83.25 GiB/rank**；这些数字尚未包含 scale、bias、offset、转换所需的 Host extent 和分配对齐，也不代表整个服务进程的内存。四个 rank 的 Host 池预算相加分别为 768 GiB（192 × 4）和 384 GiB（96 × 4），此外还要给常驻权重、checkpoint 读取和系统内存留空间。实际配置与 checkpoint 不同时，以 loader 预算核算为准。
+
+默认脚本设置 `--attention-backend ascend --page-size 128`，TP=EP=Attention DP=4，MoE TP/CP/PP=1，服务模型名为 `glm52-ascend-offload`。使用独立的 `RUNTIME_DIR`（默认 `/tmp/sglang-glm52-offload-runtime`）和 `LOG_DIR`；需要与其他服务并行时显式更换 `SERVER_PORT`、`DIST_PORT` 和设备列表。
+
+### GLM-5.2 MTP
+
+`ENABLE_MTP=1` 开启同 checkpoint 内的单层 NextN。沿用 DSV4 offload 的执行方式：主模型的 routed experts 继续卸载；draft 权重全部常驻 NPU，不占用主模型 Host/Hot 池；主模型的 target verify 走 packed 路径，关闭 Hot 直算。Verify 不触发整层 prefill 预取，draft 也不参与主模型的缓存维护。
+
+```bash
+MODEL_PATH=/models/GLM-5.2-W8A8-with-MTP \
+ENABLE_MTP=1 HOST_POOL_GIB=192 CACHE_RATIO=0.25 \
+bash scripts/moe_offload/serve_glm52_tp4.sh
+```
+
+W4 主模型使用同一开关，Host 预算仍按上面的实际格式设置。脚本固定 EAGLE `steps=2 / topk=1 / draft_tokens=3`，target 与 draft 均使用 `ascend` attention、同一个 `MODEL_PATH`。默认 `ENABLE_MTP=0`。
+
+默认 `MTP_DRAFT_QUANTIZATION=unquant`，对应仓库 GLM-5.2 NPU 部署示例中的不量化 draft；它不会继承主模型的 W8/W4 量化。必须使用实际包含 MTP 权重的 checkpoint。启动前的 `glm52_mtp_config.py` 会读取配置及 safetensors 的名称/头部信息，在分配主模型和 Host 池前检查 MTP 层是否存在，并拒绝将量化 draft 权重按浮点权重加载。若 draft 本身按 ModelSlim W8A8/W4A8 导出，显式设置 `MTP_DRAFT_QUANTIZATION=modelslim`，由 draft 层自己的量化描述选择 scheme。量化 draft 的 routed experts 支持 `W8A8_DYNAMIC` / `W4A8_DYNAMIC`，其余可量化 linear 支持 `FLOAT` / `W8A8_DYNAMIC`；静态 `W8A8` 未纳入该启动预检范围。暂不支持混合量化且 routed experts 为 FLOAT 的 draft、量化 `eh_proj`，也不支持本脚本中指定另一个 draft checkpoint。
+
+不量化 draft 还需要额外 NPU 显存；`HOST_POOL_GIB` 仅预算卸载专家的 Host 存储，不能代替这部分显存。MTP 接入已做 CPU 契约与启动参数检查，尚未进行 GLM 的 NPU 整模型精度、accept length、Graph replay 或性能验收。实机上分别以 `ENABLE_MTP=0/1` 运行 `test_requests.py` 与 `test_requests.py --bench`，检查短请求、空 DP rank、chunked prefill→verify、缓存维护和并发 1/4/8，再比较相同 checkpoint 的输出与性能。
+
+默认 [initial_profile_glm52.json](initial_profile_glm52.json) 的 `layers` 为空，表示所有专家初始热度为零，按既有确定性规则初始化 Hot；它不是采集得到的访问统计，也不代表推荐的热点分布。可用 `OFFLINE_STATS_PATH=/path/to/glm52-profile.json` 覆盖为该 GLM 模型的实测 profile，不应复用 DeepSeek V4 的 `initial_profile.json`。脚本生成的 `offload.json`、profile 和日志路径都会写入启动输出。
+
+目标 NPU 验收前，先在相同 CANN / torch_npu / MemFabric 环境运行单设备格式与 GMM 对照：
+
+```bash
+MOE_NATIVE_ACL_DIR=/tmp/sglang-glm52-offload-runtime/native_acl \
+python3 test/manual/test_ascend_glm_offload_formats.py --device 0
+```
+
+该脚本使用合成 checkpoint 分片，检查 resident 与 offload Host repack / ACL reload 后的投影结果，覆盖 W8、W4 per-channel 和 per-group；不需要下载模型。它不替代四 rank 的模型加载、长短请求、空 DP rank、prefill→decode、缓存维护和 Graph replay 验证。整模型验收还应与关闭 offload 时的同一量化 checkpoint 对照输出和精度，再评估 TTFT/TPOT。

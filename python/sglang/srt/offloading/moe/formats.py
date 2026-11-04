@@ -2,6 +2,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -12,7 +13,8 @@ class CheckpointComponent:
     shape: tuple
     dtype: object
     shards: tuple
-    runtime_name: str
+    # None retains checkpoint metadata without exposing a quantization field.
+    runtime_name: Optional[str]
     attributes: tuple = ()
     initial_value: int = 0
 
@@ -28,7 +30,7 @@ class BundleComponent:
     checkpoint_dtype: object
     host_nbytes: int
     shards: tuple
-    runtime_name: str
+    runtime_name: Optional[str]
     attributes: tuple = ()
     alignment: int = 64
 

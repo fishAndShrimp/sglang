@@ -117,7 +117,11 @@ class NpuExpertFormat(ExpertFormat):
                 if (
                     nbytes < value.numel() * value.element_size()
                     or nbytes % 64
-                    or (raw.dtype == value.dtype and nbytes < raw_bytes)
+                    or (
+                        recipe.name not in new_outputs
+                        and raw.dtype == value.dtype
+                        and nbytes < raw_bytes
+                    )
                 ):
                     raise RuntimeError(
                         "Native component has an invalid physical extent"
@@ -184,6 +188,7 @@ class NpuExpertFormat(ExpertFormat):
             **{
                 component.runtime_name: tensors[component.name]
                 for component in self.schema.components
+                if component.runtime_name is not None
             }
         )
 
