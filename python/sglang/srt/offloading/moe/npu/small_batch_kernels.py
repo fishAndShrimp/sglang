@@ -20,7 +20,7 @@ def prepare_packed_copies(
     SKIP_OFFSETS: tl.constexpr,
     CUMULATIVE: tl.constexpr,
     BLOCK: tl.constexpr,
-    COMPONENTS: tl.constexpr = None,
+    COMPONENT_MAP: tl.constexpr = -1,
 ):
     # Exactly one program owns the fault latch and this layer's access counters.
     e = tl.arange(0, BLOCK)
@@ -43,8 +43,8 @@ def prepare_packed_copies(
         e < EXPERTS,
     )
     for position in tl.static_range(COMPONENT_COUNT):
-        if COMPONENTS is not None:
-            component = COMPONENTS[position]
+        if COMPONENT_MAP >= 0:
+            component = (COMPONENT_MAP >> (4 * position)) & 15
         else:
             component = (position // 2) * 3 + position % 2 if SKIP_OFFSETS else position
         source = tl.load(
@@ -100,12 +100,14 @@ def prepare_fixed_copies(
     CUMULATIVE: tl.constexpr,
     BLOCK: tl.constexpr,
     DIRECT_HOT: tl.constexpr = False,
+    DIRECT_HOT_CAPACITY: tl.constexpr = 0,
+    HOT_OFFSET: tl.constexpr = 0,
     HotSlots=None,
     HOT_CAPACITY: tl.constexpr = 0,
     Groups=None,
     ExecutionKeys=None,
     KEY_START: tl.constexpr = 0,
-    COMPONENTS: tl.constexpr = None,
+    COMPONENT_MAP: tl.constexpr = -1,
 ):
     # Exactly one program owns the fault latch and this layer's access counters.
     e = tl.arange(0, BLOCK)
@@ -135,28 +137,34 @@ def prepare_fixed_copies(
     needed = (count > 0) & (error == 0)
     copy_needed = needed
     if DIRECT_HOT:
-        hit = hot_slot >= 0
-        physical = tl.where(hit, EXPERTS + hot_slot, e)
+        hit = (hot_slot >= 0) & (hot_slot < DIRECT_HOT_CAPACITY)
+        physical = tl.where(hit, HOT_OFFSET + hot_slot, e)
         position = tl.cumsum(needed.to(tl.int32), 0) - 1
-        pair = tl.arange(0, 2 * BLOCK)
-        match = (pair[:, None] // 2 == position[None, :]) & needed[None, :]
-        values = tl.where(
-            pair[:, None] % 2 == 0,
-            physical[None, :].to(tl.float32),
-            count[None, :].to(tl.float32),
-        )
-        packed = tl.sum(tl.where(match, values, 0), 1).to(tl.int64)
-        # The remaining descriptors stay zero from initialization. Clear the
-        # entire mutable prefix on every replay, including the empty case.
-        tl.store(Groups + pair, packed, pair < 2 * EXPERTS)
-        previous = tl.load(ExecutionKeys + e, e < EXPERTS, -1)
-        copy_needed = needed & ~hit & (previous != KEY_START + e)
-        # Hot reads must leave the Cold slot's identity untouched. Both weight
-        # copy phases finish before another layer can reuse this identity.
-        tl.store(ExecutionKeys + e, KEY_START + e, (e < EXPERTS) & copy_needed)
+        if EXPERTS <= 64:
+            pair = tl.arange(0, 2 * BLOCK)
+            match = (pair[:, None] // 2 == position[None, :]) & needed[None, :]
+            values = tl.where(
+                pair[:, None] % 2 == 0,
+                physical[None, :].to(tl.float32),
+                count[None, :].to(tl.float32),
+            )
+            packed = tl.sum(tl.where(match, values, 0), 1).to(tl.int64)
+            # The remaining descriptors stay zero from initialization. Clear the
+            # entire mutable prefix on every replay, including the empty case.
+            tl.store(Groups + pair, packed, pair < 2 * EXPERTS)
+        else:
+            # The caller clears Groups on the same stream before this kernel.
+            # Unique prefix positions make these stores race-free; keep UB O(E).
+            tl.store(Groups + 2 * position, physical.to(tl.int64), needed)
+            tl.store(Groups + 2 * position + 1, count.to(tl.int64), needed)
+        copy_needed = needed & ~hit
+    previous = tl.load(ExecutionKeys + e, e < EXPERTS, -1)
+    copy_needed = copy_needed & (previous != KEY_START + e)
+    # Hot reads leave execution identity untouched; both phases finish before reuse.
+    tl.store(ExecutionKeys + e, KEY_START + e, (e < EXPERTS) & copy_needed)
     for position in tl.static_range(COMPONENT_COUNT):
-        if COMPONENTS is not None:
-            component = COMPONENTS[position]
+        if COMPONENT_MAP >= 0:
+            component = (COMPONENT_MAP >> (4 * position)) & 15
         else:
             component = (position // 2) * 3 + position % 2 if SKIP_OFFSETS else position
         source = tl.load(

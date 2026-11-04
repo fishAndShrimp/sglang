@@ -132,7 +132,7 @@ class TestAscendQuantSelection(CustomTestCase):
         self.assertEqual((spec.group_size, spec.tp_size), (128, 4))
         self.assertFalse(spec.supports_direct_hot)
 
-    def test_speculative_target_allocates_packed_bank_even_for_w8_ep4(self):
+    def test_speculative_target_uses_fixed_bank_and_keeps_execution_identity(self):
         from sglang.srt.offloading.moe.npu import ascend_ops
 
         class AllocationReached(Exception):
@@ -157,6 +157,7 @@ class TestAscendQuantSelection(CustomTestCase):
                 owner.quant_spec = get_quant_spec(w8, w8)
                 owner.execution_slots = owner.copy_capacity = 4
                 owner.hot_slots = 8
+                owner.device = torch.device("cpu")
                 allocations = []
 
                 def allocate(*args):
@@ -614,24 +615,21 @@ class TestAscendFormatCopyPlan(CustomTestCase):
                 with patch.object(torch, "npu", npu, create=True):
                     owner._init_copy_plan(names)
                 self.assertEqual(owner.fused_components, expected)
-                owner.fused_sources.copy_(
-                    torch.arange(len(expected) * 4).reshape(len(expected), 4) + 2000
-                )
-                descriptors = [
-                    entry for phase in owner.fused_descriptors for entry in phase
-                ]
-                self.assertEqual(tuple(map(len, owner.fused_descriptors)), (3, 3))
-                for position, (component, entry) in enumerate(
-                    zip(expected, descriptors, strict=True)
-                ):
-                    torch.testing.assert_close(entry[0], owner.fused_sources[position])
-                    torch.testing.assert_close(entry[1], owner.destinations[component])
-                    torch.testing.assert_close(entry[2], owner.lengths[component])
-                # W2 progress must never mutate GMM1's packed-count output.
-                self.assertEqual(
-                    len({entry[-1].data_ptr() for entry in descriptors}), 6
-                )
-                self.assertIs(owner.packed_counts, descriptors[0][-1])
+                owner.fused_sources.copy_(torch.arange(len(expected) * 4) + 2000)
+                owner.fused_lengths.copy_(torch.arange(len(expected) * 4).to(torch.uint32))
+                descriptors = [entry for phase in owner.fused_descriptors for entry in phase]
+                self.assertEqual(tuple(map(len, owner.fused_descriptors)), (1, 1))
+                for phase, entry in enumerate(descriptors):
+                    selected = expected[phase * 3 : (phase + 1) * 3]
+                    begin, end = phase * 12, (phase + 1) * 12
+                    torch.testing.assert_close(entry[0], owner.fused_sources[begin:end])
+                    torch.testing.assert_close(entry[1], owner.destinations[list(selected)].flatten())
+                    torch.testing.assert_close(entry[2], owner.fused_lengths[begin:end])
+                    self.assertEqual(entry[3].item(), 12)
+                # W2's native outputs never alias logical counts consumed by GMM1.
+                self.assertEqual(len({entry[-1].data_ptr() for entry in descriptors}), 2)
+                self.assertNotIn(owner.fused_counts.data_ptr(), [entry[-1].data_ptr() for entry in descriptors])
+
 
 
 if __name__ == "__main__":

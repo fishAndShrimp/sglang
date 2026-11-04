@@ -394,7 +394,7 @@ class TestAscendPrefillWeights(CustomTestCase):
             SKIP_OFFSETS=False,
             CUMULATIVE=False,
             BLOCK=experts,
-            COMPONENTS=components,
+            COMPONENT_MAP=sum(c << (4 * i) for i, c in enumerate(components)),
         )
         torch.testing.assert_close(groups, counts)
         torch.testing.assert_close(
@@ -822,6 +822,7 @@ class TestAscendPrefillIntegration(CustomTestCase):
         )
 
         dispatcher = object.__new__(AscendOpsDispatcher)
+        dispatcher.ep_size = 4
         dispatcher._offload_layer = SimpleNamespace(layer_id=layer)
         dispatcher.hidden_size = values.shape[1]
         if owner is not None:
@@ -869,6 +870,7 @@ class TestAscendPrefillIntegration(CustomTestCase):
             return values
 
         with (
+            patch("sglang.srt.layers.moe.token_dispatcher.ascend_ops.get_is_extend_in_batch", return_value=True),
             patch(
                 "sglang.srt.layers.moe.token_dispatcher.ascend_ops.dist.get_rank",
                 return_value=0,
@@ -894,6 +896,7 @@ class TestAscendPrefillIntegration(CustomTestCase):
         context, copy = _Context(), _Stream()
         banks, submitted = [torch.tensor([0]), torch.tensor([99])], []
         owner = object.__new__(AscendOpsOffloader)
+        owner.diagnostics = None
         owner.ready, owner.step, owner.decode_active_rows = True, 0, None
         owner.weight_copy_stream = copy
         owner.execution_keys = None
@@ -1103,6 +1106,7 @@ class TestAscendPrefillIntegration(CustomTestCase):
         from sglang.srt.offloading.moe.npu.ascend_ops import AscendOpsOffloader
 
         owner = object.__new__(AscendOpsOffloader)
+        owner.diagnostics = None
         owner.ready = True
         owner._prepare_fused = Mock(return_value="packed decode weights")
         owner.prefill = SimpleNamespace(
@@ -1144,6 +1148,7 @@ class TestAscendPrefillIntegration(CustomTestCase):
                     self.assertEqual([b.item() for b in banks], [3, 99])
                     communication, observed = _Stream(), []
                     dispatcher = object.__new__(AscendOpsDispatcher)
+                    dispatcher.ep_size = 4
                     dispatcher._offload_layer = SimpleNamespace(
                         layer_id=3, _ascend_ops_offloader=owner
                     )
@@ -1588,6 +1593,7 @@ class TestAscendPrefillIntegration(CustomTestCase):
 
         sequence = []
         dispatcher = object.__new__(AscendOpsDispatcher)
+        dispatcher.ep_size = 4
         dispatcher._offload_layer = SimpleNamespace(
             layer_id=3,
             _ascend_ops_offloader=SimpleNamespace(

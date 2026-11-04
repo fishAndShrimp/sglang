@@ -442,6 +442,7 @@ class ExpertLayerStorage:
                 )
                 self._loaded.add(key)
 
+        load._moe_host_loader = True
         return load
 
     def finalize(self):

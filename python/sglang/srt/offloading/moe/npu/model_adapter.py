@@ -3,19 +3,15 @@
 from dataclasses import dataclass
 
 from ..config import ExpertCatalog, ExpertLayerSpec
+from .model_profile import identify_model
 
 
 def get_model_id(hf_config):
-    model_type = getattr(hf_config, "model_type", None)
-    if model_type == "deepseek_v4":
-        return "DeepSeek-V4-Flash"
-    if model_type == "glm_moe_dsa" and "GlmMoeDsaForCausalLM" in (
-        getattr(hf_config, "architectures", None) or ()
-    ):
-        return "GLM-5.2"
+    model = identify_model(hf_config)
+    if model in ("DeepSeek-V4-Flash", "GLM-5.2"):
+        return model
     raise ValueError(
-        "Ascend expert offload supports DeepSeek V4 and GLM-5.2 "
-        "(glm_moe_dsa / GlmMoeDsaForCausalLM) target models"
+        f"{model} is recognized but its NPU offload format/layout adapter is not validated"
     )
 
 
@@ -60,7 +56,7 @@ class ExpertQuantSpec:
     @property
     def supports_direct_hot(self):
         # A2/A3 GMM group_list_type=2 requires INT8 weights and activations.
-        # W4's packed INT32 carrier must use the packed/count path instead.
+        # W4's packed INT32 carrier must use a logical count-list path instead.
         return self.kind == "w8a8"
 
 

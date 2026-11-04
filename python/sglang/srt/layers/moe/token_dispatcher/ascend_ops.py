@@ -177,6 +177,19 @@ class AscendOpsDispatcher(BaseDispatcher):
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> DispatchOutput:
         topk_weights, topk_ids, _ = topk_output
+        owner = getattr(self._offload_layer, "_ascend_ops_offloader", None)
+        if self.ep_size == 1 and get_parallel().tp_size == 1:
+            if get_is_extend_in_batch():
+                if owner is not None:
+                    owner.start_prefill_layer(self._offload_layer.layer_id)
+            elif owner is not None:
+                active = owner.decode_row_mask(hidden_states.shape[0]).unsqueeze(1)
+                topk_ids = torch.where(active, topk_ids, -1)
+                topk_weights = torch.where(active, topk_weights, 0)
+            return self._dispatch_allgather(
+                hidden_states, topk_weights, topk_ids, self.ep_group,
+                row_sizes=[hidden_states.shape[0]],
+            )
         if get_is_extend_in_batch():
             owner = getattr(self._offload_layer, "_ascend_ops_offloader", None)
             if owner is not None:
@@ -208,7 +221,7 @@ class AscendOpsDispatcher(BaseDispatcher):
             raise TypeError(f"unknown Ascend Ops forward state: {type(state)!r}")
 
         owner = getattr(self._offload_layer, "_ascend_ops_offloader", None)
-        if owner is not None:
+        if owner is not None and get_is_extend_in_batch():
             # Queue the return collective and finalization before the refill.
             # The refill also waits for this combine before reusing its bank.
             owner.prefill.finish_layer(self._offload_layer.layer_id)
@@ -445,7 +458,7 @@ class AscendOpsDispatcher(BaseDispatcher):
         dist.all_gather(gathered_rows, local_rows_tensor, group=group)
         return [int(rows.item()) for rows in gathered_rows]
 
-    def _dispatch_allgather(self, hidden_states, topk_weights, topk_ids, group):
+    def _dispatch_allgather(self, hidden_states, topk_weights, topk_ids, group, *, row_sizes=None):
         """Gather the full batch on every TP rank."""
         input_dtype = hidden_states.dtype
         quant_mode = self._quant_mode("routing")
@@ -458,9 +471,10 @@ class AscendOpsDispatcher(BaseDispatcher):
         # equal split and becomes incorrect as soon as CP is enabled.  Exchange
         # the actual local row count so the subsequent padded all-gather and
         # reduce-scatter use the exact layout produced by the attention path.
-        row_sizes = self._allgather_row_sizes(
-            hidden_states.shape[0], group, hidden_states.device
-        )
+        if row_sizes is None:
+            row_sizes = self._allgather_row_sizes(
+                hidden_states.shape[0], group, hidden_states.device
+            )
         world_size = len(row_sizes)
         max_rows = max(row_sizes)
         if max_rows == 0:
@@ -469,6 +483,8 @@ class AscendOpsDispatcher(BaseDispatcher):
         equal_rows = min(row_sizes) == max_rows
 
         def gather_rows(tensor):
+            if world_size == 1:
+                return tensor
             if equal_rows:
                 padded = tensor.contiguous()
             else:
@@ -502,7 +518,7 @@ class AscendOpsDispatcher(BaseDispatcher):
                 )
 
         state = _AllGatherState(
-            group=group,
+            group=None if world_size == 1 else group,
             row_sizes=row_sizes,
             input_dtype=input_dtype,
         )
@@ -523,6 +539,8 @@ class AscendOpsDispatcher(BaseDispatcher):
     ) -> torch.Tensor:
         """ReduceScatter contributions back to the local shard."""
         sizes = state.row_sizes
+        if state.group is None:
+            return contributions.to(state.input_dtype)
         group = state.group
         max_rows = max(sizes)
         if min(sizes) == max_rows:

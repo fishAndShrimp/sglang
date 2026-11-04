@@ -332,7 +332,7 @@ def maybe_executor_submit(
     """
     if func_kwargs is None:
         func_kwargs = {}
-    if use_async:
+    if use_async and not getattr(func, "_moe_host_loader", False):
         # CRITICAL: Capture current CUDA device and restore it in worker thread.
         # torch.cuda.current_device() is thread-local and is NOT correctly passed to threads.
         # This may result in errors in case the `func` relies on torch current device to be already correctly specified.

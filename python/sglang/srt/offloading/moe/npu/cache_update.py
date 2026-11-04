@@ -169,9 +169,11 @@ class FusedCacheUpdate:
         self.owner = owner
         self.bindings = owner.residency.update_bindings
         self.n, self.h = owner.catalog.num_experts, owner.hot_slots
-        if not (0 < self.h <= min(self.n, 1280) and self.n <= 8192):
+        from .capabilities import SINGLE_PROGRAM_HOT_LIMIT
+        self.tiled = self.h > SINGLE_PROGRAM_HOT_LIMIT
+        if not (0 < self.h <= self.n):
             raise ValueError(
-                "Fused cache update supports up to 1280 Hot slots and 8192 keys"
+                "Hot cache must fit within the catalog"
             )
         device = owner.device
 
@@ -179,7 +181,9 @@ class FusedCacheUpdate:
             return torch.zeros(shape, dtype=dtype, device=device)
 
         self.partial_bad = tensor((triton.cdiv(self.n, 256),), torch.int32)
-        self.survivors = tensor((self.h,), torch.bool)
+        # Tiled indexed stores must be word-sized: independent byte stores on
+        # adjacent slots can share an NPU store word across programs.
+        self.survivors = tensor((self.h,), torch.int32 if self.tiled else torch.bool)
         self.new_keys = tensor((self.h,))
         self.new_count = tensor((), torch.int32)
         self.active = tensor((), torch.bool)
@@ -194,8 +198,13 @@ class FusedCacheUpdate:
             tensor((), torch.int32),
             self.h,
         )
+        if self.tiled:
+            from .cache_update_tiled import TiledCacheUpdate
+            self.large = TiledCacheUpdate(self)
 
     def apply(self):
+        if self.tiled:
+            return self.large.apply()
         o, s = self.owner, self.owner.state
         o.context.retain(self)
         validate_forward_map[(triton.cdiv(self.n, 256),)](

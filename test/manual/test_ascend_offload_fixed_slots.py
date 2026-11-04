@@ -1,4 +1,4 @@
-"""NPU integration check for packed expert copies and dynamic graph replay.
+"""NPU integration check for fixed-slot expert copies and dynamic graph replay.
 
 Run on an idle NPU with the same MemFabric / native ACL environment as serving.
 Set MOE_NATIVE_ACL_DIR to the already-built native extension directory.
@@ -33,8 +33,8 @@ def main():
     assert module.weight.data_ptr() == original
     assert torch.equal(module.weight, torch.arange(16, dtype=torch.float32) + 100)
     n, h, components, size = int(os.environ.get("MOE_TEST_EXPERTS", "64")), 2, 6, 1024
-    if not 8 <= n <= 256:
-        raise ValueError("MOE_TEST_EXPERTS must be in [8, 256]")
+    if not 8 <= n <= 896:
+        raise ValueError("MOE_TEST_EXPERTS must be in [8, 896]")
     names = tuple(
         f"{prefix}_{suffix}"
         for prefix in ("w13", "w2")
@@ -55,7 +55,10 @@ def main():
     owner = object.__new__(AscendOpsOffloader)
     owner.device, owner.ready, owner.local_experts, owner.hot_slots = device, True, n, h
     owner.copy_capacity = n
-    owner.direct_hot, owner.execution_keys = False, None
+    owner.direct_hot, owner.direct_hot_slots = False, 0
+    owner.execution_slots = n
+    owner.execution_keys = torch.full((n,), -1, dtype=torch.int64, device=device)
+    owner.format = SimpleNamespace(layouts={name: SimpleNamespace(runtime_name=name) for name in names})
     owner.context = _Context()
     owner.catalog = SimpleNamespace(
         num_experts=n,
@@ -98,12 +101,12 @@ def main():
     owner._init_copy_plan(names)
     owner._publish_sources()
     descriptors = [d for phase in owner.fused_descriptors for d in phase]
-    assert len(descriptors) == 4
-    assert len({d[-1].data_ptr() for d in descriptors}) == 4
-    assert all(d[0].numel() == n and d[3].item() == n for d in descriptors)
-    assert all(d[2].dtype == d[3].dtype == torch.int32 for d in descriptors)
-    # Read GMM's counts on the compute stream before the W2 wait. W2's packed
-    # output buffers must not overwrite the count vector used by GMM1.
+    from math import ceil
+    assert len(descriptors) == 2 * ceil(2 * n / 256)
+    assert len({d[-1].data_ptr() for d in descriptors}) == len(descriptors)
+    assert all(d[0].numel() <= 256 and d[3].item() == d[0].numel() for d in descriptors)
+    assert all(d[2].dtype == d[3].dtype == torch.uint32 for d in descriptors)
+    # Counts are independent of all native copy output buffers.
     observed_counts = torch.empty(n, dtype=torch.int64, device=device)
 
     def run():
@@ -112,6 +115,7 @@ def main():
         owner.wait_for_w2(0)
 
     def reset_destination():
+        owner.execution_keys.fill_(-1)
         destination.fill_(255)
         destination[2].zero_()
         destination[5].zero_()
@@ -132,18 +136,17 @@ def main():
             owner.state.step_access_count.cpu(), before + torch.tensor(values)
         )
         active = [e for e, count in enumerate(values) if count]
-        packed = torch.tensor(
-            [values[e] for e in active] + [0] * (n - len(active)),
-            dtype=torch.int64,
-        )
-        assert torch.equal(owner.packed_counts.cpu(), packed)
-        assert torch.equal(observed_counts.cpu(), packed)
-        assert inp.group_list_type == 1
+        expected_counts = torch.tensor(values, dtype=torch.int64)
+        if cumulative:
+            expected_counts = expected_counts.cumsum(0)
+        assert torch.equal(owner.fused_counts.cpu(), expected_counts)
+        assert torch.equal(observed_counts.cpu(), expected_counts)
+        assert inp.group_list_type == (0 if cumulative else 1)
         actual = destination.cpu()
         for slot in range(n):
             expected = (
-                host[:, active[slot]]
-                if slot < len(active)
+                host[:, slot]
+                if values[slot]
                 else torch.full_like(host[:, 0], 255)
             )
             expected = expected.clone()
@@ -163,9 +166,9 @@ def main():
                     x=[x],
                     weight=[weight],
                     split_item=2,
-                    group_list_type=1,
+                    group_list_type=0 if cumulative else 1,
                     group_type=0,
-                    group_list=owner.packed_counts,
+                    group_list=owner.fused_counts,
                     output_dtype=torch.bfloat16,
                 )[0]
                 expected = (
@@ -229,7 +232,7 @@ def main():
     for c, name in enumerate(names):
         assert destination[c].eq(0 if name.endswith("_offset") else 255).all().item()
     print(
-        "PASS: load-context ownership, packed H2D/Hot D2D weights/scales, GMM row order, zero offsets, empty rank, dense-to-empty tails, last expert, cumulative counts, changing graph replay routes, invalid-count masking",
+        "PASS: load-context ownership, fixed H2D/Hot D2D weights/scales, GMM row order, zero offsets, empty rank, dense-to-empty tails, last expert, cumulative counts, changing graph replay routes, invalid-count masking",
         flush=True,
     )
     import triton
@@ -285,6 +288,8 @@ def main():
     for layer in (0, 1):
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
+            if n > 64:
+                groups.zero_()
             prepare_fixed_copies[(1,)](
                 raw,
                 fault,
@@ -303,6 +308,8 @@ def main():
                 CUMULATIVE=False,
                 BLOCK=triton.next_power_of_2(n),
                 DIRECT_HOT=True,
+                DIRECT_HOT_CAPACITY=h,
+                HOT_OFFSET=n,
                 HotSlots=slots,
                 HOT_CAPACITY=h,
                 Groups=groups,
