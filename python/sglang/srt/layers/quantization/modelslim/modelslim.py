@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from copy import copy, deepcopy
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union, cast
 
@@ -95,8 +96,20 @@ class ModelSlimConfig(QuantizationConfig):
 
     supports_kimi_k3_quantized_latent_projections = True
 
-    def __init__(self, quant_config: Dict[str, Any] = {}):
+    # Hardcoded compatibility for models missing an MLA fusion declaration.
+    _HARDCODED_PACKED_MODULES = {
+        "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
+    }
+    # Hardcoded vision aliases: runtime layer name -> checkpoint layer name.
+    # These require the path and fusion guards in the vision resolver below.
+    _HARDCODED_VISION_ALIASES = {
+        "vision_model": {"proj": "out_proj"},
+        "visual": {"qkv_proj": "qkv"},
+    }
+
+    def __init__(self, quant_config: Optional[Dict[str, Any]] = None):
         super().__init__()
+        quant_config = dict(quant_config or {})
         keys = [k for k in quant_config if isinstance(k, str)]
         is_dsv4 = any(k.startswith("hc_head_") for k in keys)
         if is_dsv4:
@@ -201,8 +214,60 @@ class ModelSlimConfig(QuantizationConfig):
 
         self.quant_description = quant_config
 
-    def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
-        self.packed_modules_mapping.update(mapping)
+    @staticmethod
+    def _iter_mapped_quant_descriptions(descriptions, mapper):
+        """Apply the model mapper to parameter names or their module suffixes."""
+        parameter_mapper = copy(mapper)
+        parameter_mapper.orig_to_new_suffix = {}
+        suffix_mapper = copy(mapper)
+        suffix_mapper.orig_to_new_prefix = {}
+        suffix_mapper.orig_to_new_substr = {}
+
+        for original, value in descriptions.items():
+            # Use the shared mapper for prefix and substring rules first.
+            mapped = parameter_mapper.apply_list([original])
+            if not mapped:
+                continue
+            name = mapped[0]
+            field = None
+            # An existing parameter-suffix rule applies to the full name.
+            # Otherwise apply module-suffix rules without the final field.
+            if not any(name.endswith(suffix) for suffix in mapper.orig_to_new_suffix):
+                module, separator, parameter = name.rpartition(".")
+                if separator:
+                    name, field = module, parameter
+            mapped = suffix_mapper.apply_list([name])
+            if mapped:
+                name = mapped[0] if field is None else f"{mapped[0]}.{field}"
+                yield name, value
+
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper):
+        # Keep checkpoint names as well as the model-declared runtime aliases.
+        # Always map the original description, so repeated registration cannot
+        # apply substring rules twice (qkv -> qkv_proj -> qkv_proj_proj).
+        if not hasattr(self, "_unmapped_quant_description"):
+            self._unmapped_quant_description = dict(self.quant_description)
+        # Only tensor descriptions name parameters. Keep top-level format
+        # metadata and structured settings out of the model's name mapper.
+        descriptions = {
+            name: value
+            for name, value in self._unmapped_quant_description.items()
+            if isinstance(name, str) and "." in name and isinstance(value, str)
+        }
+        aliases = dict(self.quant_description)
+        for name, value in self._iter_mapped_quant_descriptions(
+            descriptions, hf_to_sglang_mapper
+        ):
+            if name in aliases and aliases[name] != value:
+                raise ValueError(f"Conflicting ModelSlim descriptions for {name}")
+            aliases[name] = value
+        self.quant_description = aliases
+
+    def update_packed_modules_mapping(self, mapping: Dict[str, Any]) -> None:
+        # Preserve dict.update semantics without modifying shared tables or lists.
+        updated = deepcopy(self.packed_modules_mapping)
+        updated.update(deepcopy(mapping))
+        self.packed_modules_mapping = updated
 
     def _quant_prefix_candidates(self, prefix: str) -> List[str]:
         """Return checkpoint-name variants without copying the large config.
@@ -214,8 +279,12 @@ class ModelSlimConfig(QuantizationConfig):
         boundary.
         """
         candidates = [prefix]
-        if ".mlp." in prefix:
-            candidates.append(prefix.replace(".mlp.", ".block_sparse_moe."))
+        for candidate in list(candidates):
+            if candidate.startswith(".") and not candidate.startswith(".."):
+                candidates.append(candidate[1:])
+        for candidate in list(candidates):
+            if ".mlp." in candidate:
+                candidates.append(candidate.replace(".mlp.", ".block_sparse_moe."))
 
         for candidate in list(candidates):
             if candidate.startswith("model.language_model."):
@@ -267,6 +336,124 @@ class ModelSlimConfig(QuantizationConfig):
     def from_config(cls, config: Dict[str, Any]) -> ModelSlimConfig:
         return cls(config)
 
+    def _get_packed_modules_mapping(self) -> Mapping[str, List[str]]:
+        from sglang.srt.layers.quantization.utils import _FALLBACK_FUSED_SHARDS
+
+        mapping = dict(_FALLBACK_FUSED_SHARDS)
+        for name, parts in self.packed_modules_mapping.items():
+            if isinstance(parts, Mapping):
+                if name != "model":
+                    raise ValueError(
+                        f"Unsupported ModelSlim packed mapping group: {name!r}"
+                    )
+                continue
+            mapping[name] = parts
+
+        # KimiK3LinearForCausalLM wraps its ModelSlim mapping in a "model"
+        # subtable. Other current model declarations use a flat mapping.
+        model_mapping = self.packed_modules_mapping.get("model", {})
+        if isinstance(model_mapping, Mapping):
+            mapping.update(model_mapping)
+        # Fill missing entries only; do not share the compatibility lists.
+        for name, parts in self._HARDCODED_PACKED_MODULES.items():
+            mapping.setdefault(name, list(parts))
+        return mapping
+
+    def _resolve_legacy_vision_quant_prefix(
+        self, prefix: str, shards: List[str]
+    ) -> Optional[str]:
+        """Find vision aliases otherwise applied only during load_weights."""
+        from sglang.srt.layers.quantization.utils import _FALLBACK_FUSED_SHARDS
+
+        parent, separator, name = prefix.rpartition(".")
+
+        # 1. Select aliases for this vision path.
+        path = parent.split(".")
+        if "vision_model" in path:
+            aliases = self._HARDCODED_VISION_ALIASES["vision_model"]
+        elif "visual" in path:
+            aliases = self._HARDCODED_VISION_ALIASES["visual"]
+        else:
+            return None
+        checkpoint_name = aliases.get(name)
+        if checkpoint_name is None:
+            return None
+
+        # 2. Do not override custom fusion declarations.
+        standard_shards = _FALLBACK_FUSED_SHARDS.get(name, [])
+        if shards and shards != standard_shards:
+            return None
+
+        # 3. Use the alias only if its quantization description exists.
+        quant_prefix = self._resolve_quant_prefix(parent + separator + checkpoint_name)
+        if quant_prefix + ".weight" in self.quant_description:
+            return quant_prefix
+        return None
+
+    def _linear_quant_prefixes(
+        self,
+        prefix: str,
+        fused_mapping: Mapping[str, List[str]],
+        output_sizes: Optional[List[int]] = None,
+    ) -> List[str]:
+        """Resolve the same checkpoint entries for scheme and FLOAT selection."""
+        # Possibility 1: whole layer, e.g. qkv_proj (including name variants).
+        direct = self._resolve_quant_prefix(prefix)
+        whole_quant_prefix = (
+            direct if direct + ".weight" in self.quant_description else None
+        )
+
+        # Possibility 2: split components, e.g. q_proj, k_proj, v_proj.
+        # Check both layouts to detect ambiguity.
+        parent, separator, name = prefix.rpartition(".")
+        shards = fused_mapping.get(name, [])
+        # QKV projections can omit V by declaring an output size of zero.
+        # Only use sizes when they describe exactly the declared fusion.
+        if output_sizes is not None and len(output_sizes) == len(shards):
+            shards = [shard for shard, size in zip(shards, output_sizes) if size != 0]
+        components = [
+            self._resolve_quant_prefix(parent + separator + shard)
+            for shard in shards
+        ]
+        present = [p + ".weight" in self.quant_description for p in components]
+        if any(present):
+            if not all(present):
+                missing = [
+                    p + ".weight" for p, found in zip(components, present) if not found
+                ]
+                raise ValueError(
+                    f"Missing ModelSlim quantization descriptions for some components "
+                    f"of fused layer {prefix}. Missing keys: {missing}"
+                )
+            schemes = {self.quant_description[p + ".weight"] for p in components}
+            if len(schemes) != 1:
+                entries = {
+                    p + ".weight": self.quant_description[p + ".weight"]
+                    for p in components
+                }
+                raise ValueError(
+                    f"ModelSlim requires all components of fused layer {prefix} "
+                    f"to use the same quantization scheme. Found: {entries}"
+                )
+        if whole_quant_prefix is None:
+            whole_quant_prefix = self._resolve_legacy_vision_quant_prefix(prefix, shards)
+        # A mapper may give the whole tensor a runtime alias; that is still
+        # one layout. A separate set of component entries is another layout.
+        # Even identical schemes cannot tell us which weights the loader uses.
+        if any(present):
+            if whole_quant_prefix is not None and components != [whole_quant_prefix]:
+                raise ValueError(
+                    f"Ambiguous ModelSlim layout for {prefix}: whole tensor "
+                    f"{whole_quant_prefix}.weight and component tensors "
+                    f"{[p + '.weight' for p in components]} are both described"
+                )
+            return components
+        if whole_quant_prefix is not None:
+            return [whole_quant_prefix]
+        # Some checkpoints serialize the fused tensor itself. Do not infer
+        # quantization from absent component entries, including for FLOAT.
+        return [self._resolve_quant_prefix(prefix)]
+
     def get_quant_method(
         self,
         layer: torch.nn.Module,
@@ -276,30 +463,16 @@ class ModelSlimConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
-            # TODO: we should remove this code and switch to the packed_modules_mapping declared inside the modeling files
-            key = "model"
-            if "vision_model" in prefix:
-                key = "vision_model"
-            elif "visual" in prefix:
-                key = "visual"
             if "vision_tower" in prefix or "mm_projector" in prefix:
                 prefix = prefix.replace(r"attn.qkv_proj", r"wqkv")
                 prefix = prefix.replace(r"attn.proj", r"wo")
-            packed_modules_mapping_subset = self.packed_modules_mapping.get(key, {})
-            prefix_in_quant_config = prefix
-            proj_name = prefix.split(".")[-1]
-            direct_prefix = self._resolve_quant_prefix(prefix)
-            if (
-                direct_prefix + ".weight" not in self.quant_description
-                and proj_name in packed_modules_mapping_subset
-            ):
-                prefix_in_quant_config = prefix.replace(
-                    proj_name, packed_modules_mapping_subset[proj_name][0]
-                )
-            prefix_in_quant_config = self._resolve_quant_prefix(prefix_in_quant_config)
-            if self.is_layer_skipped(
-                prefix, packed_modules_mapping_subset
-            ) or self.is_layer_skipped(prefix, self.packed_modules_mapping):
+            packed_modules_mapping = self._get_packed_modules_mapping()
+            prefixes = self._linear_quant_prefixes(
+                prefix, packed_modules_mapping, getattr(layer, "output_sizes", None)
+            )
+            prefix_in_quant_config = prefixes[0]
+            scheme_name = self.quant_description.get(prefix_in_quant_config + ".weight")
+            if scheme_name == "FLOAT":
                 return UnquantizedLinearMethod()
             layer.scheme = self.get_linear_scheme(layer, prefix_in_quant_config)
             if layer.scheme is None:
@@ -336,17 +509,31 @@ class ModelSlimConfig(QuantizationConfig):
         ]
 
         prefix = self._resolve_quant_prefix(prefix)
-        quant_schemes = [self.quant_description.get(prefix + ".weight", "")]
+        key = prefix + ".weight"
+        if key not in self.quant_description:
+            logger.warning(
+                "No ModelSlim description for layer %s; using unquantized weights. "
+                "Tried: %s",
+                prefix,
+                [
+                    candidate + ".weight"
+                    for candidate in self._quant_prefix_candidates(prefix)
+                ],
+            )
+            return None
+        scheme_name = self.quant_description[key]
+        if scheme_name == "FLOAT":
+            return None
 
-        for scheme_name, scheme_class in linear_quant_schemes:
-            if any(s == scheme_name for s in quant_schemes):
+        for supported_name, scheme_class in linear_quant_schemes:
+            if scheme_name == supported_name:
                 logger.info_once(f"Using {scheme_class.__name__}")
                 return scheme_class(quant_config=self.quant_description, prefix=prefix)
 
-        logger.warning(
-            f"Unsupported Linear modelslim scheme: {quant_schemes} in layer: {prefix}"
+        raise ValueError(
+            f"Unsupported ModelSlim Linear scheme {scheme_name!r} for layer {prefix} "
+            f"(description key: {key})"
         )
-        return None
 
     def get_moe_scheme(
         self,
@@ -455,38 +642,8 @@ class ModelSlimConfig(QuantizationConfig):
     def is_layer_skipped(
         self, prefix: str, fused_mapping: Mapping[str, List[str]] = MappingProxyType({})
     ):
-        # adapted from vllm.model_executor.layers.quantization.utils.quant_utils.is_layer_skipped
-        proj_name = prefix.split(".")[-1]
-        direct_prefix = self._resolve_quant_prefix(prefix)
-        if direct_prefix + ".weight" in self.quant_description:
-            return self.quant_description[direct_prefix + ".weight"] == "FLOAT"
-        if proj_name in fused_mapping:
-            shard_prefixes = [
-                prefix.replace(proj_name, shard_proj_name)
-                for shard_proj_name in fused_mapping[proj_name]
-            ]
-
-            is_skipped = None
-            for shard_prefix in shard_prefixes:
-                shard_prefix = self._resolve_quant_prefix(shard_prefix)
-                is_shard_skipped = (
-                    self.quant_description.get(shard_prefix + ".weight", "") == "FLOAT"
-                )
-
-                if is_skipped is None:
-                    is_skipped = is_shard_skipped
-                elif is_shard_skipped != is_skipped:
-                    raise ValueError(
-                        f"Detected some but not all shards of {prefix} "
-                        "are quantized. All shards of fused layers "
-                        "to have the same precision."
-                    )
-        else:
-            prefix = self._resolve_quant_prefix(prefix)
-            is_skipped = self.quant_description.get(prefix + ".weight", "") == "FLOAT"
-
-        assert is_skipped is not None
-        return is_skipped
+        resolved = self._linear_quant_prefixes(prefix, fused_mapping)[0]
+        return self.quant_description.get(resolved + ".weight") == "FLOAT"
 
     def get_scaled_act_names(self) -> List[str]:
         return []
