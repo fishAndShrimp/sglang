@@ -17,13 +17,13 @@ class TimingSummaryTests(unittest.TestCase):
                       poll=11.70, done=11.71, chunked=False, chunks=1)
         return worker, finish
 
-    def parse(self, events, exclude=()):
+    def parse(self, events, exclude=(), metric_only=False):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "p.log"
             path.write_text("".join("[TP rank] KV_TIMING " + json.dumps(event) + "\n"
                                     for event in events))
             with contextlib.redirect_stderr(io.StringIO()):
-                return read_rows([path], set(exclude))
+                return read_rows([path], set(exclude), metric_only=metric_only)
 
     def test_split_and_existing_metric_reconcile(self):
         row = make_row(*self.events())
@@ -80,6 +80,47 @@ class TimingSummaryTests(unittest.TestCase):
         self.assertEqual(self.parse([worker, finish]), [])
         worker["ready"] = float("nan")
         self.assertEqual(self.parse([worker, finish]), [])
+
+    def test_metric_only_keeps_full_population_when_five_stage_keeps_three(self):
+        events = []
+        expected_sum = 0.0
+        for i in range(100):
+            worker, finish = self.events(room=i)
+            # A slower single-chunk subset must not stand in for all requests.
+            latency_ms = 2955.0 if i < 3 else 1043.0
+            finish["done"] = finish["transfer"] + latency_ms / 1000
+            finish["chunks"] = 1 if i < 3 else 2
+            finish["chunked"] = i >= 3
+            expected_sum += latency_ms
+            events.extend([worker, finish])
+        self.assertEqual(len(self.parse(events)), 3)
+        rows = self.parse(events, metric_only=True)
+        self.assertEqual(len(rows), 100)
+        self.assertAlmostEqual(sum(row["metric_ms"] for row in rows), expected_sum)
+
+    def test_metric_only_needs_no_worker_or_prefill_timestamps(self):
+        _, finish = self.events()
+        finish = {k: finish[k] for k in ("event", "pid", "room", "rid", "done", "transfer")}
+        rows = self.parse([finish], metric_only=True)
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["metric_ms"], 990)
+        self.assertNotIn("send_ms", rows[0])
+
+    def test_metric_only_still_rejects_duplicate_finish_and_bad_interval(self):
+        worker, finish = self.events()
+        self.assertEqual(self.parse([finish, finish], metric_only=True), [])
+        self.assertEqual(self.parse([worker], metric_only=True), [])
+        for done in (None, float("nan"), finish["transfer"], finish["transfer"] - 1):
+            finish["done"] = done
+            self.assertEqual(self.parse([finish], metric_only=True), [])
+
+    def test_metric_only_preserves_rank_isolation_and_warmup_exclusion(self):
+        a, b = self.events(pid=10)[1], self.events(pid=11)[1]
+        rows = self.parse([a, b], metric_only=True)
+        self.assertEqual({row["pid"] for row in rows}, {10, 11})
+        self.assertEqual(
+            self.parse([a, b], exclude=["request-a"], metric_only=True), []
+        )
 
 
 if __name__ == "__main__":

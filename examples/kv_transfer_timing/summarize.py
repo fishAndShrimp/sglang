@@ -25,7 +25,9 @@ DURATIONS = (
 def make_row(worker, finish):
     if finish.get("chunks") != 1 or finish.get("chunked"):
         raise ValueError(
-            "requires one send chunk: overlapping/chunked sends are not a five-stage split"
+            "requires one send chunk: overlapping/chunked sends are not a five-stage split "
+            f"(chunks={finish.get('chunks')}, chunked={finish.get('chunked')}); "
+            "use --metric-only to include this request in the original metric"
         )
     if worker.get("attempts") != 1:
         raise ValueError("worker retried: queue/send intervals are not a single pass")
@@ -49,6 +51,7 @@ def make_row(worker, finish):
         raise ValueError("overlapping or out-of-order boundaries")
     if not prefill <= transfer <= done:
         raise ValueError("metric interval is outside the expected boundaries")
+
     def ms(a, b):
         return (a - b) * 1000
 
@@ -68,7 +71,27 @@ def make_row(worker, finish):
     }
 
 
-def read_rows(paths, exclude_rids):
+def make_metric_row(finish):
+    """Reproduce Mooncake's metric without requiring serial transfer stages."""
+    transfer, done = finish.get("transfer"), finish.get("done")
+    if any(
+        not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+        for value in (transfer, done)
+    ):
+        raise ValueError("missing or invalid metric timestamps")
+    if done <= transfer:
+        raise ValueError("non-positive metric interval")
+    return {
+        "pid": finish["pid"],
+        "room": finish["room"],
+        "rid": finish.get("rid", ""),
+        "metric_ms": (done - transfer) * 1000,
+    }
+
+
+def read_rows(paths, exclude_rids, metric_only=False):
     records = defaultdict(lambda: defaultdict(list))
     invalid = 0
     for path in paths:
@@ -90,7 +113,7 @@ def read_rows(paths, exclude_rids):
     rows = []
     for key, group in records.items():
         workers, finishes = group["worker"], group["finish"]
-        if len(workers) != 1 or len(finishes) != 1:
+        if len(finishes) != 1 or (not metric_only and len(workers) != 1):
             print(
                 f"Skipped pid/room={key}: missing or repeated events "
                 f"(worker={len(workers)}, finish={len(finishes)})",
@@ -100,7 +123,11 @@ def read_rows(paths, exclude_rids):
         if finishes[0].get("rid") in exclude_rids:
             continue
         try:
-            rows.append(make_row(workers[0], finishes[0]))
+            rows.append(
+                make_metric_row(finishes[0])
+                if metric_only
+                else make_row(workers[0], finishes[0])
+            )
         except ValueError as error:
             print(f"Skipped pid/room={key}: {error}", file=sys.stderr)
     return rows
@@ -110,6 +137,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("logs", type=Path, nargs="+")
     parser.add_argument(
+        "--metric-only",
+        action="store_true",
+        help="Use finish events to reconcile the original metric, including multi-chunk requests",
+    )
+    parser.add_argument(
         "--exclude-rid",
         action="append",
         default=[],
@@ -118,15 +150,22 @@ def main():
     args = parser.parse_args()
     if len({path.resolve() for path in args.logs}) != len(args.logs):
         parser.error("Pass each log file only once")
-    rows = read_rows(args.logs, set(args.exclude_rid))
+    rows = read_rows(args.logs, set(args.exclude_rid), metric_only=args.metric_only)
     if not rows:
-        raise SystemExit("No complete, unchunked request samples found")
-    writer = csv.DictWriter(sys.stdout, fieldnames=("pid", "room", "rid") + DURATIONS)
+        raise SystemExit("No valid samples found for the selected mode")
+    durations = ("metric_ms",) if args.metric_only else DURATIONS
+    print(
+        "mode=metric-only (valid finish events; includes multi-chunk requests)"
+        if args.metric_only
+        else "mode=five-stage (single-chunk subset; use --metric-only to reconcile /metrics)",
+        file=sys.stderr,
+    )
+    writer = csv.DictWriter(sys.stdout, fieldnames=("pid", "room", "rid") + durations)
     writer.writeheader()
     for row in rows:
         writer.writerow(
             {
-                key: round(value, 6) if key in DURATIONS else value
+                key: round(value, 6) if key in durations else value
                 for key, value in row.items()
             }
         )
@@ -139,13 +178,13 @@ def main():
             f"pid={pid} samples={len(samples)} (rank-local observations)",
             file=sys.stderr,
         )
-        for field in DURATIONS:
+        for field in durations:
             values = sorted(sample[field] for sample in samples)
             p95 = values[math.ceil(0.95 * len(values)) - 1]
             print(
                 f"  {field}: mean={statistics.mean(values):.3f} "
                 f"p50={statistics.median(values):.3f} p95={p95:.3f} "
-                f"max={values[-1]:.3f}",
+                f"max={values[-1]:.3f} sum={math.fsum(values):.3f}",
                 file=sys.stderr,
             )
 

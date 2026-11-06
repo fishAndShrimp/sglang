@@ -76,6 +76,21 @@ completion_time 与原指标终点一致，不涵盖后面的所有输出和资�
 3. 与原指标对齐
 ---------------
 
+重要：默认五段汇总只统计可以串行拆分的子集。若出现大量 Skipped，
+不要把这个子集的 metric_ms 平均值与整轮 /metrics 增量平均值相比。
+使用下面的模式可以仅凭现有 finish 记录对账，不要求单块发送或 worker 记录，
+也不需要重启 P 或重跑 benchmark：
+
+    python3 examples/kv_transfer_timing/summarize.py /你的日志路径/p.log \
+        --metric-only > /dev/null 2> /你的结果目录/metric_summary.txt
+
+这里仅输出 metric_ms 的统计，包括 samples、sum、mean、p50、p95 和 max。
+每个 pid 的 samples、sum、mean 分别与相同范围的 /metrics 的
+count 增量、sum 增量和 sum/count 对账。多块发送不会因此被排除，
+但重复 finish、缺失或无效起止时间仍会被排除并提示。
+这不是多块传输的五段分析；它不推算缺失的各块发送时刻。
+脚本仍会读取整个输入日志，请保证其中的请求属于你要比较的那轮压测。
+
 metric_ms = (completion_time - prefill_transfer_queue_entry_time) * 1000
 它使用这个版本 Mooncake 后端原有 kv_transfer_latency_ms 的起止点。
 
@@ -101,7 +116,7 @@ CSV 的 metric_start_after_enqueue_ms 记录了这两个起点的差值：
 4. 范围与限制
 -------------
 
-五段串行拆分用于一个请求只有一个发送 chunk、后台只出队一次的成功请求。
+默认五段串行拆分用于一个请求只有一个发送 chunk、后台只出队一次的成功请求。
 分块 prefill、前缀提前发送、多次发送、staging 重排队、失败、缺失/重复日志
 以及时间边界重叠的样本会被跳过并说明原因，避免给出错误的串行耗时。
 原始日志仍保留，便于后续单独分析这些路径。dummy rank 不一定有发送样本。
