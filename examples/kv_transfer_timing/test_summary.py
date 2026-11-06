@@ -10,29 +10,62 @@ from summarize import make_row, read_rows
 
 class TimingSummaryTests(unittest.TestCase):
     def events(self, pid=10, room=20):
-        worker = dict(event="worker", pid=pid, room=room,
-                      enqueue=10.71, dequeue=10.73, ready=10.91, attempts=1)
-        finish = dict(event="finish", pid=pid, room=room, rid="request-a",
-                      forward=10.0, prefill=10.70, transfer=10.72,
-                      poll=11.70, done=11.71, chunked=False, chunks=1)
+        worker = dict(
+            event="worker",
+            pid=pid,
+            room=room,
+            enqueue=10.71,
+            dequeue=10.73,
+            ready=10.91,
+            attempts=1,
+        )
+        finish = dict(
+            event="finish",
+            pid=pid,
+            room=room,
+            rid="request-a",
+            forward=10.0,
+            prefill=10.70,
+            transfer=10.72,
+            poll=11.70,
+            done=11.71,
+            chunked=False,
+            chunks=1,
+        )
         return worker, finish
 
     def parse(self, events, exclude=(), metric_only=False):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "p.log"
-            path.write_text("".join("[TP rank] KV_TIMING " + json.dumps(event) + "\n"
-                                    for event in events))
+            path.write_text(
+                "".join(
+                    "[TP rank] KV_TIMING " + json.dumps(event) + "\n"
+                    for event in events
+                )
+            )
             with contextlib.redirect_stderr(io.StringIO()):
                 return read_rows([path], set(exclude), metric_only=metric_only)
 
     def test_split_and_existing_metric_reconcile(self):
         row = make_row(*self.events())
-        for key, expected in dict(prefill_ms=700, submit_ms=10, queue_ms=20,
-                                  send_ms=180, post_send_ms=800, detect_ms=790,
-                                  cleanup_ms=10, metric_ms=990).items():
+        for key, expected in dict(
+            prefill_ms=700,
+            submit_ms=10,
+            queue_ms=20,
+            send_ms=180,
+            post_send_ms=800,
+            detect_ms=790,
+            cleanup_ms=10,
+            metric_ms=990,
+        ).items():
             self.assertAlmostEqual(row[key], expected)
-        self.assertAlmostEqual(row["queue_ms"] + row["send_ms"] + row["post_send_ms"]
-                               - row["metric_start_after_enqueue_ms"], row["metric_ms"])
+        self.assertAlmostEqual(
+            row["queue_ms"]
+            + row["send_ms"]
+            + row["post_send_ms"]
+            - row["metric_start_after_enqueue_ms"],
+            row["metric_ms"],
+        )
 
     def test_interleaved_ranks_do_not_mix(self):
         a, b = self.events(pid=10), self.events(pid=11)
@@ -66,8 +99,11 @@ class TimingSummaryTests(unittest.TestCase):
         row = make_row(worker, finish)
         self.assertLess(row["metric_start_after_enqueue_ms"], 0)
         self.assertAlmostEqual(
-            row["queue_ms"] + row["send_ms"] + row["post_send_ms"]
-            - row["metric_start_after_enqueue_ms"], row["metric_ms"]
+            row["queue_ms"]
+            + row["send_ms"]
+            + row["post_send_ms"]
+            - row["metric_start_after_enqueue_ms"],
+            row["metric_ms"],
         )
 
     def test_invalid_log_lines_do_not_discard_valid_samples(self):
@@ -100,7 +136,9 @@ class TimingSummaryTests(unittest.TestCase):
 
     def test_metric_only_needs_no_worker_or_prefill_timestamps(self):
         _, finish = self.events()
-        finish = {k: finish[k] for k in ("event", "pid", "room", "rid", "done", "transfer")}
+        finish = {
+            k: finish[k] for k in ("event", "pid", "room", "rid", "done", "transfer")
+        }
         rows = self.parse([finish], metric_only=True)
         self.assertEqual(len(rows), 1)
         self.assertAlmostEqual(rows[0]["metric_ms"], 990)

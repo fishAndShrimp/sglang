@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
-import json
 import logging
 import os
 import struct
@@ -63,6 +62,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
+from sglang.srt.observability import kv_transfer_timing as kv_timing
 from sglang.srt.observability.mooncake_trace import (
     MooncakeRequestStage,
     mooncake_trace_func,
@@ -85,7 +85,7 @@ from sglang.srt.utils.network import NetworkAddress
 logger = logging.getLogger(__name__)
 
 # Diagnostic timestamps use the P process clock only; enable before server startup.
-_KV_TIMING = os.environ.get("SGLANG_KV_TIMING", "0") == "1"
+_KV_TIMING = kv_timing.ENABLED
 
 FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
@@ -646,6 +646,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # block other rooms on this single worker thread.
             with self._staging_ctx.watermark_cv:
                 self._staging_ctx.watermark_cv.wait(STAGING_WATERMARK_WAIT_S)
+            if _KV_TIMING:
+                kv_chunk._kv_timing_enqueued = time.perf_counter()
             queue.put(kv_chunk)
             return (-1, True)
 
@@ -832,8 +834,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             return 0
 
         src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
-        return self.engine.batch_transfer_sync(
-            mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
+        return kv_timing.batch_transfer_sync(
+            self.engine,
+            mooncake_session_id,
+            list(src_addrs),
+            list(dst_addrs),
+            list(lengths),
         )
 
     def _state_stride_mismatch(
@@ -1204,7 +1210,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             and self.custom_mem_pool_type != "INTRA_NODE_NVLINK"
         ):
             futures = [
-                executor.submit(
+                kv_timing.submit(
+                    executor,
                     process_layer,
                     src_ptr,
                     dst_ptr,
@@ -1619,11 +1626,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         if self.enable_custom_mem_pool:
             futures = [
-                executor.submit(process_layer, *layer_params)
+                kv_timing.submit(executor, process_layer, *layer_params)
                 for layer_params in layers_params
             ]
             futures.extend(
-                executor.submit(process_sliced_draft, [params])
+                kv_timing.submit(executor, process_sliced_draft, [params])
                 for params in sliced_draft_params
             )
             try:
@@ -1762,12 +1769,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_addr_list = dst_slice_addrs.reshape(-1).tolist()
             total_slices = len(src_addr_list)
             length_list = [heads_bytes_per_token_to_send] * total_slices
-            return self.engine.batch_transfer_sync(
-                mooncake_session_id, src_addr_list, dst_addr_list, length_list
+            return kv_timing.batch_transfer_sync(
+                self.engine,
+                mooncake_session_id,
+                src_addr_list,
+                dst_addr_list,
+                length_list,
             )
 
         futures = [
-            executor.submit(process_layer_tp_aware, src_layer_ptr, dst_layer_ptr)
+            kv_timing.submit(
+                executor, process_layer_tp_aware, src_layer_ptr, dst_layer_ptr
+            )
             for src_layer_ptr, dst_layer_ptr in layer_ptr_pairs
         ]
 
@@ -2434,7 +2447,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             f"prefill={self.attn_tp_size}, decode={dst_attn_tp_size}."
         )
         futures = [
-            executor.submit(
+            kv_timing.submit(
+                executor,
                 self._transfer_data,
                 req.mooncake_session_id,
                 list(
@@ -2467,6 +2481,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         worker_index=0,
     ):
         staging_strategy = None
+        if _KV_TIMING:
+            logger.info("KV_TIMING_ENABLED version=2 worker=%s", worker_index)
         if self.enable_trace:
             trace_set_thread_info(
                 f"mooncake transfer worker {worker_index}",
@@ -2476,7 +2492,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         while True:
             kv_chunk: Optional[TransferKVChunk] = None
-            timing_event = None
+            timing = None
+            timing_token = None
             try:
                 kv_chunk = queue.get()
                 # teardown() pushes a None sentinel to unblock get() and stop
@@ -2485,10 +2502,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if kv_chunk is None:
                     break
                 if _KV_TIMING:
-                    kv_chunk._kv_timing_dequeued = time.perf_counter()
+                    dequeued = time.perf_counter()
                     kv_chunk._kv_timing_attempts = (
                         getattr(kv_chunk, "_kv_timing_attempts", 0) + 1
                     )
+                    timing = kv_timing.ChunkTiming(kv_chunk, dequeued)
+                    timing_token = timing.activate()
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -2509,18 +2528,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # the worker, not the scheduler, before reading source KV.
                 # A room that already failed skips the wait; the status check
                 # below then drops the chunk, including on an abort during it.
-                if kv_chunk.wait_event is not None:
-                    if (
-                        kv_chunk.room in self.request_status
-                        and self.check_status(kv_chunk.room) != KVPoll.Failed
-                    ):
-                        kv_chunk.wait_event.synchronize()
-                    kv_chunk.wait_event = None
-                if kv_chunk.indices_event is not None:
-                    kv_chunk.indices_event.synchronize()
-                    kv_chunk.indices_event = None
-                if isinstance(kv_chunk.prefill_kv_indices, torch.Tensor):
-                    kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices.numpy()
+                with kv_timing.phase("wait"):
+                    if kv_chunk.wait_event is not None:
+                        if (
+                            kv_chunk.room in self.request_status
+                            and self.check_status(kv_chunk.room) != KVPoll.Failed
+                        ):
+                            kv_chunk.wait_event.synchronize()
+                        kv_chunk.wait_event = None
+                    if kv_chunk.indices_event is not None:
+                        kv_chunk.indices_event.synchronize()
+                        kv_chunk.indices_event = None
+                    if isinstance(kv_chunk.prefill_kv_indices, torch.Tensor):
+                        kv_chunk.prefill_kv_indices = (
+                            kv_chunk.prefill_kv_indices.numpy()
+                        )
 
                 if (
                     kv_chunk.room not in self.request_status
@@ -2633,93 +2655,95 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
                         )
-                        if (
-                            len(kv_chunk.prefill_kv_indices) == 0
-                            or not self.kv_args.kv_data_ptrs
-                            or skip_kv
-                        ):
-                            ret = 0
-                        elif is_dcp_transfer:
-                            dcp_token_item_lens = (
-                                target_rank_registration_info.dcp_token_item_lens
-                            )
-                            assert dcp_token_item_lens is not None
-                            pack_buffer = (
-                                self._dcp_pack_buffers[worker_index]
-                                if self._dcp_pack_buffers
-                                else None
-                            )
-                            ret = self.send_kvcache_dcp(
-                                req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
-                                target_rank_registration_info.dst_kv_ptrs,
-                                chunked_dst_kv_indice,
-                                dcp_token_item_lens=dcp_token_item_lens,
-                                dst_dcp_size=target_rank_registration_info.dst_dcp_size,
-                                dst_dcp_rank=target_rank_registration_info.dst_dcp_rank,
-                                src_page_offset=kv_chunk.index_slice.start or 0,
-                                decode_prefix_len=req.decode_prefix_len or 0,
-                                num_kv_tokens=kv_chunk.num_kv_tokens,
-                                executor=executor,
-                                dst_layer_ids=(
-                                    target_rank_registration_info.dst_kv_layer_ids
-                                ),
-                                pack_buffer=pack_buffer,
-                                dst_kv_item_lens=target_rank_registration_info.dst_kv_item_lens,
-                                dst_tp_rank=target_rank_registration_info.dst_tp_rank,
-                                dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
-                            )
-                        elif (
-                            self.is_mla_backend
-                            or self.is_hybrid_mla_backend
-                            or self.attn_tp_size
-                            == target_rank_registration_info.dst_attn_tp_size
-                        ):
-                            ret = self.send_kvcache(
-                                req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
-                                target_rank_registration_info.dst_kv_ptrs,
-                                chunked_dst_kv_indice,
-                                executor,
-                                dst_layer_ids=target_rank_registration_info.dst_kv_layer_ids,
-                                dst_device_kv_indices=chunked_dst_device_kv_indice,
-                                dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
-                                dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
-                            )
-                        elif (
-                            self.enable_staging
-                            and staging_strategy is not None
-                            and (
-                                target_rank_registration_info.staging_base_ptr != 0
-                                or target_rank_registration_info.staging_total_size != 0
-                            )
-                        ):
-                            ret, deferred = self._do_staging_transfer(
-                                staging_strategy,
-                                kv_chunk,
-                                req,
-                                target_rank_registration_info,
-                                chunked_dst_kv_indice,
-                                executor,
-                                queue,
-                                prefill_unique_rank,
-                            )
-                            if deferred:
-                                staging_deferred = True
-                                # Chunk re-enqueued; stop processing remaining reqs for this chunk
-                                break
-                        else:
-                            ret = self.send_kvcache_slice(
-                                req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
-                                target_rank_registration_info.dst_kv_ptrs,
-                                chunked_dst_kv_indice,
-                                target_rank_registration_info.dst_tp_rank,
-                                target_rank_registration_info.dst_attn_tp_size,
-                                target_rank_registration_info.dst_kv_item_len,
-                                executor,
-                                target_rank_registration_info.dst_kv_layer_ids,
-                            )
+                        with kv_timing.phase("kv"):
+                            if (
+                                len(kv_chunk.prefill_kv_indices) == 0
+                                or not self.kv_args.kv_data_ptrs
+                                or skip_kv
+                            ):
+                                ret = 0
+                            elif is_dcp_transfer:
+                                dcp_token_item_lens = (
+                                    target_rank_registration_info.dcp_token_item_lens
+                                )
+                                assert dcp_token_item_lens is not None
+                                pack_buffer = (
+                                    self._dcp_pack_buffers[worker_index]
+                                    if self._dcp_pack_buffers
+                                    else None
+                                )
+                                ret = self.send_kvcache_dcp(
+                                    req.mooncake_session_id,
+                                    kv_chunk.prefill_kv_indices,
+                                    target_rank_registration_info.dst_kv_ptrs,
+                                    chunked_dst_kv_indice,
+                                    dcp_token_item_lens=dcp_token_item_lens,
+                                    dst_dcp_size=target_rank_registration_info.dst_dcp_size,
+                                    dst_dcp_rank=target_rank_registration_info.dst_dcp_rank,
+                                    src_page_offset=kv_chunk.index_slice.start or 0,
+                                    decode_prefix_len=req.decode_prefix_len or 0,
+                                    num_kv_tokens=kv_chunk.num_kv_tokens,
+                                    executor=executor,
+                                    dst_layer_ids=(
+                                        target_rank_registration_info.dst_kv_layer_ids
+                                    ),
+                                    pack_buffer=pack_buffer,
+                                    dst_kv_item_lens=target_rank_registration_info.dst_kv_item_lens,
+                                    dst_tp_rank=target_rank_registration_info.dst_tp_rank,
+                                    dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                                )
+                            elif (
+                                self.is_mla_backend
+                                or self.is_hybrid_mla_backend
+                                or self.attn_tp_size
+                                == target_rank_registration_info.dst_attn_tp_size
+                            ):
+                                ret = self.send_kvcache(
+                                    req.mooncake_session_id,
+                                    kv_chunk.prefill_kv_indices,
+                                    target_rank_registration_info.dst_kv_ptrs,
+                                    chunked_dst_kv_indice,
+                                    executor,
+                                    dst_layer_ids=target_rank_registration_info.dst_kv_layer_ids,
+                                    dst_device_kv_indices=chunked_dst_device_kv_indice,
+                                    dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
+                                    dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                                )
+                            elif (
+                                self.enable_staging
+                                and staging_strategy is not None
+                                and (
+                                    target_rank_registration_info.staging_base_ptr != 0
+                                    or target_rank_registration_info.staging_total_size
+                                    != 0
+                                )
+                            ):
+                                ret, deferred = self._do_staging_transfer(
+                                    staging_strategy,
+                                    kv_chunk,
+                                    req,
+                                    target_rank_registration_info,
+                                    chunked_dst_kv_indice,
+                                    executor,
+                                    queue,
+                                    prefill_unique_rank,
+                                )
+                                if deferred:
+                                    staging_deferred = True
+                                    # Chunk re-enqueued; stop processing remaining reqs for this chunk
+                                    break
+                            else:
+                                ret = self.send_kvcache_slice(
+                                    req.mooncake_session_id,
+                                    kv_chunk.prefill_kv_indices,
+                                    target_rank_registration_info.dst_kv_ptrs,
+                                    chunked_dst_kv_indice,
+                                    target_rank_registration_info.dst_tp_rank,
+                                    target_rank_registration_info.dst_attn_tp_size,
+                                    target_rank_registration_info.dst_kv_item_len,
+                                    executor,
+                                    target_rank_registration_info.dst_kv_layer_ids,
+                                )
                         if ret != 0:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
@@ -2741,12 +2765,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
                         if kv_chunk.is_last_chunk:
                             if kv_chunk.state_indices and not skip_state:
-                                state_rc = self.maybe_send_extra(
-                                    req,
-                                    kv_chunk.state_indices,
-                                    executor,
-                                    target_rank_registration_info,
-                                )
+                                with kv_timing.phase("state"):
+                                    state_rc = self.maybe_send_extra(
+                                        req,
+                                        kv_chunk.state_indices,
+                                        executor,
+                                        target_rank_registration_info,
+                                    )
                                 # Before the Failed check: an ABORT during the
                                 # send also marks the room Failed.
                                 if state_rc != 0:
@@ -2777,11 +2802,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     break
 
                             # Only the last chunk we need to send the aux data
-                            ret = self.send_aux(
-                                req,
-                                kv_chunk.prefill_aux_index,
-                                target_rank_registration_info.dst_aux_ptrs,
-                            )
+                            with kv_timing.phase("aux"):
+                                ret = self.send_aux(
+                                    req,
+                                    kv_chunk.prefill_aux_index,
+                                    target_rank_registration_info.dst_aux_ptrs,
+                                )
                             if ret != 0:
                                 # The aux write targets decode's metadata
                                 # slot, which the deferred release also frees.
@@ -2792,29 +2818,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             # Only sync status when all the dst ranks have received the kvcache
                             if len(polls) == req.required_dst_info_num:
                                 status = KVPoll.Success if all(polls) else KVPoll.Failed
-                                if _KV_TIMING and status == KVPoll.Success:
-                                    # Capture before publishing Success; emit after
-                                    # worker cleanup so logging does not hold it up.
-                                    send_ready = time.perf_counter()
-                                    timing_event = {
-                                        "event": "worker",
-                                        "pid": os.getpid(),
-                                        "room": kv_chunk.room,
-                                        "enqueue": kv_chunk._kv_timing_enqueued,
-                                        "dequeue": kv_chunk._kv_timing_dequeued,
-                                        "ready": send_ready,
-                                        "attempts": kv_chunk._kv_timing_attempts,
-                                    }
-                                self.conclude_transfer(
-                                    bootstrap_room=req.room,
-                                    status=status,
-                                    targets=dst_ranks_infos,
-                                    failure_reason=(
-                                        None
-                                        if status == KVPoll.Success
-                                        else f"Failed to send aux data of {req.room}"
-                                    ),
-                                )
+                                with kv_timing.phase("notify"):
+                                    self.conclude_transfer(
+                                        bootstrap_room=req.room,
+                                        status=status,
+                                        targets=dst_ranks_infos,
+                                        failure_reason=(
+                                            None
+                                            if status == KVPoll.Success
+                                            else f"Failed to send aux data of {req.room}"
+                                        ),
+                                    )
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
                         # Dummy request does not need to sync status to decode endpoint
@@ -2828,6 +2842,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             start_ts,
                         )
 
+                else:
+                    if timing is not None:
+                        timing.event["outcome"] = "complete" if all(polls) else "failed"
+
+                if timing is not None:
+                    timing.event["work_end"] = time.perf_counter()
+
                 if self.enable_trace:
                     kv_chunk.trace_ctx.trace_slice_end(
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
@@ -2836,6 +2857,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
 
                 if staging_deferred:
+                    if timing is not None:
+                        timing.event["outcome"] = "deferred"
                     continue
 
                 self._staging_outstanding[kv_chunk.room] -= 1
@@ -2871,12 +2894,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     # bookkeeping for a subsequent transfer using the same room.
                     self._staging_outstanding.pop(kv_chunk.room, None)
 
-                if timing_event is not None:
-                    logger.info(
-                        "KV_TIMING %s",
-                        json.dumps(timing_event, separators=(",", ":")),
-                    )
-
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                 if kv_chunk is not None:
@@ -2884,6 +2901,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
+            finally:
+                if timing is not None:
+                    timing.finish(timing_token, logger)
 
     def _handle_abort_notification(self, msg: List[bytes]) -> bool:
         if not msg or msg[0] != ABORT_TAG:
@@ -3108,6 +3128,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
         wait_event: Optional[object] = None,
         indices_event: Optional[object] = None,
+        timing_chunk_id: Optional[int] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -3150,6 +3171,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             indices_event=indices_event,
         )
         if _KV_TIMING:
+            transfer_chunk._kv_timing_id = timing_chunk_id
             transfer_chunk._kv_timing_enqueued = time.perf_counter()
         self.transfer_queues[shard_idx].put(transfer_chunk)
 
@@ -3305,6 +3327,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 trace_ctx=self.trace_ctx.copy_for_thread(),
                 wait_event=wait_event,
                 indices_event=indices_event,
+                timing_chunk_id=self._kv_timing_chunks if _KV_TIMING else None,
             )
         else:
             self.kv_mgr.add_transfer_request(
@@ -3318,6 +3341,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 trace_ctx=self.trace_ctx.copy_for_thread(),
                 wait_event=wait_event,
                 indices_event=indices_event,
+                timing_chunk_id=self._kv_timing_chunks if _KV_TIMING else None,
             )
         self._record_transfer_indices(kv_indices, state_indices)
 

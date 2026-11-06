@@ -1240,6 +1240,11 @@ class SchedulerDisaggregationPrefillMixin:
                     json.dumps(
                         {
                             "event": "finish",
+                            "version": 2,
+                            "tp_rank": get_parallel().tp_rank,
+                            "dp_rank": get_parallel().dp_rank,
+                            "cp_rank": get_parallel().attn_cp_rank,
+                            "pp_rank": get_parallel().pp_rank,
                             "pid": os.getpid(),
                             "room": req.disagg_kv_sender.bootstrap_room,
                             "rid": req.rid,

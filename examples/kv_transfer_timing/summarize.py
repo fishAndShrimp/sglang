@@ -9,6 +9,8 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+from chunk_summary import DETAIL_FIELDS, MAIN_FIELDS, make_chunk_row
+
 DURATIONS = (
     "prefill_ms",
     "submit_ms",
@@ -75,9 +77,7 @@ def make_metric_row(finish):
     """Reproduce Mooncake's metric without requiring serial transfer stages."""
     transfer, done = finish.get("transfer"), finish.get("done")
     if any(
-        not isinstance(value, (int, float))
-        or not math.isfinite(value)
-        or value <= 0
+        not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0
         for value in (transfer, done)
     ):
         raise ValueError("missing or invalid metric timestamps")
@@ -103,7 +103,7 @@ def read_rows(paths, exclude_rids, metric_only=False):
                 try:
                     event, _ = json.JSONDecoder().raw_decode(payload)
                     kind = event["event"]
-                    if kind not in ("worker", "finish"):
+                    if kind not in ("worker", "finish", "chunk"):
                         raise ValueError("unknown event")
                     records[(event["pid"], event["room"])][kind].append(event)
                 except (ValueError, KeyError, TypeError):
@@ -113,7 +113,8 @@ def read_rows(paths, exclude_rids, metric_only=False):
     rows = []
     for key, group in records.items():
         workers, finishes = group["worker"], group["finish"]
-        if len(finishes) != 1 or (not metric_only and len(workers) != 1):
+        is_v2 = len(finishes) == 1 and finishes[0].get("version") == 2
+        if len(finishes) != 1 or (not metric_only and not is_v2 and len(workers) != 1):
             print(
                 f"Skipped pid/room={key}: missing or repeated events "
                 f"(worker={len(workers)}, finish={len(finishes)})",
@@ -123,6 +124,34 @@ def read_rows(paths, exclude_rids, metric_only=False):
         if finishes[0].get("rid") in exclude_rids:
             continue
         try:
+            if is_v2 and not metric_only:
+                finish = finishes[0]
+                row = make_metric_row(finish)
+                row.update(
+                    {
+                        key: finish.get(key)
+                        for key in (
+                            "tp_rank",
+                            "dp_rank",
+                            "cp_rank",
+                            "pp_rank",
+                            "chunks",
+                        )
+                    }
+                )
+                row["detail_status"] = "complete"
+                try:
+                    row.update(make_chunk_row(group["chunk"], finish))
+                except (ValueError, KeyError, TypeError) as error:
+                    # Keep the metric sample even when per-chunk logs are
+                    # incomplete. Do not silently change its population again.
+                    row["detail_status"] = str(error)
+                    print(
+                        f"Partial pid/room={key}: {error}; metric retained",
+                        file=sys.stderr,
+                    )
+                rows.append(row)
+                continue
             rows.append(
                 make_metric_row(finishes[0])
                 if metric_only
@@ -136,6 +165,11 @@ def read_rows(paths, exclude_rids, metric_only=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("logs", type=Path, nargs="+")
+    parser.add_argument(
+        "--details",
+        action="store_true",
+        help="Also show per-phase API timings and the disjoint metric-window breakdown",
+    )
     parser.add_argument(
         "--metric-only",
         action="store_true",
@@ -153,19 +187,47 @@ def main():
     rows = read_rows(args.logs, set(args.exclude_rid), metric_only=args.metric_only)
     if not rows:
         raise SystemExit("No valid samples found for the selected mode")
-    durations = ("metric_ms",) if args.metric_only else DURATIONS
+    is_v2 = any("detail_status" in row for row in rows)
+    if is_v2 and any("detail_status" not in row for row in rows):
+        raise SystemExit(
+            "Do not mix version 1 and version 2 logs in a detailed summary"
+        )
+    durations = (
+        ("metric_ms",)
+        if args.metric_only
+        else MAIN_FIELDS + (DETAIL_FIELDS if args.details else ())
+        if is_v2
+        else DURATIONS
+    )
+    csv_durations = MAIN_FIELDS + DETAIL_FIELDS if is_v2 else durations
+    metadata = ("pid", "room", "rid") + (
+        (
+            "tp_rank",
+            "dp_rank",
+            "cp_rank",
+            "pp_rank",
+            "chunks",
+            "attempts",
+            "mooncake_calls",
+            "detail_status",
+        )
+        if is_v2
+        else ()
+    )
     print(
         "mode=metric-only (valid finish events; includes multi-chunk requests)"
         if args.metric_only
-        else "mode=five-stage (single-chunk subset; use --metric-only to reconcile /metrics)",
+        else "mode=per-chunk-v2 (unions of intervals; see n for each field)"
+        if is_v2
+        else "mode=five-stage-v1 (single-chunk subset; use --metric-only to reconcile /metrics)",
         file=sys.stderr,
     )
-    writer = csv.DictWriter(sys.stdout, fieldnames=("pid", "room", "rid") + durations)
+    writer = csv.DictWriter(sys.stdout, fieldnames=metadata + csv_durations)
     writer.writeheader()
     for row in rows:
         writer.writerow(
             {
-                key: round(value, 6) if key in durations else value
+                key: round(value, 6) if key in csv_durations else value
                 for key, value in row.items()
             }
         )
@@ -175,16 +237,32 @@ def main():
         by_pid[row["pid"]].append(row)
     for pid, samples in sorted(by_pid.items()):
         print(
-            f"pid={pid} samples={len(samples)} (rank-local observations)",
+            f"pid={pid} samples={len(samples)} (rank-local observations)"
+            + (
+                f" detailed={sum(s.get('detail_status') == 'complete' for s in samples)}"
+                f" tp_rank={samples[0].get('tp_rank')}"
+                if is_v2
+                else ""
+            ),
             file=sys.stderr,
         )
+        if is_v2:
+            print(
+                f"  chunks={sum(s.get('chunks') or 0 for s in samples)} "
+                f"attempts={sum(s.get('attempts', 0) for s in samples)} "
+                f"mooncake_calls={sum(s.get('mooncake_calls', 0) for s in samples)}",
+                file=sys.stderr,
+            )
         for field in durations:
-            values = sorted(sample[field] for sample in samples)
+            values = sorted(sample[field] for sample in samples if field in sample)
+            if not values:
+                print(f"  {field}: n=0 (details unavailable)", file=sys.stderr)
+                continue
             p95 = values[math.ceil(0.95 * len(values)) - 1]
             print(
                 f"  {field}: mean={statistics.mean(values):.3f} "
                 f"p50={statistics.median(values):.3f} p95={p95:.3f} "
-                f"max={values[-1]:.3f} sum={math.fsum(values):.3f}",
+                f"max={values[-1]:.3f} sum={math.fsum(values):.3f} n={len(values)}",
                 file=sys.stderr,
             )
 

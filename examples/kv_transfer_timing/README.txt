@@ -1,144 +1,161 @@
-P 端 Mooncake PD 分段计时
-========================
+P 端 Mooncake PD 分块与接口计时（version 2）
+========================================
 
 基线：83c31fde31c1be37cd7cba60f26ec4f60c14f9af
 分支：perf/kv-transfer-timing
 
-用途：把请求的 P 端过程拆成五段，定位双机 kv_transfer_latency_ms
-约 1 秒主要花在后台排队、发送流程，还是调度器确认完成上。
-只改 Python，不需要重新编译 Mooncake 或 MemFabric。
-原有 /metrics 的计算方式不变；新增数据在 P 日志里，不新增 Prometheus 指标。
+这版记录每个发送块的每次出队，并直接测量 engine.batch_transfer_sync()。
+支持多块 prefill、前缀提前发送、staging 延迟重排队和线程池并行调用。
+它不再要求整个请求能拆成五个互不重叠的串行阶段。
+原有 /metrics 的计算和传输策略不变；新增结果通过 P 日志离线汇总。
+只改 Python，不需要编译 Mooncake 或 MemFabric，也不需要修改 D。
 
-1. 启动
--------
-
-先把这个分支放到 P 机器。进入你原来的 deploy 目录，然后：
-
-    source envs/before_serve.env
-    export SGLANG_SOURCE=/你的实际路径/sglang
-    export SGLANG_KV_TIMING=1
-    bash 1p.sh 2>&1 | tee /tmp/p_kv_timing.log
-
-SGLANG_SOURCE 必须指向包含本次修改的仓库根目录。先 source，再设置路径，
-以免 before_serve.env 覆盖路径。1p.sh 应通过该变量设置 Python 搜索路径；
-可以检查它的 PYTHONPATH 设置，并在同样的环境中核实：
-
-    PYTHONPATH="$SGLANG_SOURCE/python${PYTHONPATH:+:$PYTHONPATH}" \
-        python3 -c 'import sglang; print(sglang.__file__)'
-
-开关在进程启动时读取，所以需要重启 P。D 按原来的方式启动，
-不需要打开计时开关。保持 P、D 的基础版本与其他配置一致。
-关闭 L3 的纯 PD 测试不需要 Mooncake Store master。
-
-首次对比建议沿用之前跑通的配置：关闭 L3、关闭 overlap、关闭 chunked prefill，
-关闭 radix cache。对应已有参数为：
-    --disable-overlap-schedule --chunked-prefill-size -1 --disable-radix-cache
-不要重复添加已有参数。单机和双机应保持模型、输入长度、TP、并发、传输协议一致。
-
-等待 P、D 就绪后，发送原来的测试请求或 benchmark。P 日志中搜索 KV_TIMING。
-普通成功请求每个实际发送的 P 进程输出两条 JSON 记录，顺序可以交错。
-等请求结束、两条记录都写入日志后，再汇总。每次启动使用新的日志文件，
-不要把不同机器或不同启动轮次的 P 日志拼在一起。
-
-2. 汇总
--------
-
-在包含本次修改的 SGLang 仓库根目录运行：
-
-    python3 examples/kv_transfer_timing/summarize.py /tmp/p_kv_timing.log \
-        > /tmp/p_kv_timing.csv
-
-终端显示每个 P 进程的样本数、平均值、p50、p95、最大值，单位都是毫秒。
-CSV 保留每条样本的 pid、room、rid 和分段耗时，便于看慢请求。
-汇总脚本只用 Python 标准库，也可以复制脚本和日志到另一台机器分析。
-
-五段的含义：
-
-    prefill_ms    开始调度执行 prefill -> 调度器处理到 prefill 完成。
-    submit_ms     prefill 完成 -> 构造发送任务并准备放入后台队列。
-    queue_ms      准备入队 -> 后台线程从队列取到任务。
-    send_ms       后台取到任务 -> KV、额外状态及 aux 的发送流程返回成功，
-                  即将调用 conclude_transfer 发布成功状态。
-    post_send_ms  上述成功点 -> P 调度器确认完成并记录 completion_time。
-
-第五段再拆成：
-    detect_ms     发送流程成功 -> 调度器处理到该请求的 Success 分支。
-    cleanup_ms    进入 Success 分支 -> completion_time。
-
-重点看 queue_ms、send_ms、detect_ms 哪个接近那 1 秒。
-send_ms 包括已有设备事件等待、索引/地址处理、后端调用、多个目标及附加数据，
-不是纯网络线上搬运时间。detect_ms 包括状态发布、后台清理、调度器轮询间隔、
-TP/CP 状态一致性等待，以及处理同一轮其他请求的时间。
-prefill_ms 是 CPU 观察到的阶段耗时，不是用设备事件测出的纯算子时间。
-completion_time 与原指标终点一致，不涵盖后面的所有输出和资源释放工作。
-这套计时没有新增设备同步，也没有调整调度、传输或轮询行为。
-
-3. 与原指标对齐
----------------
-
-重要：默认五段汇总只统计可以串行拆分的子集。若出现大量 Skipped，
-不要把这个子集的 metric_ms 平均值与整轮 /metrics 增量平均值相比。
-使用下面的模式可以仅凭现有 finish 记录对账，不要求单块发送或 worker 记录，
-也不需要重启 P 或重跑 benchmark：
-
-    python3 examples/kv_transfer_timing/summarize.py /你的日志路径/p.log \
-        --metric-only > /dev/null 2> /你的结果目录/metric_summary.txt
-
-这里仅输出 metric_ms 的统计，包括 samples、sum、mean、p50、p95 和 max。
-每个 pid 的 samples、sum、mean 分别与相同范围的 /metrics 的
-count 增量、sum 增量和 sum/count 对账。多块发送不会因此被排除，
-但重复 finish、缺失或无效起止时间仍会被排除并提示。
-这不是多块传输的五段分析；它不推算缺失的各块发送时刻。
-脚本仍会读取整个输入日志，请保证其中的请求属于你要比较的那轮压测。
-
-metric_ms = (completion_time - prefill_transfer_queue_entry_time) * 1000
-它使用这个版本 Mooncake 后端原有 kv_transfer_latency_ms 的起止点。
-
-原指标通常在提交任务返回之后才开始计时，因此不能直接把后三段相加。
-CSV 的 metric_start_after_enqueue_ms 记录了这两个起点的差值：
-
-    metric_ms = queue_ms + send_ms + post_send_ms
-                - metric_start_after_enqueue_ms
-
-如果等待 bootstrap 导致延迟提交，原指标也可能先开始，差值可以是负数；
-此时 submit_ms 中也包含提交前的等待。公式仍成立。
-
-日志与 /metrics 对比时，需要选择相同进程/标签、相同请求和相同时间窗口。
-多个 TP 进程可能各记录同一请求，不能把进程样本数直接当唯一请求数。
-脚本按 pid 分别统计，不会把 TP 样本混成一个请求平均值。
-
-已知 warmup 的 rid 时可以显式排除，例如：
-    python3 examples/kv_transfer_timing/summarize.py /tmp/p_kv_timing.log \
-        --exclude-rid warmup-request-id > /tmp/p_kv_timing.csv
-
-不指定则包括 warmup；不会自动猜测哪条是 warmup。
-
-4. 范围与限制
--------------
-
-默认五段串行拆分用于一个请求只有一个发送 chunk、后台只出队一次的成功请求。
-分块 prefill、前缀提前发送、多次发送、staging 重排队、失败、缺失/重复日志
-以及时间边界重叠的样本会被跳过并说明原因，避免给出错误的串行耗时。
-原始日志仍保留，便于后续单独分析这些路径。dummy rank 不一定有发送样本。
-
-所有时刻来自同一个 P 进程的 perf_counter，不需要两机校时。
-它不测 D 端收到数据后到开始 decode 的时间。
-打点和日志仍有少量开销；后台日志在清理完成后写入，但可能影响下一个任务，
-所以可再关闭开关跑一轮比较总吞吐和现有指标。
-
-关闭：unset SGLANG_KV_TIMING，然后重启 P。
-
-5. 本地检查与推送
+1. 更新后重新采集
 -----------------
+
+version 1 只记录最后一块，旧日志无法还原中间块或 API 的时间。
+要得到本版完整细分，需要更新 P 的仓库并重启 P，再跑一轮压测。
+D 继续使用原来跑通的版本即可。关闭 L3 的纯 PD 不需要 Store master。
+
+如果 P、D 共用环境文件，就只在 1p.sh 中修改：所有 source 之后、启动 Python
+之前设置下面变量，并确保后续代码没有用旧路径覆盖它们。
+
+    export SGLANG_SOURCE=/你的实际路径/sglang-kv-timing
+    export SGLANG_KV_TIMING=1
+    export PYTHONPATH="$SGLANG_SOURCE/python${PYTHONPATH:+:$PYTHONPATH}"
+
+启动并将新一轮日志写到盘上（换成实际路径）：
+
+    bash 1p.sh 2>&1 | tee /你的共享盘/p_v2_round1.log
+
+启动时会出现：
+    KV_TIMING_ENABLED version=2 worker=...
+
+随后每块每次尝试一条 event=chunk 日志，每个成功请求一条 event=finish 日志。
+日志带 version=2；finish 还带 tp_rank/dp_rank/cp_rank/pp_rank。
+完成请求时日志顺序可能交错，脚本按 pid、room、chunk、attempt 匹配。
+日志只记录标识、时间、字节数、返回码，不记录内存地址或输入内容。
+
+先用少量请求确认 samples 和 detailed 一致，再跑正常的 100 条压测。
+单机/双机对比保持模型、输入长度、并发、TP、缓存和传输协议一致。
+不需要为了让脚本接受样本而关闭 chunked prefill 或改动原来的调度配置。
+
+2. 只保存汇总结果
+-----------------
+
+在新仓库根目录运行，不加 --metric-only：
+
+    python3 examples/kv_transfer_timing/summarize.py \
+      /你的共享盘/p_v2_round1.log \
+      > /dev/null 2> /你的共享盘/round1_summary.txt
+
+    cat /你的共享盘/round1_summary.txt
+
+需要更细的调用分类和原指标窗口拆分时加 --details：
+
+    python3 examples/kv_transfer_timing/summarize.py \
+      /你的共享盘/p_v2_round1.log --details \
+      > /dev/null 2> /你的共享盘/round1_details.txt
+
+stdout 是逐请求 CSV，stderr 是统计文本和异常说明。
+需要保留 CSV 时把 /dev/null 改成结果 CSV 路径。
+脚本依赖同目录的 chunk_summary.py，只用 Python 标准库。
+
+每个进程的头部类似：
+    pid=7355 samples=101 (rank-local observations) detailed=101 tp_rank=0
+
+samples：可还原原指标的完成请求数。
+detailed：有完整分块记录、能计算详细耗时的请求数。
+每个字段另有 n=，明确该字段使用了多少条样本。缺块时保留 metric_ms，
+不会再为了细分而把它从整轮平均值中删除；缺失的细分显示 n=0 或较小的 n。
+只有 detailed=samples 且各字段 n 相同时，才是在同一批请求上比较各阶段。
+所有耗时单位都是毫秒。统计包括 mean、p50、p95、max、sum 和 n。
+
+3. 默认显示的字段
+-----------------
+
+prefill_ms       第一次 forward 开始到最后 prefill 完成，CPU 观察的整段时间。
+queue_ms         该请求所有块、所有重排队尝试的队列等待区间并集。
+wait_ms          既有设备事件/索引准备等待范围；没有新增设备同步。
+send_ms          所有块的 KV、附加状态、aux 发送调用范围并集。
+mooncake_ms      直接包住 batch_transfer_sync() 的时间区间并集。
+send_other_ms    send_ms 中没有被 Mooncake 接口调用覆盖的时间，例如地址准备、
+                 等待线程池、staging 就绪等待、TCP aux 等，不等于纯 CPU 计算。
+worker_other_ms  后台处理区间中，未被 wait/send/notify 范围覆盖的部分。
+notify_ms        conclude_transfer() 发布/通知发送结果的范围。
+detect_ms        所有块的最后一个 send 范围结束，到调度器进入 Success 分支。
+                 包含后台收尾、调度器轮询及 TP/CP 等待；notify 是它的部分范围。
+cleanup_ms       调度器进入 Success 分支到 completion_time。
+metric_ms        原 kv_transfer_latency_ms 的起止点，还原原指标用于对账。
+
+重点：mooncake_ms 才是本次新增的直接接口计时，仍包含 Mooncake/MemFabric
+内部的提交、排队、同步等待；它不是纯网络线上搬运时间，也没有拆开库内部。
+新版 send_ms 的定义比 version 1 更窄，wait 和 notify 已单独记录。
+如果 aux 走 TCP，则 aux_ms 有耗时，但 mooncake_aux_ms 和接口调用数可以为 0。
+
+4. --details 显示的字段
+-----------------------
+
+kv_ms/state_ms/aux_ms：三个发送范围分别耗时。
+mooncake_kv_ms/mooncake_state_ms/mooncake_aux_ms：相应范围中的接口调用并集。
+mooncake_call_sum_ms：每次 batch_transfer_sync 的耗时直接相加。
+                    并行调用时可能大于 mooncake_ms，不能当墙钟耗时。
+worker_ms：所有块从出队到处理结束的区间并集。
+post_send_ms：最后一个 send 范围结束到 completion_time；等于 detect+cleanup。
+last_submit_offset_ms：最后一个块首次入队相对 prefill 完成的偏移，可以为负。
+send_overlap_prefill_ms：发送范围与 prefill 范围重叠的时间。
+
+多块请求不能直接把这些字段相加：一个块在排队时，另一个块可能正在发送，
+早期发送还可能与 prefill 重叠。原 metric_ms 通常只覆盖最后提交之后的窗口。
+例如整请求 mooncake_ms 比 metric_ms 大，未必有错：部分接口调用在原指标
+开始之前就已执行。
+
+为准确对账，下面五项只计算原指标时间窗口内的区间，并依次去掉重叠：
+    metric_mooncake_ms       接口调用覆盖的时间。
+    metric_send_other_ms     发送范围里接口调用之外的时间。
+    metric_worker_other_ms   后台处理范围里上述两项之外的时间。
+    metric_queue_only_ms     有块排队、但没有本请求后台处理覆盖的时间。
+    metric_other_ms          窗口里其余时间，包括提交间隙、完成确认和收尾。
+
+这五项之和等于 metric_ms。这是时间覆盖的划分，不意味着这些阶段串行发生。
+先看这五项中哪一项大，再结合 wait_ms、notify_ms、detect_ms 等定位。
+notify_ms 与 detect_ms 存在包含关系，不能重复相加。
+
+5. 样本对齐与旧日志
+------------------
+
+脚本读取整个输入日志，不自动只选最后一轮。每轮使用独立日志/截取，
+不要混合多个 P 机器、多个启动轮次或 version 1/version 2 的详细日志。
+多个 TP 进程会记录同一请求，所以按 pid 分别统计。用 tp_rank 等标签与
+/metrics 对齐，比较同一轮、相同进程/标签的 sum、samples 和 mean。
+默认包含 warmup；已知 rid 时用 --exclude-rid 指定排除，可重复指定。
+
+--metric-only 保留，适用于旧日志的全样本指标对账，但它只输出 metric_ms。
+它不等于详细分析模式，不会生成未记录过的中间块/接口数据。
+旧日志不带 version=2 时，默认仍按旧的单块模式分析并明确标记 mode。
+
+所有时间来自同一 P 进程的 perf_counter，不需要两机校时。
+不测 D 收到数据后到开始 decode 的时间，也不对 TP 之间的等待原因做推断。
+打点、序列化和日志 I/O 有开销；并行按层调用较多时日志量会增加。
+统计开关关闭需 unset SGLANG_KV_TIMING 并重启 P。对比性能时可另跑关闭开关
+的一轮，观察诊断开销，不要把开启完整 NPU profiler 的一轮混入基线。
+
+6. 修改位置和检查
+-----------------
+
+python/sglang/srt/disaggregation/mooncake/conn.py
+    每块入队/出队、重排队、等待、KV/state/aux/notify 计时；两处接口调用
+    使用包装器，发送线程池通过上下文传播关联请求和块。
+python/sglang/srt/observability/kv_transfer_timing.py
+    记录阶段、接口调用时间/字节数/返回码，传播线程上下文并输出每块日志。
+python/sglang/srt/disaggregation/prefill.py
+    请求级边界、发送块总数、rank 和完成记录。
+examples/kv_transfer_timing/chunk_summary.py
+    验证块/尝试完整性，区间合并、原指标窗口去重拆分。
 
     python3 -m unittest discover -s examples/kv_transfer_timing -p 'test_*.py' -v
     git diff --check
 
-测试覆盖分段计算、原指标还原、TP 进程隔离、warmup 排除、无效样本拒绝，
-以及用模拟传输执行真实生产者/后台方法的开关、成功、失败路径。
-这些检查不代替 A5 双机测试。
-
-在本次独立 worktree 内，确认修改并创建提交后，可推送到自己的 fork：
-    git push -u origin perf/kv-transfer-timing
-
-origin 已指向 fishAndShrimp/sglang。不要使用 force push。
+测试覆盖真实生产者/后台方法的模拟传输、多块、调用上下文、并行去重、
+重排队计算、100 条多块请求全量统计、缺日志保留原指标以及旧格式兼容。
+没有在 A5 双机上实测，模拟检查不代替目标环境验证。
