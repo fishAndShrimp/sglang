@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
+import json
 import logging
 import os
 import struct
@@ -82,6 +83,9 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
+
+# Diagnostic timestamps use the P process clock only; enable before server startup.
+_KV_TIMING = os.environ.get("SGLANG_KV_TIMING", "0") == "1"
 
 FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
@@ -2472,6 +2476,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         while True:
             kv_chunk: Optional[TransferKVChunk] = None
+            timing_event = None
             try:
                 kv_chunk = queue.get()
                 # teardown() pushes a None sentinel to unblock get() and stop
@@ -2479,6 +2484,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # _stopped alone can never wake a parked worker during a role switch.
                 if kv_chunk is None:
                     break
+                if _KV_TIMING:
+                    kv_chunk._kv_timing_dequeued = time.perf_counter()
+                    kv_chunk._kv_timing_attempts = (
+                        getattr(kv_chunk, "_kv_timing_attempts", 0) + 1
+                    )
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -2782,6 +2792,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             # Only sync status when all the dst ranks have received the kvcache
                             if len(polls) == req.required_dst_info_num:
                                 status = KVPoll.Success if all(polls) else KVPoll.Failed
+                                if _KV_TIMING and status == KVPoll.Success:
+                                    # Capture before publishing Success; emit after
+                                    # worker cleanup so logging does not hold it up.
+                                    send_ready = time.perf_counter()
+                                    timing_event = {
+                                        "event": "worker",
+                                        "pid": os.getpid(),
+                                        "room": kv_chunk.room,
+                                        "enqueue": kv_chunk._kv_timing_enqueued,
+                                        "dequeue": kv_chunk._kv_timing_dequeued,
+                                        "ready": send_ready,
+                                        "attempts": kv_chunk._kv_timing_attempts,
+                                    }
                                 self.conclude_transfer(
                                     bootstrap_room=req.room,
                                     status=status,
@@ -2847,6 +2870,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     # acknowledge Success while this worker can still erase
                     # bookkeeping for a subsequent transfer using the same room.
                     self._staging_outstanding.pop(kv_chunk.room, None)
+
+                if timing_event is not None:
+                    logger.info(
+                        "KV_TIMING %s",
+                        json.dumps(timing_event, separators=(",", ":")),
+                    )
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
@@ -3108,20 +3137,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
-        self.transfer_queues[shard_idx].put(
-            TransferKVChunk(
-                room=bootstrap_room,
-                prefill_kv_indices=kv_indices,
-                index_slice=index_slice,
-                is_last_chunk=is_last_chunk,
-                prefill_aux_index=aux_index,
-                state_indices=state_indices,
-                num_kv_tokens=num_kv_tokens,
-                trace_ctx=trace_ctx,
-                wait_event=wait_event,
-                indices_event=indices_event,
-            )
+        transfer_chunk = TransferKVChunk(
+            room=bootstrap_room,
+            prefill_kv_indices=kv_indices,
+            index_slice=index_slice,
+            is_last_chunk=is_last_chunk,
+            prefill_aux_index=aux_index,
+            state_indices=state_indices,
+            num_kv_tokens=num_kv_tokens,
+            trace_ctx=trace_ctx,
+            wait_event=wait_event,
+            indices_event=indices_event,
         )
+        if _KV_TIMING:
+            transfer_chunk._kv_timing_enqueued = time.perf_counter()
+        self.transfer_queues[shard_idx].put(transfer_chunk)
 
     def get_session_id(self):
         return self.engine.get_session_id()
@@ -3260,6 +3290,8 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         )
         if should_skip:
             return
+        if _KV_TIMING:
+            self._kv_timing_chunks = getattr(self, "_kv_timing_chunks", 0) + 1
 
         wait_event = getattr(self, "_early_send_wait_event", None)
         self._early_send_wait_event = None

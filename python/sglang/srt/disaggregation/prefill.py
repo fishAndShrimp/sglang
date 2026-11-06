@@ -20,7 +20,9 @@ Life cycle of a request in the prefill server
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import os
 import time
 from array import array
 from collections import deque
@@ -104,6 +106,8 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
+
+_KV_TIMING = os.environ.get("SGLANG_KV_TIMING", "0") == "1"
 
 # TP=1 yield between polls of a pending result. An initial heuristic rather
 # than a tuned value: long enough that the bootstrap, transfer and cache
@@ -1195,6 +1199,8 @@ class SchedulerDisaggregationPrefillMixin:
                 # todo: set Transferring correctly in backend
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
+                if _KV_TIMING:
+                    req.time_stats._kv_timing_poll = time.perf_counter()
                 if req.return_routed_experts:
                     self.batch_result_processor._maybe_collect_routed_experts(req)
                 if not isinstance(req.finished_reason, FINISH_ABORT):
@@ -1227,6 +1233,29 @@ class SchedulerDisaggregationPrefillMixin:
             kv_mgr = getattr(req.disagg_kv_sender, "kv_mgr", None)
             if kv_mgr and getattr(kv_mgr, "is_dummy_cp_rank", False):
                 continue
+            if _KV_TIMING:
+                stats = req.time_stats
+                logger.info(
+                    "KV_TIMING %s",
+                    json.dumps(
+                        {
+                            "event": "finish",
+                            "pid": os.getpid(),
+                            "room": req.disagg_kv_sender.bootstrap_room,
+                            "rid": req.rid,
+                            "forward": stats.forward_entry_time,
+                            "prefill": stats.prefill_finished_time,
+                            "transfer": stats.prefill_transfer_queue_entry_time,
+                            "poll": getattr(stats, "_kv_timing_poll", None),
+                            "done": stats.completion_time,
+                            "chunked": stats.last_chunked_prefill_finish_time > 0,
+                            "chunks": getattr(
+                                req.disagg_kv_sender, "_kv_timing_chunks", None
+                            ),
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
             metrics = req.time_stats.compute_and_observe_kv_transfer_metrics(
                 req.disagg_kv_sender.get_transfer_metric()
             )
