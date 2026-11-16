@@ -93,6 +93,19 @@ def _npu_sparse_attention(
     return sparse_attention(q, k_cache, v_cache, token_slots, softmax_scale)
 
 
+def _npu_sparse_prefill_attention(q, k_cache, v_cache, token_slots, softmax_scale=None):
+    from sglang.kernels.ops.attention.qsa_prefill_attention import qsa_prefill_attention
+
+    # Prefill TopK blocks and the incomplete tail select distinct tokens.
+    return qsa_prefill_attention(
+        q,
+        _flatten_qsa_kv_cache(k_cache, "k_cache"),
+        _flatten_qsa_kv_cache(v_cache, "v_cache"),
+        token_slots,
+        softmax_scale,
+    )
+
+
 @lru_cache(maxsize=1)
 def _resolve_trtllm_sparse_decode():
     """FlashInfer paged decode for the post-gather sparse attention;
@@ -257,6 +270,8 @@ class QwenSparseAttnBackend(AttentionBackend):
     # Every seq_lens_cpu read here has a device fallback (one readback);
     # the graphed decode path never reads it, so opting out is safe.
     needs_cpu_seq_lens: bool = False
+    # Gathered KV lengths are fixed; live padding is carried by the tensor mask.
+    npu_graph_auto_dispatch_capture: bool = False
 
     def __init__(self, runner=None) -> None:
         self.runner = runner
@@ -1062,8 +1077,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             self.forward_metadata = metadata
             return
         if seq_lens_cpu is None:
-            # Host-fallback staging only (non-CUDA pools): an explicit
-            # slow-path readback, never the serving path.
+            # Fallback pools stage request lengths on the host.
             seq_lens_cpu = seq_lens[:bs].cpu()
         if self._is_speculative_paged_mode(forward_mode):
             row_lengths, row_req_pool_indices, row_prefix_lengths = (
@@ -1094,16 +1108,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         self.forward_metadata = metadata
 
     def _can_replay_with_gpu_kernels(self, metadata, seq_lens) -> bool:
-        # Guard NPU before the import, which precedes the is_cuda check below.
-        if _is_npu:
-            return False
         if self.req_to_token is None:
             return False
         from sglang.srt.layers.attention.qsa.graph_metadata import (
             supports_graph_metadata_kernels,
         )
 
-        return seq_lens.is_cuda and supports_graph_metadata_kernels(
+        return supports_graph_metadata_kernels(
             metadata.indexer_metadata.token_to_kv_pool, seq_lens.device
         )
 
@@ -1390,15 +1401,18 @@ class QwenSparseAttnBackend(AttentionBackend):
             request_ids = metadata.row_req_pool_indices.long().index_select(
                 0, sequence_ids
             )
-            safe = logical_indices.clamp(
-                min=0, max=metadata.req_to_token.shape[1] - 1
-            ).long()
-            slots = metadata.req_to_token[request_ids[:, None], safe]
+            table = metadata.req_to_token
         else:
-            safe = logical_indices.clamp(
-                min=0, max=metadata.token_slot_table.shape[1] - 1
-            ).long()
-            slots = metadata.token_slot_table[sequence_ids[:, None], safe]
+            table = metadata.token_slot_table
+            request_ids = sequence_ids
+        safe = logical_indices.clamp(min=0, max=table.shape[1] - 1).long()
+        if _is_npu:
+            # Flatten the row/column indices to use the device gather path.
+            offsets = request_ids[:, None] * table.shape[1] + safe
+            slots = table.reshape(-1).index_select(0, offsets.reshape(-1))
+            slots = slots.view(logical_indices.shape)
+        else:
+            slots = table[request_ids[:, None], safe]
         return torch.where(valid, slots, torch.full_like(slots, -1)).to(torch.int32)
 
     @staticmethod
@@ -1558,7 +1572,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             slots = self._logical_to_physical(topk_indices, metadata)
             pool = self.token_to_kv_pool
             if _is_npu:
-                attention = _npu_sparse_attention
+                attention = _npu_sparse_prefill_attention
             else:
                 attention = qsa_sparse_attention
             output = attention(
@@ -2093,6 +2107,8 @@ class QwenSparseMultiStepDraftBackend:
     """Per-step QSA metadata for consecutive Qwen4-Exp MTP draft decoding."""
 
     needs_cpu_seq_lens: bool = False
+    # Gathered KV lengths are fixed; live padding is carried by the tensor mask.
+    npu_graph_auto_dispatch_capture: bool = False
 
     def __init__(self, model_runner, topk: int, speculative_num_steps: int):
         if topk != 1:
@@ -2209,7 +2225,8 @@ class QwenSparseMultiStepDraftBackend:
 
         num_padding = getattr(forward_batch, "num_padding", None)
         num_padding = num_padding if num_padding is not None else 0
-        if forward_batch.seq_lens.is_cuda and self.attn_backends:
+        # The NPU compiler does not accept the fused kernel's nested tuple.
+        if not _is_npu and forward_batch.seq_lens.is_cuda and self.attn_backends:
             from sglang.srt.layers.attention.qsa.graph_metadata import (
                 launch_draft_graph_metadata,
                 prepare_draft_graph_metadata,
@@ -2257,7 +2274,7 @@ class QwenSparseMultiStepDraftBackend:
                 backend._cuda_graph_metadata[
                     (ForwardMode.DECODE, forward_batch.batch_size)
                 ]
-                if forward_batch.seq_lens.is_cuda
+                if forward_batch.seq_lens.device.type in ("cuda", "npu")
                 else None
             )
             if metadata is not None and backend._can_replay_with_gpu_kernels(
