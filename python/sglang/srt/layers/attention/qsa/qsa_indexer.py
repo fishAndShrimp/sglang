@@ -441,6 +441,7 @@ class QSAIndexer(MultiPlatformOp):
         query_positions: torch.Tensor,
         sequence_lengths_for_rows: torch.Tensor,
         max_row_keys: Optional[int] = None,
+        defer_expansion: bool = False,
     ) -> torch.Tensor:
         """Top-k token selection for packed prefill rows.
 
@@ -452,8 +453,13 @@ class QSAIndexer(MultiPlatformOp):
         top-k reads only each row's own section and returns indices relative to
         the row's start either way."""
         rows = q.shape[0]
+        output_width = (
+            self.block_topk
+            if defer_expansion
+            else self.token_topk + self.compress_ratio - 1
+        )
         output = torch.empty(
-            (rows, self.token_topk + self.compress_ratio - 1),
+            (rows, output_width),
             dtype=torch.int32,
             device=q.device,
         )
@@ -512,12 +518,16 @@ class QSAIndexer(MultiPlatformOp):
                     row_ends[chunk_slice],
                     topk=self.block_topk,
                 )
-            selected = expand_qsa_block_indices(
-                block_indices,
-                query_positions[chunk_slice],
-                sequence_lengths_for_rows[chunk_slice],
-                compress_ratio=self.compress_ratio,
-                token_topk=self.token_topk,
+            selected = (
+                block_indices
+                if defer_expansion
+                else expand_qsa_block_indices(
+                    block_indices,
+                    query_positions[chunk_slice],
+                    sequence_lengths_for_rows[chunk_slice],
+                    compress_ratio=self.compress_ratio,
+                    token_topk=self.token_topk,
+                )
             )
             output[chunk_slice].copy_(selected)
             del logits, block_indices, selected
@@ -816,6 +826,7 @@ class QSAIndexer(MultiPlatformOp):
             max_row_keys=indexer_metadata.prefill_max_row_keys(
                 getattr(forward_batch, "seq_lens_cpu", None)
             ),
+            defer_expansion=indexer_metadata.defer_prefill_block_expansion,
         )
 
     def forward_cuda(

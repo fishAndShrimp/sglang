@@ -94,6 +94,9 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     extend_rope_matrix: Optional[torch.Tensor] = None
     graph_ring_group_locs: Optional[torch.Tensor] = None
     defer_block_expansion: bool = False
+    # The NPU GBSA prefill consumer accepts complete group IDs and adds the
+    # incomplete causal tail itself. Other consumers expand at their boundary.
+    defer_prefill_block_expansion: bool = False
     # Host copy of the extend sequence_lengths; lets prefill MQA skip a device sync.
     prefill_sequence_lengths_cpu: Optional[Tuple[int, ...]] = None
 

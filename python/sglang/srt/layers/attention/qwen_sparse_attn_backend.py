@@ -857,6 +857,9 @@ class QwenSparseAttnBackend(AttentionBackend):
                 self._can_defer_block_expansion(forward_batch.forward_mode)
                 and decode_logical_positions is not None
             ),
+            defer_prefill_block_expansion=self._can_defer_prefill_block_expansion(
+                forward_batch.forward_mode
+            ),
             prefill_sequence_lengths_cpu=prefill_sequence_lengths_cpu,
         )
         return QwenSparseAttnMetadata(
@@ -1503,14 +1506,37 @@ class QwenSparseAttnBackend(AttentionBackend):
             and indices.shape[1] == self.qsa_profile.block_topk
         )
 
-    def _expand_block_indices(self, indices, metadata):
+    def _can_defer_prefill_block_expansion(self, forward_mode):
+        return (
+            _is_npu
+            and os.getenv("SGLANG_NPU_QSA_PREFILL_GBSA", "0") == "1"
+            and forward_mode.is_extend_or_draft_extend_or_mixed()
+            # The draft's plain post-prefill EXTEND seeds token IDs for MTP
+            # reuse, just like DRAFT_EXTEND_V2. Keep that producer unchanged.
+            and self._mtp_shared_sparse_indices is None
+            and self.compress_ratio == 4
+            and self.token_to_kv_pool.qsa_block_topk == 512
+            and self.token_to_kv_pool.qsa_compressed_page_size == 32
+        )
+
+    def _expand_block_indices(self, indices, metadata, query_positions=None):
         if not self._uses_block_indices(indices):
             return indices
         indexer = metadata.indexer_metadata
+        positions = (
+            indexer.decode_logical_positions
+            if query_positions is None
+            else query_positions
+        )
+        lengths = (
+            indexer.get_seqlens_int32()
+            if query_positions is None
+            else indexer.get_seqlens_expanded()
+        )
         return expand_qsa_block_indices(
             indices,
-            indexer.decode_logical_positions,
-            indexer.get_seqlens_int32(),
+            positions,
+            lengths,
             self.compress_ratio,
             self.qsa_profile.budget,
         )
@@ -1635,7 +1661,10 @@ class QwenSparseAttnBackend(AttentionBackend):
                 and q.shape[0] >= 128
                 and q.shape[1:] == (3, 256)
                 and q.dtype == torch.bfloat16
-                and topk_indices.shape[1] == 2051
+                and (
+                    topk_indices.shape[1] == 2051
+                    or self._uses_block_indices(topk_indices)
+                )
                 and pool.qsa_compressed_page_size * self.compress_ratio == 128
                 and not metadata.is_cuda_graph
             ):
@@ -1653,8 +1682,17 @@ class QwenSparseAttnBackend(AttentionBackend):
                     forward_batch.extend_seq_lens,
                     q.shape[0],
                     layer.scaling,
+                    indices_are_blocks=self._uses_block_indices(topk_indices),
                 )
                 return self._pad_extend_output(output, num_output_rows)
+            # Short prefills, disabled GBSA, and unsupported dtypes/layouts
+            # retain the token consumer. Expand here only when needed.
+            if self._uses_block_indices(topk_indices):
+                positions = forward_batch.positions
+                positions = positions[0] if positions.ndim == 2 else positions
+                topk_indices = self._expand_block_indices(
+                    topk_indices, metadata, positions.flatten()[:num_valid_rows]
+                )
             slots = self._logical_to_physical(topk_indices, metadata)
             if _is_npu:
                 attention = _npu_sparse_prefill_attention
