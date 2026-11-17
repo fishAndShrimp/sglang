@@ -32,7 +32,9 @@ def _make_backend(runner=None):
     # a white-box runner to exercise a specific replay() branch.
     if runner is None:
         runner = SimpleNamespace(
-            device_module=_device_module_stub(), enable_torch_compile=False
+            device_module=_device_module_stub(),
+            enable_torch_compile=False,
+            model_runner=SimpleNamespace(is_draft_worker=False),
         )
     with (
         get_parallel().override(tp_group=SimpleNamespace(barrier=mock.Mock())),
