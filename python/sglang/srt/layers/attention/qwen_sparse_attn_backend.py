@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from copy import copy
 from functools import lru_cache
 from typing import Dict, Optional, Tuple
@@ -1627,8 +1628,34 @@ class QwenSparseAttnBackend(AttentionBackend):
             return self._pad_extend_output(output, num_output_rows)
         if _is_npu or not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
-            slots = self._logical_to_physical(topk_indices, metadata)
             pool = self.token_to_kv_pool
+            if (
+                _is_npu
+                and os.getenv("SGLANG_NPU_QSA_PREFILL_GBSA", "0") == "1"
+                and q.shape[0] >= 128
+                and q.shape[1:] == (3, 256)
+                and q.dtype == torch.bfloat16
+                and topk_indices.shape[1] == 2051
+                and pool.qsa_compressed_page_size * self.compress_ratio == 128
+                and not metadata.is_cuda_graph
+            ):
+                from sglang.kernels.ops.attention.qsa_gbsa_prefill import qsa_gbsa_prefill
+
+                # Keep original sequence boundaries: GBSA computes all selected
+                # complete groups plus the causal incomplete tail (mode 1).
+                output = qsa_gbsa_prefill(
+                    q,
+                    _flatten_qsa_kv_cache(pool.layer_router.read(layer.layer_id).key(), "key"),
+                    _flatten_qsa_kv_cache(pool.layer_router.read(layer.layer_id).value(), "value"),
+                    topk_indices,
+                    metadata.token_slot_table,
+                    metadata.sequence_lengths,
+                    forward_batch.extend_seq_lens,
+                    q.shape[0],
+                    layer.scaling,
+                )
+                return self._pad_extend_output(output, num_output_rows)
+            slots = self._logical_to_physical(topk_indices, metadata)
             if _is_npu:
                 attention = _npu_sparse_prefill_attention
             else:

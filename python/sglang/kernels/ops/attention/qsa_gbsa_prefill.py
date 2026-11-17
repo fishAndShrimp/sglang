@@ -1,0 +1,48 @@
+"""Sequence-batched native prefill with GBSA's exact automatic residual tail.
+
+QSA supplies complete groups of four, packed before an incomplete tail.
+Token tables must map aligned 128-token logical pages to physical KV pages.
+"""
+import logging
+from functools import lru_cache
+
+import torch
+
+
+@lru_cache(maxsize=1)
+def _report_native():
+    logging.getLogger(__name__).info(
+        "QSA prefill uses CANN GBSA: D256, block [1,4], KV page128, residual mode1"
+    )
+
+
+def qsa_gbsa_prefill(q, k, v, logical_indices, token_table, seq_lens, extend_lens, max_query, softmax_scale=None):
+    from cann_ops_transformer.ops.attention.generic_block_sparse_attention import (
+        generic_block_sparse_attention, generic_block_sparse_attention_metadata,
+    )
+    assert q.shape[1:] == (3, 256) and k.shape[1:] == (1, 256)
+    assert k.shape == v.shape and k.shape[0] % 128 == 0
+    assert q.dtype == k.dtype == v.dtype == torch.bfloat16
+    assert logical_indices.shape == (q.shape[0], 2051)
+    assert token_table.shape[1] < 2**24
+    _report_native()
+    groups = (logical_indices >= 0).sum(-1, dtype=torch.int32) // 4
+    ranks = torch.arange(512, device=q.device)
+    block_ids = logical_indices[:, :2048:4] // 4
+    ids = torch.where(ranks[None] < groups[:, None], block_ids, 16777215)
+    ids = ids.float().sort(-1).values.int().unsqueeze(0)
+    counts = groups[None]
+    table = (token_table[:, ::128] // 128).to(torch.int32).contiguous()
+    cu_q = torch.cat([torch.zeros(1, dtype=torch.int64, device=q.device), extend_lens.to(torch.int64).cumsum(0)])
+    options = dict(cu_seqlens_q=cu_q, seqused_kv=seq_lens.to(torch.int32).contiguous(),
+                   layout_q='TND', layout_kv='PA_BBND', layout_sparse_pattern=4,
+                   mask_mode=1, quant_mode=0, softmax_precision=0,
+                   residual_block_mode=1, is_consistent_topk=False)
+    meta = generic_block_sparse_attention_metadata(
+        ids, counts, 3, 1, 256, [1,4], max_seqlen_q=max_query,
+        max_seqlen_kv=table.shape[1] * 128, **options)
+    output, _ = generic_block_sparse_attention(
+        q.contiguous(), k.view(-1,128,1,256), v.view(-1,128,1,256), ids,
+        counts, [1,4], metadata=meta, block_table=table, softmax_scale=1/16 if softmax_scale is None else softmax_scale,
+        return_softmax_lse=False, **options)
+    return output

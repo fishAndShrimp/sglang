@@ -1,8 +1,7 @@
-"""QSA attention fallback for the standard CANN 9.2.0 runtime.
+"""QSA fallback for arbitrary physical-token selections.
 
-The toolkit GBSA accepts head dimension 128 and paged KV, while QSA needs
- dimension 256 and arbitrary physical token slots. Preserve the existing
- sparse attention implementation until a compatible interface is available.
+The CANN 9.3 grouped prefill path lives in qsa_gbsa_prefill and receives
+sequence metadata directly from the attention backend.
 """
 
 import logging
@@ -14,8 +13,8 @@ logger = logging.getLogger(__name__)
 @lru_cache(maxsize=1)
 def _report_fallback():
     logger.warning(
-        "QSA uses sparse attention fallback: standard CANN 9.2.0 GBSA "
-        "does not support QSA head dimension 256."
+        "QSA uses sparse attention fallback: native grouped prefill is "
+        "disabled or this call needs arbitrary token-slot attention."
     )
 
 
