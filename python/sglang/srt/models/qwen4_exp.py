@@ -115,6 +115,9 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 if _is_npu:
+    from sgl_kernel_npu.activation.fused_sigmoid_mul import (
+        fused_sigmoid_mul as npu_fused_sigmoid_mul,
+    )
     from sgl_kernel_npu.operators.mamba import short_conv as ple_short_conv
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
@@ -2216,7 +2219,12 @@ class Qwen4ExpAttentionDecoderLayer(
 
         attn_output = self.attn(q, k, v, forward_batch, **attention_kwargs)
         if gate is not None:
-            if attn_output.is_cuda:
+            if _is_npu:
+                # transfer_to_npu makes NPU tensors report is_cuda=True.
+                # Select the NPU tiling before the CUDA row-wise kernel.
+                gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
+                attn_output = npu_fused_sigmoid_mul(attn_output, gate_val)
+            elif attn_output.is_cuda:
                 # The strided 3D gate view feeds the kernel directly, so the
                 # gate reshape copy disappears along with the sigmoid + mul.
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
