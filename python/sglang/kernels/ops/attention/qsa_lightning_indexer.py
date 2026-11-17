@@ -1,33 +1,12 @@
-"""Experimental CANN 9.1 LightningIndexerV2 adapter for paged QSA rows.
-
-This binding matches the locally validated 1024-entry CANN 9.1 metadata ABI.
-It requires the same isolated binding support package as QSA prefill GBSA.
-"""
-
-from functools import lru_cache
-from pathlib import Path
+"""Paged QSA rows using the CANN 9.2.0 image's sgl-kernel-npu interface."""
 
 import torch
 
-
-@lru_cache(maxsize=1)
-def _binding():
-    from cann_ops_transformer_qsa_probe.op_builder import OpBuilder
-
-    class Builder(OpBuilder):
-        def __init__(self):
-            super().__init__("qsa_lightning_indexer_cann91")
-
-        def sources(self):
-            return [str(Path(__file__).parent / "csrc/qsa_lightning_indexer.cpp")]
-
-        def schema(self):
-            return None
-
-        def register_meta(self):
-            pass
-
-    return Builder().load()
+# Register the image vendor before any NPU tensors or graph capture.
+from sgl_kernel_npu.operators.indexer import (
+    lightning_indexer_v2,
+    lightning_indexer_v2_metadata,
+)
 
 
 def qsa_lightning_block_indices(q, k_cache, page_table, compressed_lengths):
@@ -47,18 +26,26 @@ def qsa_lightning_block_indices(q, k_cache, page_table, compressed_lengths):
     if not rows:
         return torch.empty((0, 512), dtype=torch.int32, device=q.device)
     lens = compressed_lengths.to(torch.int32).contiguous()
+    # Empty image-vendor rows do not initialize their output. Keep a valid
+    # one-key launch during empty graph capture, then mask padded results.
+    launch_lens = lens.clamp_min(1)
+    table = torch.where(lens[:, None] > 0, page_table, 0).to(torch.int32).contiguous()
     cu_q = torch.arange(rows + 1, dtype=torch.int32, device=q.device)
-    cu_k = torch.cat((lens.new_zeros(1), lens.cumsum(0, dtype=torch.int32)))
-    q_lens = torch.ones_like(lens)
     residual = torch.zeros_like(lens)
     weights = torch.full((rows, heads), 128**-0.5, dtype=torch.float32, device=q.device)
-    binding = _binding()
-    metadata = binding.metadata(
-        cu_q, lens, residual, cu_k, q_lens, heads, 512, 1,
-        page_table.shape[1] * k_cache.shape[1],
+    options = dict(
+        cu_seqlens_q=cu_q, seqused_k=launch_lens, cmp_residual_k=residual,
+        layout_q="TND", layout_k="PA_BBND", mask_mode=3, cmp_ratio=4,
     )
-    indices, _ = binding.forward(
-        q.contiguous(), k_cache, weights, cu_q, lens, residual, cu_k, q_lens,
-        page_table.to(torch.int32).contiguous(), metadata, 512, 1, False,
+    # Producer and consumer both come from the image's bundled LI vendor.
+    metadata = lightning_indexer_v2_metadata(
+        heads, 1, 128, 512, batch_size=rows, max_seqlen_q=1,
+        max_seqlen_k=page_table.shape[1] * k_cache.shape[1], **options,
     )
-    return indices[:, 0]
+    indices, _ = lightning_indexer_v2(
+        q.contiguous(), k_cache, weights, 512,
+        block_table=table, metadata=metadata,
+        **options,
+    )
+    ranks = torch.arange(512, device=q.device)
+    return torch.where(ranks[None, :] < lens[:, None], indices[:, 0], -1)
