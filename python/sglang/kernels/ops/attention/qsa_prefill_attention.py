@@ -11,17 +11,30 @@ def qsa_prefill_attention(q, k, v, slots, softmax_scale=None):
     The GBSA path covers arch22, R>=128, Hq=3, Hkv=1 and S=2051.
     Other supported QSA shapes use the existing operator.
     """
+    return _qsa_gbsa_attention(q, k, v, slots, softmax_scale, 128, (2051,))
+
+
+def qsa_decode_attention(q, k, v, slots, softmax_scale=None):
+    """Use GBSA for 128+ verification rows; keep smaller batches on FIA."""
+    return _qsa_gbsa_attention(
+        q, k, v, slots, softmax_scale, 128, (2051, 2054, 2055)
+    )
+
+
+def _qsa_gbsa_attention(q, k, v, slots, softmax_scale, min_rows, slot_widths):
     from sgl_kernel_npu.operators.attention import qsa_sparse_attention
     from sgl_kernel_npu.operators.utils.generation import Generation, get_hardware
 
     eligible = (
         q.ndim == k.ndim == v.ndim == 3
-        and q.shape[0] >= 128
+        and q.shape[0] >= min_rows
         and q.shape[1:] == (3, 256)
         and k.shape[1:] == (1, 256)
         and v.shape == k.shape
         and q.dtype == k.dtype == v.dtype == torch.bfloat16
-        and slots.shape == (q.shape[0], 2051)
+        and slots.ndim == 2
+        and slots.shape[0] == q.shape[0]
+        and slots.shape[1] in slot_widths
         and slots.dtype == torch.int32
         and 0 < k.shape[0] <= 2**24
         and k.is_contiguous()

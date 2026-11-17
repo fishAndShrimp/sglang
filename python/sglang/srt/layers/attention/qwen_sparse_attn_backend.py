@@ -88,6 +88,13 @@ def _npu_sparse_attention(
         qsa_sparse_attention as sparse_attention,
     )
 
+    import os
+
+    if os.getenv("SGLANG_NPU_QSA_DECODE_GBSA", "0") == "1":
+        from sglang.kernels.ops.attention.qsa_prefill_attention import (
+            qsa_decode_attention as sparse_attention,
+        )
+
     k_cache = _flatten_qsa_kv_cache(k_cache, "k_cache")
     v_cache = _flatten_qsa_kv_cache(v_cache, "v_cache")
     return sparse_attention(q, k_cache, v_cache, token_slots, softmax_scale)

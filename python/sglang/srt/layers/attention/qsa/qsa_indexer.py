@@ -534,6 +534,32 @@ class QSAIndexer(MultiPlatformOp):
         sequence_lengths: torch.Tensor,
         defer_expansion: bool = False,
     ) -> torch.Tensor:
+        import os
+
+        if (
+            _is_npu
+            and self.block_topk == 512
+            and self.compress_ratio == 4
+            and q.dtype == torch.bfloat16
+            and os.getenv("SGLANG_NPU_QSA_LIGHTNING_INDEXER", "0") == "1"
+        ):
+            from sglang.kernels.ops.attention.qsa_lightning_indexer import (
+                qsa_lightning_block_indices,
+            )
+
+            block_indices = qsa_lightning_block_indices(
+                q, compressed_cache, compressed_page_table, compressed_lengths
+            )
+            if defer_expansion:
+                return block_indices
+            return expand_qsa_block_indices(
+                block_indices,
+                query_positions,
+                sequence_lengths,
+                compress_ratio=self.compress_ratio,
+                token_topk=self.token_topk,
+            )
+
         # fast_topk (k = 512) writes 0..length-1 for rows that fit k without reading
         # their scores, and never reads past a row's length.
         use_fast_topk = (
