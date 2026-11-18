@@ -806,7 +806,9 @@ class QSAIndexer(MultiPlatformOp):
                 max_model_len,
                 logical_positions,
                 indexer_metadata.get_seqlens_int32(),
-                defer_expansion=q.is_cuda and indexer_metadata.defer_block_expansion,
+                defer_expansion=(
+                    (_is_npu or q.is_cuda) and indexer_metadata.defer_block_expansion
+                ),
             )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (

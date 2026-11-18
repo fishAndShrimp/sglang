@@ -131,6 +131,7 @@ def test_attention_consumer_fallback_and_padding(rows, enabled, padded, monkeypa
                               _pad_extend_output=QwenSparseAttnBackend._pad_extend_output)
     backend._uses_block_indices = MethodType(QwenSparseAttnBackend._uses_block_indices, backend)
     backend._expand_block_indices = MethodType(QwenSparseAttnBackend._expand_block_indices, backend)
+    backend._npu_indices_to_physical = MethodType(QwenSparseAttnBackend._npu_indices_to_physical, backend)
     batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND, positions=c.positions, extend_seq_lens=c.extends)
     layer = SimpleNamespace(layer_id=0, tp_q_head_num=3, head_dim=256, scaling=1 / 16)
     q = torch.cat([c.q, c.q.new_zeros(padded, 3, 256)])

@@ -1493,7 +1493,11 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     def _can_defer_block_expansion(self, forward_mode):
         return (
-            self._fused_kv_pool_eligible
+            (
+                self._mtp_shared_sparse_indices is None
+                if _is_npu
+                else self._fused_kv_pool_eligible
+            )
             and self.qsa_profile is not None
             and self.compress_ratio == 4
             and self.qsa_profile.block_topk == 512
@@ -1504,6 +1508,42 @@ class QwenSparseAttnBackend(AttentionBackend):
         return (
             self.qsa_profile is not None
             and indices.shape[1] == self.qsa_profile.block_topk
+        )
+
+    def _npu_indices_to_physical(self, indices, metadata, query_positions=None):
+        indexer = metadata.indexer_metadata
+        pages = (
+            indexer.graph_compressed_page_table
+            if metadata.is_cuda_graph
+            else indexer.decode_page_table
+        )
+        tensors = [indices, metadata.token_to_batch_idx, metadata.sequence_lengths]
+        if pages is not None:
+            tensors.append(pages)
+        if query_positions is not None:
+            tensors.append(query_positions)
+        if (
+            pages is None
+            or indices.shape[0] > 128
+            or indices.shape[1] > 2055
+            or pages.shape[1] > 512
+            or any(t.dtype != torch.int32 or not t.is_contiguous() for t in tensors)
+        ):
+            # Ordinary prefills have no paged LI view. Large eager batches
+            # retain the original mapper: the fused kernel is tuned for the
+            # <=128-row int32 decode/verify shapes and <=64K context. Strided
+            # int64 metadata also needs the original path to fit Ascend UB.
+            indices = self._expand_block_indices(indices, metadata, query_positions)
+            return self._logical_to_physical(indices, metadata)
+        from sglang.kernels.ops.attention.qsa_index_slots import qsa_paged_indices_to_slots
+
+        return qsa_paged_indices_to_slots(
+            indices,
+            metadata.token_to_batch_idx,
+            metadata.sequence_lengths,
+            pages,
+            query_positions,
+            self.token_to_kv_pool.qsa_compressed_page_size * self.compress_ratio,
         )
 
     def _can_defer_prefill_block_expansion(self, forward_mode):
@@ -1685,15 +1725,22 @@ class QwenSparseAttnBackend(AttentionBackend):
                     indices_are_blocks=self._uses_block_indices(topk_indices),
                 )
                 return self._pad_extend_output(output, num_output_rows)
-            # Short prefills, disabled GBSA, and unsupported dtypes/layouts
-            # retain the token consumer. Expand here only when needed.
+            # The token consumer can fuse compact expansion with slot mapping.
+            positions = None
             if self._uses_block_indices(topk_indices):
                 positions = forward_batch.positions
                 positions = positions[0] if positions.ndim == 2 else positions
-                topk_indices = self._expand_block_indices(
-                    topk_indices, metadata, positions.flatten()[:num_valid_rows]
-                )
-            slots = self._logical_to_physical(topk_indices, metadata)
+                positions = positions.flatten()[:num_valid_rows]
+                if not _is_npu:
+                    topk_indices = self._expand_block_indices(
+                        topk_indices, metadata, positions
+                    )
+                    positions = None
+            slots = (
+                self._npu_indices_to_physical(topk_indices, metadata, positions)
+                if _is_npu
+                else self._logical_to_physical(topk_indices, metadata)
+            )
             if _is_npu:
                 attention = _npu_sparse_prefill_attention
             else:
@@ -2119,14 +2166,22 @@ class QwenSparseAttnBackend(AttentionBackend):
         k_buffer = pool.layer_router.read(layer.layer_id).key()
         v_buffer = pool.layer_router.read(layer.layer_id).value()
         metadata = self._resolve_metadata(forward_batch)
+        if _is_npu:
+            compact = self._uses_block_indices(topk_indices)
+            positions = (
+                metadata.indexer_metadata.decode_logical_positions
+                if compact
+                else None
+            )
+            if compact and positions is None:
+                raise RuntimeError("Compact QSA paged indices require logical positions")
+            slots = self._npu_indices_to_physical(topk_indices, metadata, positions)
+            output = _npu_sparse_attention(q, k_buffer, v_buffer, slots, layer.scaling)
+            return output.reshape(q.shape[0], -1)
         topk_indices = self._expand_block_indices(topk_indices, metadata)
-        if _is_npu or not q.is_cuda:
+        if not q.is_cuda:
             slots = self._logical_to_physical(topk_indices, metadata)
-            if _is_npu:
-                attention = _npu_sparse_attention
-            else:
-                attention = qsa_sparse_attention
-            output = attention(q, k_buffer, v_buffer, slots, layer.scaling)
+            output = qsa_sparse_attention(q, k_buffer, v_buffer, slots, layer.scaling)
             return output.reshape(q.shape[0], -1)
 
         topk_indices = topk_indices.to(torch.int32).contiguous()
