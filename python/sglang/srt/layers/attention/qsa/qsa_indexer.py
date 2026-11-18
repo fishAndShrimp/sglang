@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -37,6 +38,7 @@ from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
+_use_va_norm_rope = _is_npu and os.getenv("SGLANG_NPU_QSA_VA_NORM_ROPE", "0") == "1"
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
@@ -207,10 +209,11 @@ class QSAIndexer(MultiPlatformOp):
             )
             return q, token_k, True
         q_raw = qk[:, : self.index_n_heads * self.index_head_dim]
-        q = self.q_layernorm(q_raw.reshape(-1, self.index_head_dim)).reshape(
-            -1, self.index_n_heads, self.index_head_dim
+        q = self._normalize_and_rope(
+            q_raw.reshape(-1, self.index_n_heads, self.index_head_dim),
+            positions,
+            self.q_layernorm,
         )
-        q = self.apply_rope(positions, q)
         if pool is not None:
             q = q.to(pool.qsa_compressed_dtype)
         return q, token_k, False
@@ -218,10 +221,26 @@ class QSAIndexer(MultiPlatformOp):
     def normalize_compressed_keys(
         self, compressed_keys: torch.Tensor, block_positions: torch.Tensor
     ) -> torch.Tensor:
-        normalized = self.k_layernorm(
-            compressed_keys.reshape(-1, self.index_head_dim)
-        ).reshape(-1, self.index_kv_heads, self.index_head_dim)
-        return self.apply_rope(block_positions, normalized)
+        return self._normalize_and_rope(
+            compressed_keys.reshape(-1, self.index_kv_heads, self.index_head_dim),
+            block_positions,
+            self.k_layernorm,
+        )
+
+    def _normalize_and_rope(self, tensor, positions, norm):
+        if _use_va_norm_rope:
+            from sglang.kernels.ops.attention.qsa_norm_rope_va import (
+                qsa_norm_rope_va,
+                supports_qsa_norm_rope_va,
+            )
+
+            if supports_qsa_norm_rope_va(tensor, positions, norm.weight, self.rotary_emb):
+                return qsa_norm_rope_va(
+                    tensor, positions, norm.weight, norm.variance_epsilon,
+                    self.rotary_emb, triton_positions=True, selected_cache=False,
+                )
+        normalized = norm(tensor.reshape(-1, self.index_head_dim)).reshape_as(tensor)
+        return self.apply_rope(positions, normalized)
 
     def _use_fused_compress(self, pool) -> bool:
         return getattr(
