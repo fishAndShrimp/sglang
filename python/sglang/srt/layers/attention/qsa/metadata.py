@@ -99,6 +99,8 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     defer_prefill_block_expansion: bool = False
     # Host copy of the extend sequence_lengths; lets prefill MQA skip a device sync.
     prefill_sequence_lengths_cpu: Optional[Tuple[int, ...]] = None
+    # Separate stable request view for LI; other consumers retain row metadata.
+    npu_lightning_inputs: Optional[object] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.sequence_lengths.to(torch.int32)

@@ -1067,6 +1067,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             pending_ring_slots=self._graph_state_slots[:metadata_rows],
             graph_ring_group_locs=self._graph_ring_group_locs[:metadata_rows],
             defer_block_expansion=self._can_defer_block_expansion(forward_mode),
+            npu_lightning_inputs=self._make_npu_verify_lightning_inputs(
+                forward_mode, spec_info, metadata_rows,
+                self._graph_compressed_page_table.shape[1],
+            ),
         )
         metadata = QwenSparseAttnMetadata(
             sequence_lengths=self._graph_seq_lens[:metadata_rows],
@@ -1082,6 +1086,41 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         self._cuda_graph_metadata[(forward_mode, bs)] = metadata
         self.forward_metadata = metadata
+        self._refresh_npu_lightning_inputs(indexer_metadata)
+
+    def _make_npu_verify_lightning_inputs(self, forward_mode, spec_info, rows, pages):
+        profile = self.qsa_profile
+        pool = self.token_to_kv_pool
+        if not (
+            _is_npu
+            and os.getenv("SGLANG_NPU_QSA_REQUEST_LI", "0") == "1"
+            and os.getenv("SGLANG_NPU_QSA_LIGHTNING_INDEXER", "0") == "1"
+            and forward_mode.is_target_verify()
+            and profile is not None
+            and profile.head_dim == 128
+            and profile.n_heads == 4
+            and profile.kv_heads == 1
+            and profile.compress_ratio == 4
+            and profile.block_topk == 512
+            and getattr(pool, "qsa_compressed_dtype", None) == torch.bfloat16
+        ):
+            return None
+        width = int(getattr(spec_info, "draft_token_num", 0) or 0)
+        if width not in (1, 2, 3, 4) or rows <= 0 or rows % width:
+            return None
+        from sglang.kernels.ops.attention.qsa_lightning_inputs import TargetVerifyLightningInputs
+
+        return TargetVerifyLightningInputs(rows, width, pages, profile.n_heads, self.device)
+
+    @staticmethod
+    def _refresh_npu_lightning_inputs(indexer_metadata):
+        inputs = getattr(indexer_metadata, "npu_lightning_inputs", None)
+        if inputs is not None:
+            inputs.refresh(
+                indexer_metadata.sequence_lengths,
+                indexer_metadata.graph_compressed_lengths,
+                indexer_metadata.graph_compressed_page_table,
+            )
 
     def _replay_cuda_graph_metadata(
         self,
@@ -1228,6 +1267,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             pool=pool,
             seq_offset=seq_offset,
         )
+        self._refresh_npu_lightning_inputs(indexer)
 
     def _update_qsa_cuda_graph_metadata(
         self, metadata: QSAIndexerMetadata, req_pool_indices: torch.Tensor
@@ -1286,6 +1326,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             // full_page
         ).clamp_min(0)
         page_table[:, :num_pages].copy_(table.to(torch.int32))
+        QwenSparseAttnBackend._refresh_npu_lightning_inputs(metadata)
 
     def get_indexer_metadata(self, layer_id: int, forward_batch):
         if self.forward_metadata is None:

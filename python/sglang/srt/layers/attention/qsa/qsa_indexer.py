@@ -613,6 +613,7 @@ class QSAIndexer(MultiPlatformOp):
         query_positions: torch.Tensor,
         sequence_lengths: torch.Tensor,
         defer_expansion: bool = False,
+        lightning_inputs=None,
     ) -> torch.Tensor:
         import os
 
@@ -627,9 +628,12 @@ class QSAIndexer(MultiPlatformOp):
                 qsa_lightning_block_indices,
             )
 
-            block_indices = qsa_lightning_block_indices(
-                q, compressed_cache, compressed_page_table, compressed_lengths
-            )
+            if lightning_inputs is None:
+                block_indices = qsa_lightning_block_indices(
+                    q, compressed_cache, compressed_page_table, compressed_lengths
+                )
+            else:
+                block_indices = lightning_inputs.select(q, compressed_cache)
             if defer_expansion:
                 return block_indices
             return expand_qsa_block_indices(
@@ -879,6 +883,7 @@ class QSAIndexer(MultiPlatformOp):
                 defer_expansion=(
                     (_is_npu or q.is_cuda) and indexer_metadata.defer_block_expansion
                 ),
+                lightning_inputs=getattr(indexer_metadata, "npu_lightning_inputs", None),
             )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (
