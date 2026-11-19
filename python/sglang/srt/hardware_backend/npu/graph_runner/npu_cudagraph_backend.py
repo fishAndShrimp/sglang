@@ -464,6 +464,20 @@ class NPUCudaGraphBackend(BaseGraphBackend):
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
+        if (
+            os.getenv("SGLANG_NPU_PREWARM_FIXED_GRAPHS", "0") == "1"
+            and not self._auto_dispatch_capture()
+        ):
+            # Allocate the runtime's SQ/CQ resources while startup still has
+            # free huge pages, rather than on a bucket's first live replay.
+            # Fixed-input graphs have no external host-update event to wait on.
+            self._device_module.synchronize()
+            self._tp_group.barrier()
+            graph.replay()
+            self._device_module.synchronize()
+            if post_warmup_hook is not None:
+                post_warmup_hook()
+            logger.info("Prewarmed fixed NPU graph %s", shape_key)
 
     def _auto_dispatch_capture(self) -> bool:
         attn_backend = getattr(self._decode_runner, "attn_backend", None)
