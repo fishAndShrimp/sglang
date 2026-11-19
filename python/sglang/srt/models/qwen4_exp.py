@@ -610,6 +610,17 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if (
+            _is_npu
+            and os.getenv("SGLANG_NPU_PLE_GROUPED_NORM", "0") == "1"
+            and self.group_size == 2560
+            and x.ndim == 2 and x.shape[1] == 10240
+            and x.dtype == self.weight.dtype == torch.bfloat16
+            and x.is_contiguous() and self.weight.is_contiguous()
+        ):
+            from sgl_kernel_npu.operators.norm import grouped_gemma_rmsnorm
+
+            return grouped_gemma_rmsnorm(x, self.weight, self.group_size, self.eps)
+        if (
             not _is_npu
             and x.is_cuda
             and self._jit_group_size is not None
@@ -831,7 +842,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self, contexts: torch.Tensor, *, decode_sized: bool = False
     ) -> torch.Tensor:
         contexts = contexts.to(torch.long)
-        if self.enable_ple_fusion and decode_sized:
+        if (self.enable_ple_fusion and decode_sized) or (
+            _is_npu and os.getenv("SGLANG_NPU_PLE_NGRAM_HASH", "0") == "1"
+        ):
             from sglang.kernels.ops.embeddings.qwen4_ngram import (
                 can_fuse_qwen4_ngram_hash,
                 fused_qwen4_ngram_hash,
@@ -1526,26 +1539,7 @@ class Qwen4ExpPLELayer(nn.Module):
         self._prefetch_state = None
         return embeddings
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        batch: _PLEBatch,
-    ) -> torch.Tensor:
-        sp_active = layernorm_sp.runs_sp(_get_ple_forward_mode(forward_batch))
-        hidden_rows = hidden_states.shape[0] if sp_active else batch.processed_tokens
-        hidden_states = hidden_states[:hidden_rows]
-        if self._prefetch_state is not None:
-            embeddings = self._consume_prefetched_embeddings(forward_batch)
-        else:
-            embeddings = self.ple_embedding(batch, forward_batch)
-        if sp_active:
-            embeddings = _pad_token_rows(embeddings, batch.physical_tokens)
-            embeddings = layernorm_sp.shard_token_rows(
-                embeddings, group=get_parallel().tp_group
-            )
-        key, _ = self.key_proj(embeddings)
-        value, _ = self.value_proj(embeddings)
+    def _gate_values(self, key, value, hidden_states, batch):
         token_count = hidden_states.shape[0]
         hidden_size = self.hidden_size
         hc_count = self.hc_count
@@ -1553,6 +1547,27 @@ class Qwen4ExpPLELayer(nn.Module):
             raise RuntimeError(
                 "PLE hidden size does not match its hyper-connection layout: "
                 f"expected {hc_count * hidden_size}, got {hidden_states.shape[-1]}"
+            )
+        if (
+            _is_npu
+            and os.getenv("SGLANG_NPU_PLE_VA_GATE", "0") == "1"
+            and (hc_count, hidden_size) == (4, 2560)
+            and hidden_states.is_contiguous()
+            and key.stride(1) == value.stride(1) == 1
+            and key.dtype == value.dtype == hidden_states.dtype == torch.bfloat16
+            and all(
+                norm.group_size == hidden_size
+                and norm.eps == self.norm_key.eps
+                and norm.weight.is_contiguous()
+                and norm.weight.numel() == hc_count * hidden_size
+                for norm in (self.norm_key, self.norm_query, self.norm_conv)
+            )
+        ):
+            from sglang.kernels.ops.elementwise.qwen4_ple_gate_npu import ple_gate
+
+            return ple_gate(
+                key, value, hidden_states, self.norm_key.weight,
+                self.norm_query.weight, self.norm_conv.weight, self.norm_key.eps,
             )
         key = key.reshape(token_count, hc_count, hidden_size)
         query = hidden_states.reshape(token_count, hc_count, hidden_size)
@@ -1588,8 +1603,31 @@ class Qwen4ExpPLELayer(nn.Module):
                 gate = torch.sigmoid(gate)
                 gated_value = gate * value.unsqueeze(-2)
         gated_value_normed = self._apply_ple_norm(self.norm_conv, gated_value)
-        gated_value = gated_value.flatten(-2)
-        gated_value_normed = gated_value_normed.flatten(-2)
+        return gated_value.flatten(-2), gated_value_normed.flatten(-2)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        batch: _PLEBatch,
+    ) -> torch.Tensor:
+        sp_active = layernorm_sp.runs_sp(_get_ple_forward_mode(forward_batch))
+        hidden_rows = hidden_states.shape[0] if sp_active else batch.processed_tokens
+        hidden_states = hidden_states[:hidden_rows]
+        if self._prefetch_state is not None:
+            embeddings = self._consume_prefetched_embeddings(forward_batch)
+        else:
+            embeddings = self.ple_embedding(batch, forward_batch)
+        if sp_active:
+            embeddings = _pad_token_rows(embeddings, batch.physical_tokens)
+            embeddings = layernorm_sp.shard_token_rows(
+                embeddings, group=get_parallel().tp_group
+            )
+        key, _ = self.key_proj(embeddings)
+        value, _ = self.value_proj(embeddings)
+        gated_value, gated_value_normed = self._gate_values(
+            key, value, hidden_states, batch
+        )
         if (
             not _is_npu
             and self.ple_embedding.enable_ple_fusion
