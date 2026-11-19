@@ -6,6 +6,7 @@ must satisfy the same visibility and prefix-valid contract as QSA expansion.
 Token tables must map aligned 128-token logical pages to physical KV pages.
 """
 import logging
+import os
 from functools import lru_cache
 
 import torch
@@ -42,19 +43,31 @@ def qsa_gbsa_prefill(
     assert logical_indices.shape == (q.shape[0], 512 if indices_are_blocks else 2051)
     assert token_table is None or token_table.shape[1] < 2**24
     _report_native()
-    if indices_are_blocks:
-        valid = logical_indices >= 0
-        groups = valid.sum(-1, dtype=torch.int32)
-        ids = torch.where(valid, logical_indices, 16777215)
+    if (
+        indices_are_blocks
+        and logical_indices.device.type == "npu"
+        and logical_indices.dtype == torch.int32
+        and logical_indices.is_contiguous()
+        and logical_indices.shape[0] > 0
+        and os.getenv("SGLANG_NPU_QSA_GBSA_SORT_COUNTS", "0") == "1"
+    ):
+        from .qsa_gbsa_sort_counts import sort_count_groups
+
+        ids, counts = sort_count_groups(logical_indices)
     else:
-        groups = (logical_indices >= 0).sum(-1, dtype=torch.int32) // 4
-        ranks = torch.arange(512, device=q.device)
-        block_ids = logical_indices[:, :2048:4] // 4
-        ids = torch.where(ranks[None] < groups[:, None], block_ids, 16777215)
-    # Keep the original order of attention's reduction. Removing this sort is
-    # a separate numerical/performance experiment, not needed for compact input.
-    ids = ids.float().sort(-1).values.int().unsqueeze(0)
-    counts = groups[None]
+        if indices_are_blocks:
+            valid = logical_indices >= 0
+            groups = valid.sum(-1, dtype=torch.int32)
+            ids = torch.where(valid, logical_indices, 16777215)
+        else:
+            groups = (logical_indices >= 0).sum(-1, dtype=torch.int32) // 4
+            ranks = torch.arange(512, device=q.device)
+            block_ids = logical_indices[:, :2048:4] // 4
+            ids = torch.where(ranks[None] < groups[:, None], block_ids, 16777215)
+        # Keep the original order of attention's reduction. Removing this sort is
+        # a separate numerical/performance experiment, not needed for compact input.
+        ids = ids.float().sort(-1).values.int().unsqueeze(0)
+        counts = groups[None]
     table = (
         (token_table[:, ::128] // 128).to(torch.int32).contiguous()
         if page_table is None else page_table.to(torch.int32).contiguous()
