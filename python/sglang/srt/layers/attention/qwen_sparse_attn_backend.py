@@ -2557,8 +2557,12 @@ class QwenSparseMultiStepDraftBackend:
 
         num_padding = getattr(forward_batch, "num_padding", None)
         num_padding = num_padding if num_padding is not None else 0
-        # The NPU compiler does not accept the fused kernel's nested tuple.
-        if not _is_npu and forward_batch.seq_lens.is_cuda and self.attn_backends:
+        use_fused_draft_metadata = (
+            forward_batch.seq_lens.device.type == "npu"
+            and _is_npu
+            and os.getenv("SGLANG_NPU_QSA_MULTISTEP_METADATA", "0") == "1"
+        ) or (not _is_npu and forward_batch.seq_lens.is_cuda)
+        if use_fused_draft_metadata and self.attn_backends:
             from sglang.srt.layers.attention.qsa.graph_metadata import (
                 launch_draft_graph_metadata,
                 prepare_draft_graph_metadata,
