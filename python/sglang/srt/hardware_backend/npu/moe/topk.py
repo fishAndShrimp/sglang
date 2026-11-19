@@ -1,3 +1,4 @@
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -52,11 +53,26 @@ def fused_topk_npu(
 
     # Fast path: simple top-k without grouped routing and bias
     elif not use_grouped_topk and correction_bias is None:
-        topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
-            router_logits,
-            k=topk_config.top_k,
-        )
-
+        if (
+            os.getenv("SGLANG_NPU_MOE_VA_TOPK", "0") == "1"
+            and router_logits.dtype == torch.bfloat16
+            and router_logits.shape[-1] == 512
+            and 0 < router_logits.shape[0] <= 16
+            and topk_config.top_k == 10
+            and renormalize
+            and topk_config.scoring_func == "softmax"
+            and topk_config.num_shared_topk_slots == 0
+            and not topk_config.apply_routed_scaling_factor_on_output
+        ):
+            # Preserve the BF16 selected softmax weights before SG's FP32 L1.
+            topk_weights, topk_ids, _ = moe_gating_top_k(
+                x=router_logits, k=topk_config.top_k, group_select_mode=1,
+                renorm=0, norm_type=0,
+            )
+        else:
+            topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
+                router_logits, k=topk_config.top_k,
+            )
         if renormalize:
             from sgl_kernel_npu.norm.l1_norm import l1_norm
 
@@ -144,11 +160,15 @@ def _finalize_topk_npu(
     # NPU dispatch retains valid IDs; duplicating a padded row's routes onto
     # expert zero can exceed per-expert capacity in fused dispatch backends.
     _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
+    recorder = get_global_expert_distribution_recorder()
     recorder_ids = routed_ids
-    if num_token_non_padded is not None:
+    if num_token_non_padded is not None and (
+        os.getenv("SGLANG_NPU_MOE_SKIP_NOOP_IDS", "0") != "1"
+        or getattr(recorder, "needs_padded_expert_ids", True)
+    ):
         rows = torch.arange(topk_ids.shape[0], device=topk_ids.device)
         recorder_ids = routed_ids.masked_fill(
             (rows >= num_token_non_padded)[:, None], -1
         )
-    get_global_expert_distribution_recorder().on_select_experts(topk_ids=recorder_ids)
+    recorder.on_select_experts(topk_ids=recorder_ids)
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
