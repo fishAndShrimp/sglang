@@ -211,6 +211,7 @@ class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
     # This field references the live request-pool table used by graph fallback
     # instead of the placeholder. Updates must preserve its storage for replay.
     req_to_token: Optional[torch.Tensor] = None
+    npu_prefill_inputs: Optional[object] = None
 
 
 class QSAMTPSharedSparseIndices:
@@ -868,6 +869,35 @@ class QwenSparseAttnBackend(AttentionBackend):
             token_slot_table=token_slot_table,
             indexer_metadata=indexer_metadata,
             row_req_pool_indices=row_req_pool_indices,
+            npu_prefill_inputs=self._make_npu_prefill_inputs(
+                forward_batch, sequence_lengths, token_slot_table,
+                token_to_batch_idx.numel(),
+            ),
+        )
+
+    def _make_npu_prefill_inputs(self, batch, lengths, token_table, rows):
+        if not (
+            _is_npu
+            and os.getenv("SGLANG_NPU_QSA_VA_PREFILL_DISPATCH", "0") == "1"
+            and batch.forward_mode == ForwardMode.EXTEND
+            and self._can_defer_prefill_block_expansion(batch.forward_mode)
+            and getattr(batch, "attn_cp_metadata", None) is None
+            and batch.seq_lens_cpu is not None
+            and batch.extend_seq_lens_cpu is not None
+            and rows >= 128
+        ):
+            return None
+        from sglang.kernels.ops.attention.qsa_prefill_dispatch_va import (
+            prepare_sg_prefill_inputs,
+        )
+
+        positions = batch.positions
+        positions = positions[0] if positions.ndim == 2 else positions
+        return prepare_sg_prefill_inputs(
+            batch.seq_lens_cpu[: lengths.numel()],
+            batch.extend_seq_lens_cpu[: lengths.numel()],
+            lengths, batch.extend_seq_lens, token_table,
+            positions.flatten()[:rows],
         )
 
     def init_forward_metadata(self, forward_batch):
@@ -1781,6 +1811,18 @@ class QwenSparseAttnBackend(AttentionBackend):
             ):
                 from sglang.kernels.ops.attention.qsa_gbsa_prefill import qsa_gbsa_prefill
 
+                if metadata.npu_prefill_inputs is not None and self._uses_block_indices(topk_indices):
+                    from sglang.kernels.ops.attention.qsa_prefill_dispatch_va import (
+                        dispatch_sg_prefill,
+                    )
+
+                    output = dispatch_sg_prefill(
+                        q, k, v,
+                        _flatten_qsa_kv_cache(pool.layer_router.read(layer.layer_id).key(), "key"),
+                        _flatten_qsa_kv_cache(pool.layer_router.read(layer.layer_id).value(), "value"),
+                        topk_indices, metadata.npu_prefill_inputs, layer.scaling,
+                    )
+                    return self._pad_extend_output(output, num_output_rows)
                 # Keep original sequence boundaries: GBSA computes all selected
                 # complete groups plus the causal incomplete tail (mode 1).
                 output = qsa_gbsa_prefill(
