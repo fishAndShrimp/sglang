@@ -843,7 +843,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     ) -> torch.Tensor:
         contexts = contexts.to(torch.long)
         if (self.enable_ple_fusion and decode_sized) or (
-            _is_npu and os.getenv("SGLANG_NPU_PLE_NGRAM_HASH", "0") == "1"
+            _is_npu
+            and os.getenv("SGLANG_NPU_PLE_NGRAM_HASH", "0") == "1"
+            and contexts.shape[0] <= 512
         ):
             from sglang.kernels.ops.embeddings.qwen4_ngram import (
                 can_fuse_qwen4_ngram_hash,
@@ -1551,14 +1553,20 @@ class Qwen4ExpPLELayer(nn.Module):
         if (
             _is_npu
             and os.getenv("SGLANG_NPU_PLE_VA_GATE", "0") == "1"
+            and (token_count <= 512 or os.getenv("SGLANG_NPU_PLE_GROUPED_NORM", "0") != "1")
             and (hc_count, hidden_size) == (4, 2560)
             and hidden_states.is_contiguous()
+            and key.shape == hidden_states.shape
+            and value.shape == (token_count, hidden_size)
+            and key.device == value.device == hidden_states.device
             and key.stride(1) == value.stride(1) == 1
             and key.dtype == value.dtype == hidden_states.dtype == torch.bfloat16
             and all(
                 norm.group_size == hidden_size
                 and norm.eps == self.norm_key.eps
                 and norm.weight.is_contiguous()
+                and norm.weight.device == key.device
+                and norm.weight.dtype == key.dtype
                 and norm.weight.numel() == hc_count * hidden_size
                 for norm in (self.norm_key, self.norm_query, self.norm_conv)
             )

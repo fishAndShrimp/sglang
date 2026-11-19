@@ -67,15 +67,18 @@ def can_fuse_qwen4_ngram_hash(
     """Return whether inputs match the fixed Qwen4 PLE hash contract."""
 
     return (
-        (contexts.is_cuda or (
-            contexts.device.type == "npu"
-            and os.getenv("SGLANG_NPU_PLE_NGRAM_HASH", "0") == "1"
-            and all(t.is_contiguous() for t in (multipliers, vocab_sizes, offsets))
-        ))
+        (
+            contexts.is_cuda
+            or (
+                contexts.device.type == "npu"
+                and os.getenv("SGLANG_NPU_PLE_NGRAM_HASH", "0") == "1"
+            )
+        )
         and contexts.dtype == torch.long
         and contexts.dim() == 2
         and contexts.shape[1] == _QWEN4_NGRAM_SIZE
         and contexts.is_contiguous()
+        and all(t.is_contiguous() for t in (multipliers, vocab_sizes, offsets))
         and multipliers.device == contexts.device
         and multipliers.dtype == torch.long
         and multipliers.numel() == _QWEN4_NGRAM_SIZE

@@ -7,6 +7,17 @@ import triton.language as tl
 
 
 @triton.jit
+def _round_bf16_scalar(x):
+    # arch22 can fold an in-register BF16-to-FP32 round trip for a scalar.
+    # Retain the same nearest-even BF16 value as SG's tensor intermediates.
+    bits = x.to(tl.uint32, bitcast=True)
+    rounded = (bits + 0x7FFF + ((bits >> 16) & 1)) & 0xFFFF0000
+    is_nan = (bits & 0x7FFFFFFF) > 0x7F800000
+    rounded = tl.where(is_nan, (bits & 0xFFFF0000) | 0x00400000, rounded)
+    return rounded.to(tl.float32, bitcast=True)
+
+
+@triton.jit
 def _ple_gate_kernel(
     key_ptr,  # [T, HC*H] with row stride key_rs
     value_ptr,  # [T, H] with row stride value_rs
@@ -39,14 +50,14 @@ def _ple_gate_kernel(
     k_n = (k * tl.rsqrt(tl.sum(k * k) / H + eps) * (1.0 + nk)).to(dtype)
     q_n = (q * tl.rsqrt(tl.sum(q * q) / H + eps) * (1.0 + nq)).to(dtype)
     products = (k_n.to(tl.float32) * q_n.to(tl.float32)).to(dtype)
-    dot = tl.sum(products.to(tl.float32)).to(dtype).to(tl.float32)
+    dot = _round_bf16_scalar(tl.sum(products.to(tl.float32)))
     d = dot / tl.sqrt(float(H))
-    d = d.to(dtype).to(tl.float32)
+    d = _round_bf16_scalar(d)
     sign = tl.where(d < 0, -1.0, 0.0)
     sign = tl.where(d > 0, 1.0, sign)
-    magnitude = tl.sqrt(tl.maximum(tl.abs(d), 1e-6)).to(dtype)
+    magnitude = _round_bf16_scalar(tl.sqrt(tl.maximum(tl.abs(d), 1e-6)))
     g = tl.sigmoid(sign * magnitude)
-    g = g.to(dtype).to(tl.float32)
+    g = _round_bf16_scalar(g)
 
     v = tl.load(value_ptr + t * value_rs + lanes, mask=mask, other=0.0).to(tl.float32)
     gated = (g * v).to(dtype)
@@ -74,8 +85,8 @@ def ple_gate(
     assert hidden.is_contiguous()
     if key.dtype != value.dtype or key.dtype != hidden.dtype:
         raise ValueError("key, value, and hidden must have the same dtype")
-    if key.dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError("PLE gate supports BF16 and FP16 inputs")
+    if key.dtype != torch.bfloat16:
+        raise ValueError("PLE gate expects BF16 inputs")
     gated = torch.empty_like(hidden)
     normed = torch.empty_like(hidden)
     if num_tokens == 0:
