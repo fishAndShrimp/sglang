@@ -40,6 +40,7 @@ from sglang.srt.utils import is_npu
 _is_npu = is_npu()
 _use_va_norm_rope = _is_npu and os.getenv("SGLANG_NPU_QSA_VA_NORM_ROPE", "0") == "1"
 _use_va_compress = _is_npu and os.getenv("SGLANG_NPU_QSA_VA_COMPRESS", "0") == "1"
+_use_va_raw_store = _is_npu and os.getenv("SGLANG_NPU_QSA_VA_RAW_STORE", "0") == "1"
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
@@ -324,12 +325,29 @@ class QSAIndexer(MultiPlatformOp):
                 state_slots = self._pending_ring_slots(
                     metadata, logical_positions, is_extend
                 )
-            pool.set_qsa_key_state_buffer(
-                self.layer_id, state_slots[: token_k.shape[0]], token_k
-            )
-            pool.set_qsa_rope_position_buffer(
-                state_slots[: token_k.shape[0]], rope_positions
-            )
+            slots = state_slots[:token_k.shape[0]]
+            if (
+                _use_va_raw_store
+                and getattr(metadata, "npu_unique_live_ring_writes", False)
+                and token_k.device.type == "npu"
+                and token_k.dtype == pool.index_state_dtype == torch.bfloat16
+                and token_k.shape[1:] == (1, 128)
+                and slots.numel() == token_k.shape[0]
+                and slots.is_contiguous()
+                and pool.qsa_rope_position_buffer.dtype == torch.int64
+            ):
+                from sglang.kernels.ops.attention.qsa_state_va import qsa_store_cache_rows
+
+                raw = pool.get_qsa_key_state_buffer(self.layer_id)
+                rope = pool.qsa_rope_position_buffer
+                qsa_store_cache_rows(raw.view(raw.shape[0], 1, 1, 128), slots, token_k)
+                qsa_store_cache_rows(
+                    rope.view(rope.shape[0], 1, 1, 3), slots,
+                    build_rope_position_matrix(rope_positions, token_k.shape[0]),
+                )
+            else:
+                pool.set_qsa_key_state_buffer(self.layer_id, slots, token_k)
+                pool.set_qsa_rope_position_buffer(slots, rope_positions)
 
         if metadata.is_cuda_graph:
             self._compress_decode_cuda_graph(metadata)

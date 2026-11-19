@@ -30,6 +30,8 @@ def qsa_gbsa_prefill(
     softmax_scale=None,
     *,
     indices_are_blocks=False,
+    page_table=None,
+    cu_seqlens_q=None,
 ):
     from cann_ops_transformer.ops.attention.generic_block_sparse_attention import (
         generic_block_sparse_attention, generic_block_sparse_attention_metadata,
@@ -38,7 +40,7 @@ def qsa_gbsa_prefill(
     assert k.shape == v.shape and k.shape[0] % 128 == 0
     assert q.dtype == k.dtype == v.dtype == torch.bfloat16
     assert logical_indices.shape == (q.shape[0], 512 if indices_are_blocks else 2051)
-    assert token_table.shape[1] < 2**24
+    assert token_table is None or token_table.shape[1] < 2**24
     _report_native()
     if indices_are_blocks:
         valid = logical_indices >= 0
@@ -53,8 +55,15 @@ def qsa_gbsa_prefill(
     # a separate numerical/performance experiment, not needed for compact input.
     ids = ids.float().sort(-1).values.int().unsqueeze(0)
     counts = groups[None]
-    table = (token_table[:, ::128] // 128).to(torch.int32).contiguous()
-    cu_q = torch.cat([torch.zeros(1, dtype=torch.int64, device=q.device), extend_lens.to(torch.int64).cumsum(0)])
+    table = (
+        (token_table[:, ::128] // 128).to(torch.int32).contiguous()
+        if page_table is None else page_table.to(torch.int32).contiguous()
+    )
+    cu_q = (
+        torch.cat([torch.zeros(1, dtype=torch.int64, device=q.device), extend_lens.to(torch.int64).cumsum(0)])
+        if cu_seqlens_q is None else cu_seqlens_q
+    )
+    assert cu_q.dtype == torch.int64
     options = dict(cu_seqlens_q=cu_q, seqused_kv=seq_lens.to(torch.int32).contiguous(),
                    layout_q='TND', layout_kv='PA_BBND', layout_sparse_pattern=4,
                    mask_mode=1, quant_mode=0, softmax_precision=0,

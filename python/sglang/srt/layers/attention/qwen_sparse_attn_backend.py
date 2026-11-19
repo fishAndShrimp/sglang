@@ -1071,6 +1071,21 @@ class QwenSparseAttnBackend(AttentionBackend):
                 forward_mode, spec_info, metadata_rows,
                 self._graph_compressed_page_table.shape[1],
             ),
+            npu_gbsa_cu_q=(
+                self._graph_cu_seqlens_q[:metadata_rows + 1].to(torch.int64)
+                if _is_npu and os.getenv("SGLANG_NPU_QSA_PAGED_GBSA", "0") == "1"
+                else None
+            ),
+            npu_unique_live_ring_writes=(
+                self._npu_device_metadata_enabled(pool)
+                and pool.qsa_compress_ratio == 4
+                and (
+                    forward_mode.is_decode()
+                    or 1 <= int(get_spec().speculative_num_draft_tokens or 0) <= 4
+                )
+                and (not forward_mode.is_target_verify()
+                     or 1 <= int(spec_info.draft_token_num) <= 4)
+            ),
         )
         metadata = QwenSparseAttnMetadata(
             sequence_lengths=self._graph_seq_lens[:metadata_rows],
@@ -1086,7 +1101,23 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         self._cuda_graph_metadata[(forward_mode, bs)] = metadata
         self.forward_metadata = metadata
-        self._refresh_npu_lightning_inputs(indexer_metadata)
+        if self._npu_device_metadata_enabled(pool):
+            # Warmup/capture must use the same reserved-slot padding contract
+            # as replay, before any captured raw writer observes these buffers.
+            self._replay_cuda_graph_metadata_gpu(
+                metadata, bs=bs, req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens, forward_mode=forward_mode,
+                spec_info=spec_info, seq_lens_cpu=None, num_padding=bs,
+            )
+        else:
+            self._refresh_npu_lightning_inputs(indexer_metadata)
+
+    def _npu_device_metadata_enabled(self, pool):
+        if not (_is_npu and os.getenv("SGLANG_NPU_QSA_DEVICE_METADATA", "0") == "1"):
+            return False
+        from sglang.srt.layers.attention.qsa.graph_metadata import supports_graph_metadata_kernels
+
+        return supports_graph_metadata_kernels(pool, self.device)
 
     def _make_npu_verify_lightning_inputs(self, forward_mode, spec_info, rows, pages):
         profile = self.qsa_profile
@@ -1181,8 +1212,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         self.forward_metadata = metadata
 
     def _can_replay_with_gpu_kernels(self, metadata, seq_lens) -> bool:
-        # Guard NPU before the import, which precedes the is_cuda check below.
-        if _is_npu:
+        if _is_npu and not self._npu_device_metadata_enabled(metadata.indexer_metadata.token_to_kv_pool):
             return False
         if self.req_to_token is None:
             return False
@@ -2216,6 +2246,12 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             if compact and positions is None:
                 raise RuntimeError("Compact QSA paged indices require logical positions")
+            if compact:
+                output = self._try_npu_paged_gbsa(
+                    q, k_buffer, v_buffer, metadata, topk_indices, layer.scaling
+                )
+                if output is not None:
+                    return output.reshape(q.shape[0], -1)
             slots = self._npu_indices_to_physical(topk_indices, metadata, positions)
             output = _npu_sparse_attention(q, k_buffer, v_buffer, slots, layer.scaling)
             return output.reshape(q.shape[0], -1)
@@ -2320,6 +2356,41 @@ class QwenSparseAttnBackend(AttentionBackend):
             causal=True,
         )
         return output.reshape(q.shape[0], -1)
+
+    def _try_npu_paged_gbsa(self, q, k, v, metadata, groups, scale):
+        if not (
+            os.getenv("SGLANG_NPU_QSA_PAGED_GBSA", "0") == "1"
+            and q.shape[0] > 0
+            and q.shape[1:] == (3, 256)
+            and q.dtype == k.dtype == v.dtype == torch.bfloat16
+            and groups.shape == (q.shape[0], 512)
+            and self.compress_ratio == 4
+            and self.token_to_kv_pool.qsa_compressed_page_size == 32
+        ):
+            return None
+        indexer = metadata.indexer_metadata
+        pages = indexer.graph_compressed_page_table if metadata.is_cuda_graph else indexer.decode_page_table
+        if pages is None:
+            return None
+        if metadata.is_cuda_graph:
+            # Captured paged metadata is already expanded to query rows.
+            if pages.shape[0] != q.shape[0] or metadata.sequence_lengths.shape != (q.shape[0],):
+                return None
+            lengths = metadata.sequence_lengths
+        else:
+            rows = metadata.token_to_batch_idx.long()
+            pages = pages.index_select(0, rows)
+            lengths = metadata.sequence_lengths.index_select(0, rows)
+        cu_q = indexer.npu_gbsa_cu_q
+        if cu_q is None:
+            cu_q = torch.arange(q.shape[0] + 1, dtype=torch.int64, device=q.device)
+        from sglang.kernels.ops.attention.qsa_gbsa_prefill import qsa_gbsa_prefill
+
+        return qsa_gbsa_prefill(
+            q, _flatten_qsa_kv_cache(k, "key"), _flatten_qsa_kv_cache(v, "value"),
+            groups, None, lengths, None, 1, scale,
+            indices_are_blocks=True, page_table=pages, cu_seqlens_q=cu_q,
+        )
 
 
 class QwenSparseMultiStepDraftBackend:
