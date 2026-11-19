@@ -170,13 +170,12 @@ def supports_qsa_norm_rope_va(tensor, positions, weight, rotary):
     )
 
 
-def qsa_norm_rope_va(tensor, positions, weight, eps, rotary, *, triton_positions=False,
-                     selected_cache=True):
-    """Adapt the reused VA operation while preserving SGLang's shared RoPE state.
+def qsa_norm_rope_va(tensor, positions, weight, eps, rotary):
+    """Use VA's local RoPE view without overwriting main-attention positions.
 
-    Read the position cache once. Publish exactly the existing position_cos/sin
-    values and dtype: later attention layers share this rotary object. The
-    optional publication helper is also an existing SGLang Triton operation.
+    QSA compressed keys have different positions from the main token queries.
+    The rotary module is shared across layers; later main QKV prepare calls
+    reuse its position_cos/sin fields. The indexer must not replace them.
     """
     if tensor.numel() == 0:
         return tensor
@@ -185,27 +184,7 @@ def qsa_norm_rope_va(tensor, positions, weight, eps, rotary, *, triton_positions
         cos_sin = rotary.cos_sin_cache.index_select(0, positions)
     else:
         cos_sin = rotary.cos_sin_cache[positions]
-    cos, sin = cos_sin.chunk(2, dim=-1)
-    if positions.ndim == 2:
-        if triton_positions:
-            from sglang.kernels.ops.attention.mrope import apply_interleaved_rope_triton
-
-            cos = apply_interleaved_rope_triton(cos, rotary.mrope_section)
-            sin = apply_interleaved_rope_triton(sin, rotary.mrope_section)
-        else:
-            from sglang.srt.layers.rotary_embedding.mrope import apply_interleaved_rope
-
-            cos = apply_interleaved_rope(cos, rotary.mrope_section)
-            sin = apply_interleaved_rope(sin, rotary.mrope_section)
-    rotary.position_cos = cos.repeat(1, 2).view(-1, 1, 1, 64).contiguous()
-    rotary.position_sin = sin.repeat(1, 2).view(-1, 1, 1, 64).contiguous()
-    if positions.ndim == 2 and selected_cache:
-        # Shared publication already selected the position axis for each pair.
-        # Feed the same selected pairs to VA's existing 1-axis entry instead of
-        # repeating the three-axis selection inside that operation.
-        cos_sin = torch.cat((cos, sin), dim=-1)
-    # Native apply_rotary_emb rounds the cache to the tensor dtype before
-    # multiplication. Retain that boundary even if the shared cache is FP32.
+    # Keep native apply_rotary_emb's cache-to-input dtype boundary.
     return triton_qsa_rmsnorm_mrope(
         tensor, weight, cos_sin.to(tensor.dtype), eps,
         list(getattr(rotary, "mrope_section", []) or []), rotary.rotary_dim,

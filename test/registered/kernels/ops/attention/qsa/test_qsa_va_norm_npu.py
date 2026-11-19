@@ -1,6 +1,7 @@
 """Reused VA prep through real QSAIndexer methods, checked against retained Q04."""
 
 import ast
+import copy
 import json
 import os
 import textwrap
@@ -40,9 +41,10 @@ def legacy_methods():
     root = Path(os.environ["RUN_ROOT"])
     source = (root / "framework_q01_q03_q04/python/sglang/srt/layers/attention/qsa/qsa_indexer.py").read_text()
     cls = next(n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name == "QSAIndexer")
-    ns = {"torch": torch}
+    from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
+    ns = {"torch": torch, "apply_rotary_emb": apply_rotary_emb}
     for node in cls.body:
-        if isinstance(node, ast.FunctionDef) and node.name in ("project_qk", "normalize_compressed_keys"):
+        if isinstance(node, ast.FunctionDef) and node.name in ("project_qk", "normalize_compressed_keys", "apply_rope"):
             exec("from __future__ import annotations\n" + textwrap.dedent(ast.get_source_segment(source, node)), ns)
     return ns
 
@@ -88,17 +90,26 @@ def test_real_methods_weights_and_graph(rows, axes, cache_dtype):
     assert module._use_va_norm_rope
     c = make_case(rows, axes, cache_dtype)
     old = legacy_methods()
+    reference = copy.copy(c.obj)
+    reference.rotary_emb = copy.deepcopy(c.obj.rotary_emb)
+    reference.rotary_emb.cos_sin_cache = c.obj.rotary_emb.cos_sin_cache
+    reference.apply_rope = MethodType(old["apply_rope"], reference)
 
     def native():
-        q, k, stored = old["project_qk"](c.obj, None, c.positions, pool=c.pool)
+        q, k, stored = old["project_qk"](reference, None, c.positions, pool=c.pool)
         assert not stored
-        compressed = old["normalize_compressed_keys"](c.obj, c.keys, c.key_positions)
+        compressed = old["normalize_compressed_keys"](reference, c.keys, c.key_positions)
         return q, k, compressed
 
     def candidate():
+        c.obj.rotary_emb.get_cos_sin_with_position(c.positions)
+        before = (c.obj.rotary_emb.position_cos, c.obj.rotary_emb.position_sin)
         q, k, stored = c.obj.project_qk(None, c.positions, pool=c.pool)
         assert not stored
-        return q, k, c.obj.normalize_compressed_keys(c.keys, c.key_positions)
+        compressed = c.obj.normalize_compressed_keys(c.keys, c.key_positions)
+        assert c.obj.rotary_emb.position_cos is before[0]
+        assert c.obj.rotary_emb.position_sin is before[1]
+        return q, k, compressed
 
     graphs, outputs, shared = {}, {}, {}
     with torch.no_grad():
@@ -125,7 +136,9 @@ def test_real_methods_weights_and_graph(rows, axes, cache_dtype):
             torch.npu.synchronize()
             for i, (a, b) in enumerate(zip(outputs["va"], outputs["native"])):
                 torch.testing.assert_close(a, b, atol=0 if i == 1 else 0.02, rtol=0 if i == 1 else 0.02)
-            for a, b in zip(shared["va"], shared["native"]):
+            reference.rotary_emb.get_cos_sin_with_position(c.positions)
+            expected_main = (reference.rotary_emb.position_cos, reference.rotary_emb.position_sin)
+            for a, b in zip(shared["va"], expected_main):
                 torch.testing.assert_close(a, b, atol=0, rtol=0)
                 assert a.dtype == b.dtype == cache_dtype
 

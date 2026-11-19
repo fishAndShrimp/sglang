@@ -39,6 +39,7 @@ from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
 _use_va_norm_rope = _is_npu and os.getenv("SGLANG_NPU_QSA_VA_NORM_ROPE", "0") == "1"
+_use_va_compress = _is_npu and os.getenv("SGLANG_NPU_QSA_VA_COMPRESS", "0") == "1"
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
@@ -237,7 +238,7 @@ class QSAIndexer(MultiPlatformOp):
             if supports_qsa_norm_rope_va(tensor, positions, norm.weight, self.rotary_emb):
                 return qsa_norm_rope_va(
                     tensor, positions, norm.weight, norm.variance_epsilon,
-                    self.rotary_emb, triton_positions=True, selected_cache=False,
+                    self.rotary_emb,
                 )
         normalized = norm(tensor.reshape(-1, self.index_head_dim)).reshape_as(tensor)
         return self.apply_rope(positions, normalized)
@@ -378,13 +379,12 @@ class QSAIndexer(MultiPlatformOp):
                 source_rope=source_rope,
             )
             return
-        key_groups = source_keys[group_locs]
-        pooled = average_pool_qsa_keys(key_groups)
-        compressed_rope_positions = self._rope_from_matrix(
-            source_rope[group_locs[:, 0]]
+        pooled, first_positions = self._pool_group_keys(
+            source_keys, source_rope, group_locs
         )
+        compressed_rope_positions = self._rope_from_matrix(first_positions)
         normalized = self.normalize_compressed_keys(pooled, compressed_rope_positions)
-        pool.set_qsa_compressed_k_buffer(self.layer_id, compressed_locs, normalized)
+        self._store_compressed_keys(pool, compressed_locs, normalized)
 
     def _compress_decode_cuda_graph(self, metadata) -> None:
         """Fixed-shape graph-replay compression; non-boundary rows write slot 0."""
@@ -400,17 +400,63 @@ class QSAIndexer(MultiPlatformOp):
                 metadata.graph_write_locs,
             )
             return
-        key_groups = pool.get_qsa_key_state_buffer(self.layer_id)[group_locs]
-        compressed = average_pool_qsa_keys(key_groups)
-        compressed_rope_positions = self._rope_from_matrix(
-            pool.qsa_rope_position_buffer[group_locs[:, 0]]
+        compressed, first_positions = self._pool_group_keys(
+            pool.get_qsa_key_state_buffer(self.layer_id),
+            pool.qsa_rope_position_buffer,
+            group_locs,
         )
+        compressed_rope_positions = self._rope_from_matrix(first_positions)
         compressed = self.normalize_compressed_keys(
             compressed, compressed_rope_positions
         )
-        pool.set_qsa_compressed_k_buffer(
-            self.layer_id, metadata.graph_write_locs, compressed.contiguous()
+        self._store_compressed_keys(
+            pool, metadata.graph_write_locs, compressed.contiguous()
         )
+
+    def _pool_group_keys(self, source_keys, source_rope, group_locs):
+        if (
+            _use_va_compress
+            and source_keys.device.type == "npu"
+            and source_keys.dtype == torch.bfloat16
+            and source_keys.ndim == 3
+            and source_keys.shape[1:] == (1, 128)
+            and group_locs.ndim == 2
+            and group_locs.shape[1] == 4
+            and group_locs.dtype in (torch.int32, torch.int64)
+            and source_rope.shape == (source_keys.shape[0], 3)
+            and source_rope.dtype == torch.int64
+        ):
+            from sglang.kernels.ops.attention.qsa_state_va import compress_sg_group_slots
+
+            return compress_sg_group_slots(source_keys, source_rope, group_locs)
+        return (
+            average_pool_qsa_keys(source_keys[group_locs]),
+            source_rope[group_locs[:, 0]],
+        )
+
+    def _store_compressed_keys(self, pool, locations, compressed):
+        if (
+            _use_va_compress
+            and compressed.device.type == "npu"
+            and compressed.dtype == torch.bfloat16
+            and pool.qsa_compressed_dtype == torch.bfloat16
+            and compressed.ndim == 3
+            and compressed.shape[1:] == (1, 128)
+            and locations.ndim == 1
+            and locations.is_contiguous()
+            and locations.dtype in (torch.int32, torch.int64)
+        ):
+            from sglang.kernels.ops.attention.qsa_state_va import qsa_store_cache_rows
+
+            buffer = pool.get_qsa_compressed_k_buffer(self.layer_id)
+            # Existing compression plans write each live slot once; only the
+            # reserved compressed slot0 repeats. Do not reuse this for the raw
+            # ring writer: speculative padding can alias a live ring slot.
+            qsa_store_cache_rows(
+                buffer.view(buffer.shape[0], 1, 1, 128), locations, compressed
+            )
+            return
+        pool.set_qsa_compressed_k_buffer(self.layer_id, locations, compressed)
 
     def _rope_from_matrix(self, positions: torch.Tensor) -> torch.Tensor:
         """[n, 3] slot coordinates -> the layout apply_rope expects."""
@@ -432,17 +478,22 @@ class QSAIndexer(MultiPlatformOp):
         )
         if num_positions != tensor.shape[0]:
             raise ValueError("QSA RoPE positions must match the token dimension")
-        # position_cos/position_sin repeat cos/sin to the full rotary width;
-        # apply_rotary_emb consumes one half.
-        self.rotary_emb.get_cos_sin_with_position(positions)
+        # Keep indexer positions local. This rotary module is also read by
+        # later main-attention layers, which reuse the first layer's token
+        # position_cos/sin. Compressed-group positions must not replace them.
+        cos_sin = self.rotary_emb.cos_sin_cache[positions]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        if positions.ndim == 2:
+            section = self.rotary_emb.mrope_section
+            if self.rotary_emb.mrope_interleaved:
+                from sglang.srt.layers.rotary_embedding.mrope import apply_interleaved_rope
+
+                cos = apply_interleaved_rope(cos, section)
+                sin = apply_interleaved_rope(sin, section)
+            else:
+                cos = torch.cat([part[i] for i, part in enumerate(cos.split(section, dim=-1))], dim=-1)
+                sin = torch.cat([part[i] for i, part in enumerate(sin.split(section, dim=-1))], dim=-1)
         rotary_dim = self.rotary_emb.rotary_dim
-        half_rotary_dim = rotary_dim // 2
-        cos = self.rotary_emb.position_cos.reshape(num_positions, -1)[
-            :, :half_rotary_dim
-        ]
-        sin = self.rotary_emb.position_sin.reshape(num_positions, -1)[
-            :, :half_rotary_dim
-        ]
         rotated = apply_rotary_emb(
             tensor[..., :rotary_dim],
             cos,
