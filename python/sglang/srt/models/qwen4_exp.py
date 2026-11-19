@@ -729,6 +729,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 ),
                 output_dtype=torch.bfloat16,
                 use_attn_tp_group=self.use_attn_tp_ngram,
+                use_npu_ple_lookup=(
+                    _is_npu and not offload_embedding
+                    and os.getenv("SGLANG_NPU_PLE_HBM_LOOKUP", "0") == "1"
+                ),
             )
         # weight_scale stays a real device tensor.
         ngram_embedding.register_buffer(
