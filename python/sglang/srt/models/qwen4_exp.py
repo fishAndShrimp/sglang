@@ -1582,10 +1582,11 @@ class Qwen4ExpPLELayer(nn.Module):
         self._prefetch_state = None
         return embeddings
 
-    def _gate_values(self, key, value, hidden_states, batch):
+    def _gate_values(self, key, value, hidden_states, batch, *, full_token_count=None):
         token_count = hidden_states.shape[0]
         hidden_size = self.hidden_size
         hc_count = self.hc_count
+        gate_rows = token_count if full_token_count is None else full_token_count
         if hidden_states.shape[-1] != hc_count * hidden_size:
             raise RuntimeError(
                 "PLE hidden size does not match its hyper-connection layout: "
@@ -1594,7 +1595,7 @@ class Qwen4ExpPLELayer(nn.Module):
         if (
             _is_npu
             and os.getenv("SGLANG_NPU_PLE_VA_GATE", "0") == "1"
-            and (token_count <= 512 or os.getenv("SGLANG_NPU_PLE_GROUPED_NORM", "0") != "1")
+            and (gate_rows <= 512 or os.getenv("SGLANG_NPU_PLE_GROUPED_NORM", "0") != "1")
             and (hc_count, hidden_size) == (4, 2560)
             and hidden_states.is_contiguous()
             and key.shape == hidden_states.shape
@@ -1654,6 +1655,43 @@ class Qwen4ExpPLELayer(nn.Module):
         gated_value_normed = self._apply_ple_norm(self.norm_conv, gated_value)
         return gated_value.flatten(-2), gated_value_normed.flatten(-2)
 
+    def _can_shard_gate_rows(self, batch, sp_active):
+        if not _is_npu or os.getenv("SGLANG_NPU_PLE_SHARD_GATE_ROWS", "0") != "1":
+            return False
+        if batch.mode != ForwardMode.EXTEND or batch.processed_tokens != 4096:
+            return False
+        table = self.ple_embedding.ngram_embedding
+        return (
+            not sp_active
+            and not is_dp_attention_enabled()
+            and not get_attn_tp_context().input_scattered
+            and (self.hc_count, self.hidden_size) == (4, 2560)
+            and isinstance(table, VocabParallelEmbedding)
+            and table.use_npu_ple_lookup
+            and not table.use_attn_tp_group
+            and table.tp_size == get_parallel().tp_group.world_size == 8
+            and table.weight.dtype == torch.bfloat16
+            and os.getenv("SGLANG_NPU_PLE_GROUPED_NORM", "0") == "1"
+        )
+
+    def _sharded_gate_values(self, key, value, hidden_states, batch, group):
+        # The full-size projections preserve the BF16 checkpoint path's rounding.
+        # Their token-local outputs can be sharded before the gate and three norms.
+        gated, conv_input = self._gate_values(
+            layernorm_sp.shard_token_rows(key, group=group),
+            layernorm_sp.shard_token_rows(value, group=group),
+            layernorm_sp.shard_token_rows(hidden_states, group=group),
+            batch,
+            full_token_count=batch.processed_tokens,
+        )
+        joined = layernorm_sp.all_gather_token_rows(
+            torch.cat((gated, conv_input), dim=-1),
+            total_rows=batch.processed_tokens,
+            group=group,
+        )
+        gated, conv_input = joined.chunk(2, dim=-1)
+        return gated, conv_input.contiguous()
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1674,9 +1712,14 @@ class Qwen4ExpPLELayer(nn.Module):
             )
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
-        gated_value, gated_value_normed = self._gate_values(
-            key, value, hidden_states, batch
-        )
+        if self._can_shard_gate_rows(batch, sp_active):
+            gated_value, gated_value_normed = self._sharded_gate_values(
+                key, value, hidden_states, batch, get_parallel().tp_group
+            )
+        else:
+            gated_value, gated_value_normed = self._gate_values(
+                key, value, hidden_states, batch
+            )
         if (
             not _is_npu
             and self.ple_embedding.enable_ple_fusion
