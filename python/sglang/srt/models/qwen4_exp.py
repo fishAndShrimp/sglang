@@ -941,6 +941,26 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
     def compute_ngram_ids(self, batch: _PLEBatch) -> torch.Tensor:
         assert batch.ngram_context is not None
+        if (
+            _is_npu
+            and os.getenv("SGLANG_NPU_PLE_WINDOW_IDS", "0") == "1"
+            and self.enable_ple_fusion
+            and batch.mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            and self.ngram_size == 3 and self.heads_per_ngram == 8
+            and batch.ngram_context.dtype in (torch.int32, torch.int64)
+            and batch.ngram_context.ndim == 2 and batch.ngram_context.stride(1) == 1
+            and batch.req_indices.is_contiguous() and batch.token_offsets.is_contiguous()
+            and self.layer_multipliers.numel() == 3
+            and self.ngram_heads_vocab_sizes.numel() == self.ngram_heads_offsets.numel() == 16
+            and all(t.is_contiguous() and t.dtype == torch.int64 for t in (
+                self.layer_multipliers, self.ngram_heads_vocab_sizes, self.ngram_heads_offsets
+            ))
+        ):
+            from sglang.kernels.ops.embeddings.qwen4_ple_window_hash_npu import ple_window_ids
+
+            return ple_window_ids(batch.ngram_context, batch.req_indices, batch.token_offsets,
+                                 self.layer_multipliers, self.ngram_heads_vocab_sizes,
+                                 self.ngram_heads_offsets, self.eos_token_id)
         pool = get_req_to_token_pool()
         cached = pool.ple_window_cache
         if cached is not None and cached[0] is batch:
@@ -1389,48 +1409,65 @@ class Qwen4ExpPLELayer(nn.Module):
                 short_conv.view_layer_id
             )
             if intermediate_cache is not None:
-                if self.short_conv_state_len:
-                    intermediate_state = (
-                        conv_input.unfold(2, self.short_conv_state_len, 1)[
-                            :, :, 1 : batch.row_width + 1
-                        ]
-                        .permute(0, 2, 1, 3)
-                        .contiguous()
-                    )
-                else:
-                    intermediate_state = x.new_empty(
-                        (
-                            batch.lengths.shape[0],
-                            batch.row_width,
-                            self.conv_channels,
-                            0,
-                        )
-                    )
-                valid_steps = batch.valid_tokens.reshape(
-                    batch.lengths.shape[0], batch.row_width, 1, 1
-                )
-                intermediate_state = torch.where(
-                    valid_steps,
-                    intermediate_state,
-                    torch.zeros_like(intermediate_state),
-                )
-                intermediate_state = intermediate_state.to(
-                    dtype=intermediate_cache.dtype
-                )
                 dst_indices_raw = select_verify_intermediate_state_indices(
                     None,
                     forward_batch.req_pool_indices,
                     batch.lengths.ne(0),
                     get_req_to_token_pool().size,
                 )
-                if dst_indices_raw is None:
-                    intermediate_cache[
-                        : batch.lengths.shape[0], : batch.row_width
-                    ].copy_(intermediate_state)
+                if (
+                    _is_npu and os.getenv("SGLANG_NPU_PLE_VERIFY_STATE", "0") == "1"
+                    and self.short_conv_state_len == 9 and batch.row_width == 4
+                    and intermediate_cache.shape[1] >= batch.row_width
+                    and (dst_indices_raw is not None or intermediate_cache.shape[0] >= batch.lengths.shape[0])
+                    and self.conv_channels == 10240 and conv_input.dtype == torch.bfloat16
+                    and intermediate_cache.dtype in (torch.bfloat16, torch.float32)
+                    and batch.valid_tokens.is_contiguous() and conv_input.is_contiguous()
+                    and intermediate_cache.stride(-1) == 1
+                    and intermediate_cache.stride(-2) == self.short_conv_state_len
+                    and (dst_indices_raw is None or dst_indices_raw.is_contiguous())
+                ):
+                    from sglang.kernels.ops.mamba.qwen4_verify_windows_npu import store_verify_windows
+
+                    store_verify_windows(conv_input, batch.valid_tokens, intermediate_cache,
+                                         batch.row_width, dst_indices_raw)
                 else:
-                    intermediate_cache[
-                        dst_indices_raw.to(dtype=torch.long), : batch.row_width
-                    ] = intermediate_state
+                    if self.short_conv_state_len:
+                        intermediate_state = (
+                            conv_input.unfold(2, self.short_conv_state_len, 1)[
+                                :, :, 1 : batch.row_width + 1
+                            ]
+                            .permute(0, 2, 1, 3)
+                            .contiguous()
+                        )
+                    else:
+                        intermediate_state = x.new_empty(
+                            (
+                                batch.lengths.shape[0],
+                                batch.row_width,
+                                self.conv_channels,
+                                0,
+                            )
+                        )
+                    valid_steps = batch.valid_tokens.reshape(
+                        batch.lengths.shape[0], batch.row_width, 1, 1
+                    )
+                    intermediate_state = torch.where(
+                        valid_steps,
+                        intermediate_state,
+                        torch.zeros_like(intermediate_state),
+                    )
+                    intermediate_state = intermediate_state.to(
+                        dtype=intermediate_cache.dtype
+                    )
+                    if dst_indices_raw is None:
+                        intermediate_cache[
+                            : batch.lengths.shape[0], : batch.row_width
+                        ].copy_(intermediate_state)
+                    else:
+                        intermediate_cache[
+                            dst_indices_raw.to(dtype=torch.long), : batch.row_width
+                        ] = intermediate_state
         else:
             state_cols = torch.arange(
                 self.short_conv_state_len, device=x.device, dtype=torch.long
