@@ -56,11 +56,12 @@ from sglang.srt.layers.layer_boundary import (
     get_attn_tp_context,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import post_experts_output_is_complete
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_ascend_ops_config
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptMixedPrecisionConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
@@ -1984,6 +1985,16 @@ class Qwen4ExpLayerExtensionMixin:
         )
 
         self._decode_moe_comm = _prepare_decode_moe_comm(self.mlp)
+        parallel = get_parallel()
+        self._prefill_allgather_width = (
+            parallel.tp_size
+            if _is_npu
+            and get_moe_a2a_backend().is_ascend_ops()
+            and get_moe_ascend_ops_config().prefill == "allgather"
+            and parallel.attn_tp_size == parallel.moe_ep_size == parallel.tp_size
+            and parallel.attn_cp_size == parallel.attn_dp_size == 1
+            else 0
+        )
 
     @contextmanager
     def hc_norms(self, normalized_input, next_norm, mode):
@@ -2161,11 +2172,30 @@ class Qwen4ExpLayerExtensionMixin:
                             ),
                         )
                 else:
-                    hidden_states = self.mlp(
-                        hidden_states,
-                        forward_batch,
-                        defer_finalize=ffn_exit.defer_moe_finalize,
-                    )
+                    row_layout = nullcontext()
+                    width = self._prefill_allgather_width
+                    if (
+                        width
+                        and forward_batch.forward_mode == ForwardMode.EXTEND
+                        and self.ffn_boundary.plan is not None
+                        and self.ffn_boundary.input_on_attn_tp_slices
+                        and self.ffn_boundary.plan.variant_for(forward_batch)
+                        is BatchVariant.ORDINARY
+                        and get_forward().ascend_allgather_row_sizes is None
+                    ):
+                        # The ordinary FFN entry slices the replicated input across
+                        # attention TP. All ranks derive the layout from the same input.
+                        count, remainder = divmod(forward_batch.input_ids.shape[0], width)
+                        if not remainder:
+                            row_layout = get_forward().scoped(
+                                ascend_allgather_row_sizes=[count] * width
+                            )
+                    with row_layout:
+                        hidden_states = self.mlp(
+                            hidden_states,
+                            forward_batch,
+                            defer_finalize=ffn_exit.defer_moe_finalize,
+                        )
             else:
                 hidden_states = self.mlp(hidden_states)
         return ffn_exit.finish(hidden_states)
