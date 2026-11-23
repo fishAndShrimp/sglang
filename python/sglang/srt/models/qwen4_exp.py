@@ -2537,6 +2537,9 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         inputs_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], PPProxyTensors]:
+        if _is_npu and get_bool_env_var("SGLANG_NPU_GDN_SHARED_INPUTS") and forward_batch.forward_mode.is_target_verify():
+            # A fresh table per invocation keeps capture warmups and live graphs independent.
+            forward_batch.npu_gdn_verify_inputs = {}
         if self.pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
