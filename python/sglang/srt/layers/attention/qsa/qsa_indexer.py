@@ -24,6 +24,7 @@ from sglang.srt.layers.attention.qsa.mqa import (
     qsa_mqa_prefill,
     qsa_mqa_prefill_relative,
 )
+from sglang.srt.layers.attention.qsa.tp_shard import gather_prefill_blocks
 from sglang.srt.layers.cp.utils import (
     ContextParallelStrategyKind,
     cp_materialize_global_token_order,
@@ -532,6 +533,9 @@ class QSAIndexer(MultiPlatformOp):
         sequence_lengths_for_rows: Optional[torch.Tensor],
         max_row_keys: Optional[int] = None,
         defer_expansion: bool = False,
+        *,
+        row_offset: int = 0,
+        total_rows: Optional[int] = None,
     ) -> torch.Tensor:
         """Top-k token selection for packed prefill rows.
 
@@ -563,13 +567,17 @@ class QSAIndexer(MultiPlatformOp):
             and q.is_cuda
             and HAS_TILELANG
         )
+        reference_rows = rows if total_rows is None else total_rows
         row_chunk_size = _qsa_prefill_row_chunk_size(
-            rows,
+            reference_rows,
             max_row_keys if relative else compressed_keys.shape[0],
             q.shape[1],
         )
-        for row_start in range(0, rows, row_chunk_size):
-            row_end = min(row_start + row_chunk_size, rows)
+        first_chunk = row_offset // row_chunk_size * row_chunk_size
+        for base in range(first_chunk, row_offset + rows, row_chunk_size):
+            stop = min(base + row_chunk_size, reference_rows)
+            row_start = max(0, base - row_offset)
+            row_end = min(rows, stop - row_offset)
             chunk_slice = slice(row_start, row_end)
             if compressed_keys.shape[0] == 0:
                 block_indices = torch.full(
@@ -607,6 +615,7 @@ class QSAIndexer(MultiPlatformOp):
                     row_starts[chunk_slice],
                     row_ends[chunk_slice],
                     topk=self.block_topk,
+                    dispatch_rows=stop - base if total_rows is not None else None,
                 )
             selected = (
                 block_indices
@@ -923,6 +932,14 @@ class QSAIndexer(MultiPlatformOp):
                 indexer_metadata.defer_prefill_block_expansion,
             )
             self._logged_prefill_ranges = True
+        shard = getattr(indexer_metadata, "npu_indexer_slice", None)
+        selection_rows = q.shape[0]
+        offset = 0
+        if shard is not None:
+            q, row_starts, row_ends = q[shard], row_starts[shard], row_ends[shard]
+            offset = shard.start
+        defer = indexer_metadata.defer_prefill_block_expansion
+        spans = ()
         if (
             _is_npu and indexer_metadata.defer_prefill_block_expansion
             and self.block_topk == 512 and self.compress_ratio == 4
@@ -935,24 +952,37 @@ class QSAIndexer(MultiPlatformOp):
             )
 
             spans = packed_short_ranges(contiguous[1], contiguous[2], num_valid_tokens)
-            if spans:
-                return select_packed_groups(q, compressed_keys, row_starts, row_ends, spans,
-                    _qsa_prefill_row_chunk_size(num_valid_tokens, compressed_keys.size(0), q.size(1)))
         row_sequence_lengths = None
-        if not indexer_metadata.defer_prefill_block_expansion:
+        if not defer:
             query_sequence_ids = indexer_metadata.get_token_to_batch_idx()
             row_sequence_lengths = sequence_lengths.index_select(0, query_sequence_ids.long())
-        return self.select_prefill_tokens(
-            q,
-            compressed_keys,
-            row_starts,
-            row_ends,
-            logical_positions,
-            row_sequence_lengths,
-            max_row_keys=indexer_metadata.prefill_max_row_keys(
-                getattr(forward_batch, "seq_lens_cpu", None)
-            ),
-            defer_expansion=indexer_metadata.defer_prefill_block_expansion,
+        if spans:
+            selected = select_packed_groups(
+                q, compressed_keys, row_starts, row_ends, spans,
+                _qsa_prefill_row_chunk_size(selection_rows, compressed_keys.size(0), q.size(1)),
+                row_offset=offset, total_rows=selection_rows,
+            )
+        else:
+            selected = self.select_prefill_tokens(
+                q, compressed_keys, row_starts, row_ends,
+                logical_positions if shard is None else logical_positions[shard],
+                row_sequence_lengths if shard is None else None,
+                max_row_keys=indexer_metadata.prefill_max_row_keys(
+                    getattr(forward_batch, "seq_lens_cpu", None)
+                ),
+                defer_expansion=defer or shard is not None,
+                row_offset=offset, total_rows=selection_rows if shard is not None else None,
+            )
+        if shard is None:
+            return selected
+        layout = indexer_metadata.prefill_tp_layout
+        blocks = gather_prefill_blocks(selected, selection_rows, shard.stop - offset, layout)
+        if defer:
+            return blocks
+        attn_rows = layout.attention_slice if layout is not None else slice(None)
+        return expand_qsa_block_indices(
+            blocks, logical_positions[attn_rows], row_sequence_lengths[attn_rows],
+            compress_ratio=self.compress_ratio, token_topk=self.token_topk,
         )
 
     def forward_cuda(

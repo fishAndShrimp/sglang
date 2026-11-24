@@ -23,15 +23,17 @@ def packed_short_ranges(prefixes, sizes, rows):
     return tuple((a,b) for a,b in spans if b-a >= 128)
 
 
-def select_packed_groups(q, keys, starts, ends, spans, chunk):
+def select_packed_groups(q, keys, starts, ends, spans, chunk, *, row_offset=0, total_rows=None):
     from sgl_kernel_npu.implementation.triton.indexer import qsa_mqa, qsa_topk
 
     rows, width = q.size(0), keys.size(0)
     out = torch.empty((rows,512), dtype=torch.int32, device=q.device)
     lengths = ends-starts
-    for begin in range(0,rows,chunk):
-        end = min(begin+chunk,rows)
-        implementation = qsa_topk.select_implementation(end-begin,width,512)
+    total_rows = rows if total_rows is None else total_rows
+    for base in range(row_offset // chunk * chunk, row_offset + rows, chunk):
+        stop = min(base + chunk, total_rows)
+        begin, end = max(0, base - row_offset), min(rows, stop - row_offset)
+        implementation = qsa_topk.select_implementation(stop-base,width,512)
 
         def score(lo,hi):
             if lo == hi:
@@ -46,7 +48,7 @@ def select_packed_groups(q, keys, starts, ends, spans, chunk):
 
         cursor = begin
         for a,b in spans:
-            lo,hi = max(a,begin),min(b,end)
+            lo,hi = max(a-row_offset,begin),min(b-row_offset,end)
             if hi <= lo:
                 continue
             score(cursor,lo)

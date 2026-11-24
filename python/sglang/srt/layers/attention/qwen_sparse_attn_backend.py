@@ -17,6 +17,7 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.kv_shard_hooks import (
     get_kv_shard_pool,
@@ -46,6 +47,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_packed_decode_triton,
     sparse_gqa_paged_prefill_triton,
 )
+from sglang.srt.layers.attention.qsa.tp_shard import QSAPrefillTPLayout, qsa_all_to_all
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.utils import (
     ContextParallelStrategyKind,
@@ -57,7 +59,7 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPoo
 from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.runtime_context import get_spec, get_stream
+from sglang.srt.runtime_context import get_parallel, get_spec, get_stream
 from sglang.srt.utils import is_hip, is_npu, is_sm100_supported, is_sm120
 
 logger = logging.getLogger(__name__)
@@ -333,6 +335,17 @@ class QwenSparseAttnBackend(AttentionBackend):
         if config is None:
             config = getattr(model_config, "hf_config", None)
         self.qsa_profile = parse_qsa_profile(config)
+        self._prefill_shard = envs.SGLANG_NPU_QSA_PREFILL_TP_SHARD.get() if _is_npu else "off"
+        if self._prefill_shard not in ("off", "indexer", "attention"):
+            raise ValueError("SGLANG_NPU_QSA_PREFILL_TP_SHARD must be off, indexer or attention")
+        if getattr(runner, "is_draft_worker", False) or self._kv_shard_pool is not None:
+            self._prefill_shard = "off"
+        self._shard_gqa = (
+            self._prefill_shard == "attention"
+            and getattr(config, "num_attention_heads", None) == 24
+            and getattr(config, "num_key_value_heads", None) == 2
+            and get_parallel().attn_tp_size == 8
+        )
         self.max_context_len = int(getattr(model_config, "context_len", 0))
         self.compress_ratio = (
             self.qsa_profile.compress_ratio
@@ -864,8 +877,30 @@ class QwenSparseAttnBackend(AttentionBackend):
                 sequence_lengths, forward_batch.positions.flatten()[:token_to_batch_idx.numel()],
                 token_to_batch_idx, self.compress_ratio,
             )
+        rows = token_to_batch_idx.numel()
+        shard = layout = None
+        if (
+            self._prefill_shard != "off" and self._mtp_shared_sparse_indices is None
+            and forward_batch.forward_mode.is_context_parallel_extend()
+            and getattr(forward_batch, "attn_cp_metadata", None) is None
+            and not get_parallel().dcp_enabled
+            and 1 < get_parallel().attn_tp_size <= rows
+        ):
+            size, rank = get_parallel().attn_tp_size, get_parallel().attn_tp_rank
+            count = (rows + size - 1) // size
+            shard = slice(rank * count, (rank + 1) * count)
+            if (
+                self._shard_gqa and forward_batch.forward_mode == ForwardMode.EXTEND
+                and rows >= 128
+                and forward_batch.seq_lens_cpu is not None
+                and forward_batch.extend_seq_lens_cpu is not None
+            ):
+                layout = QSAPrefillTPLayout.build(rows, size, rank)
+                shard = layout.indexer_slice
         indexer_metadata = QSAIndexerMetadata(
             npu_prefill_row_ranges=npu_prefill_row_ranges,
+            npu_indexer_slice=shard,
+            prefill_tp_layout=layout,
             sequence_lengths=sequence_lengths,
             token_to_batch_idx=token_to_batch_idx,
             token_slot_table=token_slot_table,
@@ -893,16 +928,27 @@ class QwenSparseAttnBackend(AttentionBackend):
             ),
             prefill_sequence_lengths_cpu=prefill_sequence_lengths_cpu,
         )
+        if layout is not None and indexer_metadata.defer_prefill_block_expansion:
+            from sglang.kernels.ops.attention.qsa_prefill_dispatch_va import (
+                prepare_sharded_prefill_inputs,
+            )
+
+            prefill_inputs = prepare_sharded_prefill_inputs(
+                forward_batch, token_slot_table,
+                slice(layout.attention_slice.start, min(rows, layout.attention_slice.stop)),
+                os.getenv("SGLANG_NPU_QSA_VA_PREFILL_DISPATCH", "0") == "1",
+            )
+        else:
+            prefill_inputs = self._make_npu_prefill_inputs(
+                forward_batch, sequence_lengths, token_slot_table, rows
+            )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,
             token_to_batch_idx=token_to_batch_idx,
             token_slot_table=token_slot_table,
             indexer_metadata=indexer_metadata,
             row_req_pool_indices=row_req_pool_indices,
-            npu_prefill_inputs=self._make_npu_prefill_inputs(
-                forward_batch, sequence_lengths, token_slot_table,
-                token_to_batch_idx.numel(),
-            ),
+            npu_prefill_inputs=prefill_inputs,
         )
 
     def _make_npu_prefill_inputs(self, batch, lengths, token_table, rows):
@@ -1589,9 +1635,12 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     @staticmethod
     def _logical_to_physical(
-        logical_indices: torch.Tensor, metadata: QwenSparseAttnMetadata
+        logical_indices: torch.Tensor, metadata: QwenSparseAttnMetadata, row_slice=None
     ) -> torch.Tensor:
-        sequence_ids = metadata.token_to_batch_idx.long()
+        sequence_ids = metadata.token_to_batch_idx
+        if row_slice is not None:
+            sequence_ids = sequence_ids[row_slice]
+        sequence_ids = sequence_ids.long()
         if sequence_ids.numel() != logical_indices.shape[0]:
             raise ValueError("QSA top-k rows do not match query rows")
         row_lengths = metadata.sequence_lengths.to(torch.int32).index_select(
@@ -1824,6 +1873,12 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         num_output_rows = q.shape[0]
+        if getattr(self, "_shard_gqa", False) and forward_batch.forward_mode == ForwardMode.EXTEND:
+            metadata = self._resolve_metadata(forward_batch)
+            layout = metadata.indexer_metadata.prefill_tp_layout
+            if layout is not None:
+                output = self._forward_extend_tp(q, k, v, layer, topk_indices, metadata, layout)
+                return self._pad_extend_output(output, num_output_rows)
         num_valid_rows = topk_indices.shape[0]
         if num_valid_rows > num_output_rows:
             raise ValueError(
@@ -1989,6 +2044,35 @@ class QwenSparseAttnBackend(AttentionBackend):
             layer.scaling,
         )
         return self._pad_extend_output(output, num_output_rows)
+
+    def _forward_extend_tp(self, q, chunk_k, chunk_v, layer, indices, metadata, layout):
+        """Transpose rows within each replicated KV group, with three Q heads per call."""
+        rows = metadata.token_to_batch_idx.numel()
+        padded_rows = sum(layout.attention_splits)
+        q = q[:rows].contiguous()
+        if rows != padded_rows:
+            q = F.pad(q, (0, 0, 0, 0, 0, padded_rows - rows))
+        received = qsa_all_to_all(q, layout.attention_splits)
+        chunks = received.view(-1, 2 * layout.rows_per_rank, *q.shape[1:])
+        out = torch.zeros_like(chunks)
+        count = indices.shape[0]
+        if count:
+            cache = self.token_to_kv_pool.layer_router.read(layer.layer_id)
+            k, v = cache.key(), cache.value()
+            if metadata.indexer_metadata.defer_prefill_block_expansion:
+                from sglang.kernels.ops.attention.qsa_prefill_dispatch_va import dispatch_sg_prefill
+
+                k = _flatten_qsa_kv_cache(k, "key")
+                v = _flatten_qsa_kv_cache(v, "value")
+                for i, x in enumerate(chunks):
+                    out[i, :count] = dispatch_sg_prefill(
+                        x[:count], chunk_k, chunk_v, k, v, indices, metadata.npu_prefill_inputs, layer.scaling,
+                    )
+            else:
+                slots = self._logical_to_physical(indices, metadata, layout.attention_slice)
+                for i, x in enumerate(chunks):
+                    out[i, :count] = _npu_sparse_attention(x[:count], k, v, slots, layer.scaling)
+        return qsa_all_to_all(out.view_as(received), layout.attention_splits)[:rows]
 
     def prefetch_cp_kv(self, layer, k: torch.Tensor, v: torch.Tensor, forward_batch):
         """Run ``layer``'s prefill-CP K/V gather on a side stream; the layer's

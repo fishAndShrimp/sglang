@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.qsa.kernel import (
     gather_qsa_compressed_keys,
     qsa_fast_topk,
 )
+from sglang.srt.layers.attention.qsa.tp_shard import QSAPrefillTPLayout
 
 
 def build_qsa_row_ranges(
@@ -99,6 +100,8 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     defer_prefill_block_expansion: bool = False
     # Host copy of the extend sequence_lengths; lets prefill MQA skip a device sync.
     prefill_sequence_lengths_cpu: Optional[Tuple[int, ...]] = None
+    npu_indexer_slice: Optional[slice] = None
+    prefill_tp_layout: Optional[QSAPrefillTPLayout] = None
     # Separate stable request view for LI; other consumers retain row metadata.
     npu_lightning_inputs: Optional[object] = None
     # Paged GBSA uses one sequence per query row; the fixed offsets are shared
