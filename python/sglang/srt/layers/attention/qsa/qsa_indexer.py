@@ -294,6 +294,7 @@ class QSAIndexer(MultiPlatformOp):
             sequence_lengths=metadata.sequence_lengths,
             logical_positions=logical_positions,
             compress_ratio=self.compress_ratio,
+            ring_stride=getattr(metadata.token_to_kv_pool, "qsa_ring_stride", self.compress_ratio),
             is_extend=is_extend,
         )
 
@@ -305,6 +306,7 @@ class QSAIndexer(MultiPlatformOp):
             group_end_positions=group_end_positions,
             sequence_ids=sequence_ids,
             compress_ratio=self.compress_ratio,
+            ring_stride=getattr(metadata.token_to_kv_pool, "qsa_ring_stride", self.compress_ratio),
         )
 
     def update_key_state_and_compress(
@@ -527,7 +529,7 @@ class QSAIndexer(MultiPlatformOp):
         row_starts: torch.Tensor,
         row_ends: torch.Tensor,
         query_positions: torch.Tensor,
-        sequence_lengths_for_rows: torch.Tensor,
+        sequence_lengths_for_rows: Optional[torch.Tensor],
         max_row_keys: Optional[int] = None,
         defer_expansion: bool = False,
     ) -> torch.Tensor:
@@ -904,13 +906,42 @@ class QSAIndexer(MultiPlatformOp):
                 lightning_inputs=getattr(indexer_metadata, "npu_lightning_inputs", None),
             )
 
-        compressed_keys, row_starts, row_ends, sequence_lengths = (
-            indexer_metadata.get_prefill_mqa_inputs(self.layer_id, logical_positions)
-        )
-        query_sequence_ids = indexer_metadata.get_token_to_batch_idx()
-        row_sequence_lengths = sequence_lengths.index_select(
-            0, query_sequence_ids.long()
-        )
+        if _is_npu and getattr(indexer_metadata, "npu_prefill_row_ranges", None) is not None:
+            inputs = indexer_metadata.get_prefill_mqa_inputs(
+                self.layer_id, logical_positions, use_prepared_ranges=True
+            )
+        else:
+            inputs = indexer_metadata.get_prefill_mqa_inputs(self.layer_id, logical_positions)
+        compressed_keys, row_starts, row_ends, sequence_lengths = inputs
+        contiguous = getattr(forward_batch, "_qsa_contiguous_extend", None)
+        if _is_npu and self.layer_id == 3 and not getattr(self, "_logged_prefill_ranges", False):
+            import logging
+            logging.getLogger(__name__).info(
+                "QSA prefill rows=%s, prepared_bounds=%s, contiguous_rows=%s, same_positions=%s, compact_groups=%s",
+                num_valid_tokens, getattr(indexer_metadata, "npu_prefill_row_ranges", None) is not None,
+                contiguous is not None, contiguous is not None and contiguous[0] is forward_batch.positions,
+                indexer_metadata.defer_prefill_block_expansion,
+            )
+            self._logged_prefill_ranges = True
+        if (
+            _is_npu and indexer_metadata.defer_prefill_block_expansion
+            and self.block_topk == 512 and self.compress_ratio == 4
+            and contiguous is not None and contiguous[0] is forward_batch.positions
+            and getattr(forward_batch, "attn_cp_metadata", None) is None
+            and num_valid_tokens >= 1024 and compressed_keys.size(0) > 0
+        ):
+            from sglang.kernels.ops.attention.qsa_short_rows_npu import (
+                packed_short_ranges, select_packed_groups,
+            )
+
+            spans = packed_short_ranges(contiguous[1], contiguous[2], num_valid_tokens)
+            if spans:
+                return select_packed_groups(q, compressed_keys, row_starts, row_ends, spans,
+                    _qsa_prefill_row_chunk_size(num_valid_tokens, compressed_keys.size(0), q.size(1)))
+        row_sequence_lengths = None
+        if not indexer_metadata.defer_prefill_block_expansion:
+            query_sequence_ids = indexer_metadata.get_token_to_batch_idx()
+            row_sequence_lengths = sequence_lengths.index_select(0, query_sequence_ids.long())
         return self.select_prefill_tokens(
             q,
             compressed_keys,

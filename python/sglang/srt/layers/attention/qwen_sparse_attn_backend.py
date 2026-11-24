@@ -30,6 +30,7 @@ from sglang.srt.layers.attention.qsa.kernel import (
 )
 from sglang.srt.layers.attention.qsa.metadata import (
     QSAIndexerMetadata,
+    build_qsa_row_ranges,
     build_group_ring_slots,
     build_pending_ring_slots,
     build_rope_position_matrix,
@@ -831,6 +832,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 sequence_lengths=sequence_lengths,
                 logical_positions=ring_logical_positions,
                 compress_ratio=self.compress_ratio,
+                ring_stride=getattr(self.token_to_kv_pool, "qsa_ring_stride", self.compress_ratio),
                 is_extend=group_member_rows is not None,
             )
             if write_locs.numel():
@@ -849,8 +851,21 @@ class QwenSparseAttnBackend(AttentionBackend):
                         group_end_positions=group_positions.long(),
                         sequence_ids=group_sequence_ids.long(),
                         compress_ratio=self.compress_ratio,
+                        ring_stride=getattr(self.token_to_kv_pool, "qsa_ring_stride", self.compress_ratio),
                     )
+        npu_prefill_row_ranges = None
+        if (
+            _is_npu and not speculative_paged
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and self._can_defer_prefill_block_expansion(forward_batch.forward_mode)
+            and getattr(forward_batch, "attn_cp_metadata", None) is None
+        ):
+            npu_prefill_row_ranges = build_qsa_row_ranges(
+                sequence_lengths, forward_batch.positions.flatten()[:token_to_batch_idx.numel()],
+                token_to_batch_idx, self.compress_ratio,
+            )
         indexer_metadata = QSAIndexerMetadata(
+            npu_prefill_row_ranges=npu_prefill_row_ranges,
             sequence_lengths=sequence_lengths,
             token_to_batch_idx=token_to_batch_idx,
             token_slot_table=token_slot_table,
@@ -1392,6 +1407,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 sequence_lengths=metadata.sequence_lengths,
                 logical_positions=current_positions,
                 compress_ratio=ratio,
+                ring_stride=getattr(pool, "qsa_ring_stride", ratio),
                 is_extend=False,
             )
         )
@@ -1401,6 +1417,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 group_end_positions=current_positions,
                 sequence_ids=metadata.token_to_batch_idx.long(),
                 compress_ratio=ratio,
+                ring_stride=getattr(pool, "qsa_ring_stride", ratio),
             ).to(torch.int32)
         )
 
