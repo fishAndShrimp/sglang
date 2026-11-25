@@ -249,6 +249,24 @@ class QSAMTPSharedSparseIndices:
             device=device,
         )
         self._tail_offsets = torch.arange(tail_width, device=device)
+        self.block_cache = None
+        if (
+            _is_npu
+            and os.getenv("SGLANG_NPU_QSA_PAGED_GBSA", "0") == "1"
+            and token_topk == 2051
+            and tail_width <= 5
+        ):
+            from sglang.kernels.ops.attention.qsa_mtp_blocks import CACHE_WIDTH
+
+            # Each draft can finish at most one four-token block in this window.
+            self.block_cache = torch.zeros(
+                (len(self.layer_slots), num_requests + 1, CACHE_WIDTH),
+                dtype=torch.int32,
+                device=device,
+            )
+            self.block_cache[:, :, 1:512].fill_(16777215)
+            self.block_cache[:, :, 512].fill_(1)
+            self.block_cache[:, :, 513].fill_(4)
 
     def capture(
         self,
@@ -258,6 +276,17 @@ class QSAMTPSharedSparseIndices:
         layer_id: int,
     ) -> None:
         slot = self.layer_slots[int(layer_id)]
+        if self.block_cache is not None:
+            from sglang.kernels.ops.attention import qsa_mtp_blocks as blocks
+
+            packed = blocks.pack(topk_indices, captured_lens.contiguous())
+            anchors = torch.arange(
+                req_pool_indices.numel(), dtype=torch.int32, device=req_pool_indices.device
+            )
+            blocks.save(
+                packed, anchors, req_pool_indices, self.block_cache[slot], self.trash_row
+            )
+            return
         rows = req_pool_indices.to(torch.long)
         self.indices[slot, :, : topk_indices.shape[1]].index_copy_(
             0, rows, topk_indices.to(self.indices.dtype)
@@ -270,9 +299,12 @@ class QSAMTPSharedSparseIndices:
         current_positions: torch.Tensor,
         layer_id: int,
     ) -> torch.Tensor:
-        """Frozen selection plus a tail of positions drafted since the capture;
-        tail slots past current_position hold -1, which downstream drops."""
+        """Reuse the captured selection, including KV made visible by the draft."""
         slot = self.layer_slots[int(layer_id)]
+        if self.block_cache is not None:
+            from sglang.kernels.ops.attention.qsa_mtp_blocks import lookup
+
+            return lookup(self.block_cache[slot], req_pool_indices, current_positions)
         rows = req_pool_indices.to(torch.long)
         out = self.indices[slot, rows]
         base = self.captured_len[slot, rows].to(torch.int64)
@@ -1532,17 +1564,16 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     def capture_mtp_sparse_indices(
         self, topk_indices: torch.Tensor, forward_batch, layer_id: int, metadata=None
-    ) -> None:
+    ) -> Optional[torch.Tensor]:
         """Store each request's final accepted row as the iteration seed."""
         if topk_indices.shape[0] == 0:
             return
         if metadata is None:
             metadata = self.get_indexer_metadata(layer_id, forward_batch)
         if metadata.is_cuda_graph or forward_batch.forward_mode.is_draft_extend_v2():
-            self._capture_mtp_sparse_indices_from_extend_lens(
+            return self._capture_mtp_sparse_indices_from_extend_lens(
                 topk_indices, forward_batch, metadata, layer_id
             )
-            return
         if metadata.req_pool_indices is None or metadata.req_pool_indices.numel() == 0:
             return
         state = self._mtp_shared_sparse_indices
@@ -1576,7 +1607,7 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     def _capture_mtp_sparse_indices_from_extend_lens(
         self, topk_indices, forward_batch, metadata, layer_id: int
-    ) -> None:
+    ) -> Optional[torch.Tensor]:
         """DRAFT_EXTEND_V2 packs each request as [front rows][draft-window rows],
         so its last accepted row is block_end - (window - front - num_accept);
         rows with no real request (zero extend, padding slot 0) go to the trash row."""
@@ -1605,6 +1636,15 @@ class QwenSparseAttnBackend(AttentionBackend):
             req_pool_rows,
             state.trash_row,
         )
+        if state.block_cache is not None and self._uses_block_indices(topk_indices):
+            from sglang.kernels.ops.attention import qsa_mtp_blocks as blocks
+
+            packed = blocks.pack(topk_indices, metadata.get_seqlens_expanded().contiguous())
+            blocks.save(
+                packed, anchor_rows, req_rows, state.block_cache[state.layer_slots[layer_id]],
+                state.trash_row,
+            )
+            return packed
         captured_lens = metadata.get_seqlens_expanded()[anchor_rows]
         state.capture(
             topk_indices.index_select(0, anchor_rows),
@@ -1687,6 +1727,14 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
 
     def _can_defer_block_expansion(self, forward_mode):
+        if _is_npu and self._mtp_shared_sparse_indices is not None:
+            return (
+                forward_mode.is_draft_extend_v2()
+                and self._mtp_shared_sparse_indices.block_cache is not None
+                and self.qsa_profile is not None
+                and self.compress_ratio == 4
+                and self.qsa_profile.block_topk == 512
+            )
         return (
             (
                 self._mtp_shared_sparse_indices is None
@@ -2446,20 +2494,31 @@ class QwenSparseAttnBackend(AttentionBackend):
         v_buffer = pool.layer_router.read(layer.layer_id).value()
         metadata = self._resolve_metadata(forward_batch)
         if _is_npu:
+            counts = None
+            positions = None
+            state = self._mtp_shared_sparse_indices
+            if state is not None and state.block_cache is not None:
+                from sglang.kernels.ops.attention import qsa_mtp_blocks as blocks
+
+                if topk_indices.shape[1] == blocks.PACK_WIDTH:
+                    ids, counts, lengths = blocks.unpack(topk_indices)
+                    topk_indices = ids[0]
             compact = self._uses_block_indices(topk_indices)
-            positions = (
-                metadata.indexer_metadata.decode_logical_positions
-                if compact
-                else None
-            )
-            if compact and positions is None:
+            if compact:
+                positions = metadata.indexer_metadata.decode_logical_positions
+            if compact and counts is None and positions is None:
                 raise RuntimeError("Compact QSA paged indices require logical positions")
             if compact:
                 output = self._try_npu_paged_gbsa(
-                    q, k_buffer, v_buffer, metadata, topk_indices, layer.scaling
+                    q, k_buffer, v_buffer, metadata, topk_indices, layer.scaling,
+                    sorted_block_counts=counts,
                 )
                 if output is not None:
                     return output.reshape(q.shape[0], -1)
+            if counts is not None:
+                positions = lengths - 1
+                # The slot mapper uses -1 padding; GBSA consumes counts instead.
+                topk_indices = topk_indices.masked_fill(topk_indices == 16777215, -1)
             slots = self._npu_indices_to_physical(topk_indices, metadata, positions)
             output = _npu_sparse_attention(q, k_buffer, v_buffer, slots, layer.scaling)
             return output.reshape(q.shape[0], -1)
@@ -2565,7 +2624,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         return output.reshape(q.shape[0], -1)
 
-    def _try_npu_paged_gbsa(self, q, k, v, metadata, groups, scale):
+    def _try_npu_paged_gbsa(
+        self, q, k, v, metadata, groups, scale, *, sorted_block_counts=None
+    ):
         if not (
             os.getenv("SGLANG_NPU_QSA_PAGED_GBSA", "0") == "1"
             and q.shape[0] > 0
@@ -2598,6 +2659,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             q, _flatten_qsa_kv_cache(k, "key"), _flatten_qsa_kv_cache(v, "value"),
             groups, None, lengths, None, 1, scale,
             indices_are_blocks=True, page_table=pages, cu_seqlens_q=cu_q,
+            sorted_block_counts=sorted_block_counts,
         )
 
 

@@ -2367,9 +2367,11 @@ class Qwen4ExpAttentionDecoderLayer(
             sparse_backend, "should_capture_mtp_sparse_indices", None
         )
         if should_capture is not None and should_capture(forward_batch):
-            sparse_backend.capture_mtp_sparse_indices(
+            prepared = sparse_backend.capture_mtp_sparse_indices(
                 topk_indices, forward_batch, self.layer_id, metadata=indexer_metadata
             )
+            if prepared is not None:
+                return prepared
         return topk_indices
 
     def self_attention(

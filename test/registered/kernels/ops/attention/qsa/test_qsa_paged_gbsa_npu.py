@@ -13,7 +13,11 @@ from test_qsa_request_li_npu import runtime_context  # noqa: F401
 import torch
 from sglang.srt.layers.attention.qsa.metadata import QSAIndexerMetadata
 from sglang.srt.layers.attention.qsa.kernel import expand_qsa_block_indices
-from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend, QwenSparseAttnMetadata
+from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+    QSAMTPSharedSparseIndices,
+    QwenSparseAttnBackend,
+    QwenSparseAttnMetadata,
+)
 
 
 @pytest.mark.parametrize("extends,prefixes,marker", [
@@ -105,3 +109,19 @@ def test_actual_paged_consumer(monkeypatch, extends, prefixes, marker):
     assert backend._try_npu_paged_gbsa(c.q, c.k.unsqueeze(1), c.v.unsqueeze(1), metadata, tokens, 1 / 16) is None
     expected = backend._forward_paged_attention(c.q, layer, None, tokens)
     torch.testing.assert_close(outputs["gbsa"], expected, atol=0.004, rtol=0.02)
+
+    # Replaying the selection at its capture position must reproduce both
+    # native paged attention and the slot-based fallback, including short tails.
+    monkeypatch.setenv("SGLANG_NPU_QSA_PAGED_GBSA", "1")
+    state = QSAMTPSharedSparseIndices(
+        layer_ids=[0], num_requests=rows + 1, token_topk=2051,
+        tail_width=4, device=c.q.device,
+    )
+    backend.set_mtp_shared_sparse_indices(state)
+    slots = row_ids + 1
+    state.capture(tokens, slots, lengths, 0)
+    packed = state.lookup(slots, c.positions, 0)
+    for enabled in ("1", "0"):
+        monkeypatch.setenv("SGLANG_NPU_QSA_PAGED_GBSA", enabled)
+        actual = backend._forward_paged_attention(c.q, layer, None, packed)
+        torch.testing.assert_close(actual, expected, atol=0.004, rtol=0.02)

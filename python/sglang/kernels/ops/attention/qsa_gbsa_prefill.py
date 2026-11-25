@@ -33,6 +33,7 @@ def qsa_gbsa_prefill(
     indices_are_blocks=False,
     page_table=None,
     cu_seqlens_q=None,
+    sorted_block_counts=None,
 ):
     from sgl_kernel_npu.operators.attention import (
         generic_block_sparse_attention,
@@ -44,7 +45,9 @@ def qsa_gbsa_prefill(
     assert logical_indices.shape == (q.shape[0], 512 if indices_are_blocks else 2051)
     assert token_table is None or token_table.shape[1] < 2**24
     _report_native()
-    if (
+    if sorted_block_counts is not None:
+        ids, counts = logical_indices.unsqueeze(0), sorted_block_counts
+    elif (
         indices_are_blocks
         and logical_indices.device.type == "npu"
         and logical_indices.dtype == torch.int32
