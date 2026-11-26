@@ -19,6 +19,29 @@ def _report_native():
     )
 
 
+def _gbsa_options(cu_q, seq_lens):
+    return dict(
+        cu_seqlens_q=cu_q, seqused_kv=seq_lens.to(torch.int32).contiguous(),
+        layout_q="TND", layout_kv="PA_BBND", layout_sparse_pattern=4,
+        mask_mode=1, quant_mode=0, softmax_precision=0,
+        residual_block_mode=1, is_consistent_topk=False,
+    )
+
+
+def prepare_gbsa_metadata(block_lengths, cu_q, seq_lens, max_query, max_kv):
+    from sgl_kernel_npu.operators.attention import generic_block_sparse_attention_metadata
+
+    counts = block_lengths.clamp(0, 512).to(torch.int32).view(1, -1)
+    # CANN 9.2 A3 uses the int32 index tensor's shape and reads the count values.
+    # Per-layer selected IDs are supplied only to the attention consumer.
+    index_shape = counts.new_empty((1, counts.shape[1], 512))
+    return generic_block_sparse_attention_metadata(
+        index_shape, counts, 3, 1, 256, [1, 4],
+        max_seqlen_q=max_query, max_seqlen_kv=max_kv,
+        **_gbsa_options(cu_q, seq_lens),
+    )
+
+
 def qsa_gbsa_prefill(
     q,
     k,
@@ -33,6 +56,7 @@ def qsa_gbsa_prefill(
     indices_are_blocks=False,
     page_table=None,
     cu_seqlens_q=None,
+    prepared_meta=None,
 ):
     from sgl_kernel_npu.operators.attention import (
         generic_block_sparse_attention,
@@ -78,15 +102,18 @@ def qsa_gbsa_prefill(
         if cu_seqlens_q is None else cu_seqlens_q
     )
     assert cu_q.dtype == torch.int64
-    options = dict(cu_seqlens_q=cu_q, seqused_kv=seq_lens.to(torch.int32).contiguous(),
-                   layout_q='TND', layout_kv='PA_BBND', layout_sparse_pattern=4,
-                   mask_mode=1, quant_mode=0, softmax_precision=0,
-                   residual_block_mode=1, is_consistent_topk=False)
-    meta = generic_block_sparse_attention_metadata(
-        ids, counts, 3, 1, 256, [1,4], max_seqlen_q=max_query,
-        max_seqlen_kv=table.shape[1] * 128, **options)
+    options = _gbsa_options(cu_q, seq_lens)
+    meta = prepared_meta
+    if meta is None:
+        meta = generic_block_sparse_attention_metadata(
+            ids, counts, 3, 1, 256, [1, 4],
+            max_seqlen_q=max_query, max_seqlen_kv=table.shape[1] * 128, **options,
+        )
+
     output, _ = generic_block_sparse_attention(
-        q.contiguous(), k.view(-1,128,1,256), v.view(-1,128,1,256), ids,
-        counts, [1,4], metadata=meta, block_table=table, softmax_scale=1/16 if softmax_scale is None else softmax_scale,
-        return_softmax_lse=False, **options)
+        q.contiguous(), k.view(-1, 128, 1, 256), v.view(-1, 128, 1, 256), ids,
+        counts, [1, 4], metadata=meta, block_table=table,
+        softmax_scale=1/16 if softmax_scale is None else softmax_scale,
+        return_softmax_lse=False, **options,
+    )
     return output

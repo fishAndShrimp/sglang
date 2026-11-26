@@ -161,7 +161,7 @@ def prepare_sg_prefill_inputs(
     )
 
 
-def dispatch_sg_prefill(q, k, v, key_cache, value_cache, groups, inputs, scale):
+def dispatch_sg_prefill(q, k, v, key_cache, value_cache, groups, inputs, scale, *, prepared_metas=()):
     """Use current-chunk KV or zero-copy paged KV with the VA request plan."""
     if groups.shape != (q.shape[0], 512):
         raise ValueError("SG prefill dispatch requires compact512 group indices")
@@ -183,11 +183,12 @@ def dispatch_sg_prefill(q, k, v, key_cache, value_cache, groups, inputs, scale):
             q[rows], keys, values, groups[rows], inputs.visible_lens[rows],
             request.kv_length, output[rows], block_table=table, softmax_scale=scale,
         )
-    for start, end, first, last, cu_q in inputs.gbsa_calls:
+    for idx, (start, end, first, last, cu_q) in enumerate(inputs.gbsa_calls):
         output[start:end].copy_(qsa_gbsa_prefill(
             q[start:end], key_cache, value_cache, groups[start:end], None,
             inputs.sequence_lengths[first:last], inputs.extend_lengths[first:last],
             end - start, scale, indices_are_blocks=True,
             page_table=inputs.page_table[first:last], cu_seqlens_q=cu_q,
+            prepared_meta=prepared_metas[idx] if prepared_metas else None,
         ))
     return output
