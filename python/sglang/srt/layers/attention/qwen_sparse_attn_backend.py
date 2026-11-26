@@ -223,7 +223,7 @@ class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
     # KV-sharded extend.
     kv_shard_slot_table: Optional[torch.Tensor] = None
     npu_prefill_inputs: Optional[object] = None
-    gbsa_meta_cache: Optional[dict] = None
+    prefill_gbsa_metadata: Optional[dict] = None
 
 
 class QSAMTPSharedSparseIndices:
@@ -412,7 +412,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._trtllm_sparse_tables = {}
         self._mtp_shared_sparse_indices = None
         self._reuse_gbsa_meta = (
-            _is_npu and os.getenv("SGLANG_NPU_QSA_REUSE_GBSA_META", "0") == "1"
+            _is_npu and os.getenv("SGLANG_NPU_QSA_REUSE_GBSA_META", "1") == "1"
+        )
+        self._prepare_prefill_gbsa = (
+            self._reuse_gbsa_meta
+            and getattr(config, "num_attention_heads", 0) == 3 * get_parallel().attn_tp_size
+            and getattr(config, "head_dim", None) == 256
+            and getattr(model_config, "dtype", None) == torch.bfloat16
         )
         self._trtllm_workspace = None
         self._trtllm_counters = {}
@@ -978,6 +984,20 @@ class QwenSparseAttnBackend(AttentionBackend):
             prefill_inputs = self._make_npu_prefill_inputs(
                 forward_batch, sequence_lengths, token_slot_table, rows
             )
+        schedules = None
+        if self._prepare_prefill_gbsa and npu_prefill_row_ranges is not None and rows >= 128:
+            from sglang.kernels.ops.attention.qsa_gbsa_prefill import (
+                prepare_prefill_gbsa_metadata,
+            )
+
+            start, end, _ = npu_prefill_row_ranges
+            if layout is not None:
+                start, end = start[layout.attention_slice], end[layout.attention_slice]
+            if start.numel():
+                schedules = prepare_prefill_gbsa_metadata(
+                    (start, end), prefill_inputs, sequence_lengths, forward_batch.extend_seq_lens,
+                    (token_slot_table.shape[1] + 127) // 128,
+                )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,
             token_to_batch_idx=token_to_batch_idx,
@@ -985,14 +1005,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             indexer_metadata=indexer_metadata,
             row_req_pool_indices=row_req_pool_indices,
             npu_prefill_inputs=prefill_inputs,
-            gbsa_meta_cache=(
-                {}
-                if self._reuse_gbsa_meta
-                and indexer_metadata.defer_prefill_block_expansion
-                and forward_batch.forward_mode == ForwardMode.EXTEND
-                and getattr(forward_batch, "attn_cp_metadata", None) is None
-                else None
-            ),
+            prefill_gbsa_metadata=schedules,
         )
 
     def _make_npu_prefill_inputs(self, batch, lengths, token_table, rows):
@@ -2001,7 +2014,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                         _flatten_qsa_kv_cache(pool.layer_router.read(layer.layer_id).key(), "key"),
                         _flatten_qsa_kv_cache(pool.layer_router.read(layer.layer_id).value(), "value"),
                         topk_indices, metadata.npu_prefill_inputs, layer.scaling,
-                        meta_cache=metadata.gbsa_meta_cache,
+                        prepared_metadata=metadata.prefill_gbsa_metadata,
                     )
                     return self._pad_extend_output(output, num_output_rows)
                 # Keep original sequence boundaries: GBSA computes all selected
@@ -2017,9 +2030,11 @@ class QwenSparseAttnBackend(AttentionBackend):
                     q.shape[0],
                     layer.scaling,
                     indices_are_blocks=self._uses_block_indices(topk_indices),
-                    meta_cache=(
-                        metadata.gbsa_meta_cache
-                        if num_valid_rows == metadata.token_to_batch_idx.numel()
+                    prepared_metadata=(
+                        metadata.prefill_gbsa_metadata[0, num_valid_rows]
+                        if metadata.prefill_gbsa_metadata is not None
+                        and self._uses_block_indices(topk_indices)
+                        and num_valid_rows == metadata.token_to_batch_idx.numel()
                         else None
                     ),
                 )
@@ -2133,7 +2148,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 for i, x in enumerate(chunks):
                     out[i, :count] = dispatch_sg_prefill(
                         x[:count], chunk_k, chunk_v, k, v, indices, metadata.npu_prefill_inputs, layer.scaling,
-                        meta_cache=metadata.gbsa_meta_cache,
+                        prepared_metadata=metadata.prefill_gbsa_metadata,
                     )
             else:
                 slots = self._logical_to_physical(indices, metadata, layout.attention_slice)
