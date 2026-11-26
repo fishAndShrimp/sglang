@@ -1,23 +1,35 @@
 # 在 A3 上复现 Qwen3.8-Flash-Next 的双 PR 性能
 
-用一台 A3 的 8 个空闲 die 跑一个副本。历史基线的三轮整批耗时为 **126.80、126.53、127.91 秒**。取后两轮均值是 **127.22 秒**，平均首 token **17.68 秒**，平均每个后续 token **25.36 ms**，输出吞吐 **1030.3 token/s**。
+单机 8 个 die，TP8 / EP8。A032 含 16 条纯文本和 16 条图文请求，32 并发，每条输出 4096 token。定版配置的两轮参考结果如下。
 
-## 1. 装好两个 PR
+| 轮次 | 整批 E2E（s） | 平均 TTFT（s） | 平均 TPOT（ms） | 输出 tok/s | MTP 接受长度 |
+|---|---:|---:|---:|---:|---:|
+| 1 | 116.30 | 11.70 | 23.65 | 1127.03 | 3.037 |
+| 2 | 115.54 | 10.47 | 23.75 | 1134.41 | 3.033 |
+| 平均 | **115.92** | **11.08** | **23.70** | **1130.72** | **3.035** |
 
-使用已加载 CANN 9.2.0 环境的 SGLang 镜像。参考环境用 Python 3.12、torch / torch-npu 2.13.0 和 Triton 3.6 系列。框架用本分支（基于 `012aa4d034`），算子仓用 `176434f0`。两个终端使用同一 Python 环境。[SGLang #52107](https://github.com/sgl-project/sglang/pull/52107) · [sgl-kernel-npu #1076](https://github.com/sgl-project/sgl-kernel-npu/pull/1076)
+## 1. 安装两个 PR
 
-在干净的算子仓根目录编译并安装 wheel。保留两个构建选项，第二个会装上基线使用的 MoE 分组矩阵乘。
+使用 CANN 9.2.0 的 SGLang 镜像。本分支包含框架 PR 提交 `75acaa1cd9` 的代码和本目录的复现工具，配套算子 PR 提交是 `af22f597e9`。参考环境使用 Python 3.12、torch / torch-npu 2.13.0 和 Triton 3.6 系列。[框架 PR #52107](https://github.com/sgl-project/sglang/pull/52107) · [算子 PR #1076](https://github.com/sgl-project/sgl-kernel-npu/pull/1076)
+
+在干净的 `sgl-kernel-npu` 仓库根目录编译并安装 wheel。两个构建选项分别提供稀疏注意力和本次使用的 MoE 分组矩阵乘。
 
 ```bash
+git fetch https://github.com/sgl-project/sgl-kernel-npu.git refs/pull/1076/head
+git switch --detach af22f597e9
 python3 setup.py --arch-version 2201 --third-party ops_transformer,ops_transformer_gmm93
 python3 -m pip install --no-deps --force-reinstall output/sgl_kernel_npu-*.whl
 ```
 
-然后在本分支的 SGLang 仓库根目录运行 `python3 -m pip install --no-deps -e python`。
+回到 SGLang 的 `repro/qwen38-flash-next-a3` 分支根目录，用同一 Python 环境安装框架。
 
-## 2. 起服务
+```bash
+python3 -m pip install --no-deps -e python
+```
 
-在 SGLang 仓库根目录运行。把权重目录和设备号换成本机的实际值。
+## 2. 起 TP8 服务
+
+把权重路径和 8 个设备号换成本机的实际值。以下命令都从 SGLang 仓库根目录执行。
 
 ```bash
 export MODEL_PATH=/path/to/Qwen3.8-Flash-Next
@@ -25,61 +37,29 @@ export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 bash benchmark/qwen38_flash_next/serve.sh
 ```
 
-服务使用 TP8 / EP8、BF16、NEXTN 三步、PLE 常驻显存。Prefill 每块 4096 token，专家通信用 AllToAllV，decode 用 MC2。KV 池是 469888 token，前缀缓存关闭。等服务显示已就绪，再测速。
+脚本使用 BF16、NEXTN 三步和 32 个请求槽。Prefill 按 8192 token 分块，indexer 按 TP 切分，GBSA 分核表在主模型进层前准备。PLE 卸载到 pinned 主存，KV 池为 573440 token。MoE 的 prefill 用 AllGather，decode 用 MC2。Prefill delayer 上限为 30 轮，前缀缓存和图像 embedding 缓存均关闭。
 
-## 3. 测速
+## 3. 测 A032
 
-在同一台机器的第二个终端，从 SGLang 仓库根目录运行。端口默认 30000。需要换端口时，在两个终端设置相同的 `PORT`。
-
-```bash
-bash benchmark/qwen38_flash_next/bench.sh
-```
-
-脚本使用随附的 32 条合成请求。30 条输入在 8000–11000 token 之间，另外两条分别是 21000 和 30000 token。先用每条输出 16、256 token 的两批请求预热，再测三轮。每个正式轮次先预热 8 条，然后以 32 并发跑完全部请求，每条输出 4096 token。保留同一个服务进程，比较脚本末尾的第 2、3 轮均值。
-
-一轮应成功完成 **32 条、336000 个输入 token、131072 个输出 token**。整批耗时看 `Benchmark duration (s)`。输入文件 SHA-256 为 `88999a151b8c84dbcb67fe2d19532e68fcce7f90b037ec3c499fb3ba71e29a09`。
-
-**如果首 token 明显变慢，先看服务日志。** 基线平均 TTFT 为 **17.68 秒**。32 条长输入分成 83 个 prefill 块，开头有请求排队很正常，热轮最后一条在 36–38 秒才拿到首 token。随后 decode 日志能同时看到 `#running-req: 32` 和 `#queue-req: 0`。如果进入 decode 后队列长时间不清空、同时运行的请求数一直达不到 32，先核对服务实际拿到的请求槽位和 KV 容量。如果能跑满 32 条，再看处理完 83 个 prefill 块花了多久。
-
-**PLE offload 的收益取决于并发。** 固定 32 槽和同样大的 KV 池，开启 offload 前后，平均 TTFT 为 **17.68 / 17.74 秒**。在另一组 64 并发测试中，开启 offload 后把 KV 池扩大到 939776 token、运行槽位从 32 增至 64，平均 TTFT 才从 **79.54 秒降到 35.06 秒**。复现本页的 32 并发基线时，保持 PLE 常驻即可。
-
-## 4. 单机 16 die 文本配置
-
-`serve_tp16.sh` 启动一个 TP16 / EP16 副本。Attention 分两组（`--attn-dp-size 2`），每组 8 个 die、32 个请求槽、469888 个 KV token。Prefill 分块参数传 8192，服务端按组折算为 4096。PLE 使用 pinned 主存，MoE 在 prefill 用 AllGather，在 decode 用 MC2。
-
-16 die 实测用了较新的框架和当时的 QSA、MoE 等改动。沿用第 1 节的算子 wheel，在交接分支的仓库根目录执行一次以下命令，把实测代码准备到相邻目录。`origin` 指提供本交接分支的 fork。
+服务就绪后，在同机第二个终端、同一 Python 环境运行。默认端口是 30000，自定义时在两个终端设置相同的 `PORT`。
 
 ```bash
-git fetch origin dev/qwen38-flash-next-a3
-git worktree add --detach ../sglang-tp16 32390471f7800109e9b9872f952508a8d3ed424f
-git -C ../sglang-tp16 apply "$PWD/benchmark/qwen38_flash_next/tp16-runtime.patch"
+python3 benchmark/qwen38_flash_next/bench_mixed.py
 ```
 
-设置好第 2 节的 `MODEL_PATH`，在交接分支的仓库根目录启动服务。
+脚本校验并解包数据，用 D032 最长的一条请求生成 32 个 token 预热，再调用包内的流式客户端 `bench.py` 连测两轮 A032。每轮 32 条请求应全部成功，输入合计 **343220 token**，输出合计 **131072 token**。客户端逐条核对服务返回的输入和输出长度。终端打印两轮均值和保存逐请求结果的目录。
 
-```bash
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
-PYTHONPATH="$PWD/../sglang-tp16/python${PYTHONPATH:+:$PYTHONPATH}" bash benchmark/qwen38_flash_next/serve_tp16.sh
-```
+如果 TTFT 明显高于表中数值，先看服务是否拿到了 32 个槽位和配置的 KV 容量，再看日志中满批 decode 时能否达到 `#running-req: 32`、`#queue-req: 0`。
 
-原来的 `bench.sh` 可以直接测 32 并发。历史上，同一服务处理随附的 32 条文本、每条输出 4096 token，单轮耗时 **94.47 秒**。将这组输入重复两份，以 64 并发发送 64 条请求，后两轮平均 **123.32 秒**，输出吞吐 **2125.83 token/s**。
+## 其他负载
 
-## 5. 固定的纯文本和图文混合输入
-
-`serving_benchmark_v1.zip` 包含 A、B、C、D 四组互不重叠的合成请求。每组可取 32 到 256 条，步长为 32。每批一半纯文本、一半带图片，平均输入约 10,720 token，最长 29,990 token，每条固定输出 4,096 token。
-
-在仓库根目录运行以下命令。脚本校验 ZIP，一次生成 32 份供 IDE 查看原文的 JSONL 和 4 份供官方测速的 JSONL。已解包过的目录可以直接重跑。
+- **纯文本**。运行 `bash benchmark/qwen38_flash_next/bench.sh`，使用原来的 32 条文本和 SGLang 官方测速客户端。旧版 TP8 的 127.22 秒对应纯文本和旧服务配置。[历史配置与结果](https://github.com/fishAndShrimp/sglang/blob/baa6fdc8515d02bd3e7c5f38eef204942a979a98/benchmark/qwen38_flash_next/README.md)
+- **16 die**。设置好 `MODEL_PATH` 和 16 个空闲设备号后，从本分支直接运行 `bash benchmark/qwen38_flash_next/serve_tp16.sh`。它启动一个 TP16 / EP16 副本，attention DP 为 2。历史纯文本 C32 的 94.47 秒来自当时的补丁版本。本次定版只测了 TP8。如需复核旧的 TP16 成绩，按历史说明使用对应工作树及 `tp16-runtime.patch`。[历史 TP16 步骤](https://github.com/fishAndShrimp/sglang/blob/baa6fdc8515d02bd3e7c5f38eef204942a979a98/benchmark/qwen38_flash_next/README.md#4-单机-16-die-文本配置)
+- **其他图文组或官方客户端**。A、B、C、D 四组请求互不重叠，每组可取 32 到 256 条，步长为 32。可用下面的命令导出并测 A032。基准表使用上一节的客户端及预热方式。
 
 ```bash
 cd benchmark/qwen38_flash_next
 python3 unpack_mixed.py
-```
-
-用 IDE 打开 `serving_benchmark_v1/A032.jsonl` 或同目录的 `D032.jsonl`。每行是一条完整请求，图片路径相对于该文件。
-
-测速使用支持图文的服务，上下文至少设为 34,086 token。在刚才的目录运行以下命令，以 32 并发测 A 组前 32 条。测速文件内嵌原图，客户端可以在另一台机器上运行。
-
-```bash
 python3 -m sglang.benchmark.serving --backend sglang-oai-chat \
   --host localhost --port "${PORT:-30000}" \
   --dataset-name openai --dataset-path serving_benchmark_v1/openai/A.jsonl \
@@ -87,6 +67,4 @@ python3 -m sglang.benchmark.serving --backend sglang-oai-chat \
   --output-details --output-file result-A032.jsonl
 ```
 
-测 A64 时，把请求数和并发都改为 64，结果写到 `result-A064.jsonl`。换组时选择同目录的 `B.jsonl`、`C.jsonl` 或 `D.jsonl`。远端服务可用 `--base-url` 指定服务根地址（到端口为止），用 `--tokenizer` 指定客户端可读的 tokenizer。
-
-跨机器比较时，选择同一组和同一请求数，关闭前缀缓存和图片 embedding 缓存，用独立请求预热。以 A32 为例，结果明细的 `input_lens` 合计应为 343,220，`output_lens` 应为 32 个 4,096。`input_lens` 应和 `A032.jsonl` 中逐条的 `input_tokens` 对齐，加载数据时打印的输入估算只计算了图片占位符和文本。
+`serving_benchmark_v1/A032.jsonl` 和 `D032.jsonl` 可直接用 IDE 阅读。测其他并发时，同时调整请求数、并发和服务槽位。比较机器时使用同一组请求。
