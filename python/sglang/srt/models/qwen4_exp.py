@@ -15,6 +15,7 @@ import triton
 import triton.language as tl
 from torch import nn
 
+from sglang.kernels.ops.attention.qsa_gbsa_prefill import with_paged_gbsa_cache
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
@@ -2531,6 +2532,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             else PPMissingLayer()
         )
 
+    @with_paged_gbsa_cache
     def forward(
         self,
         input_ids: torch.Tensor,

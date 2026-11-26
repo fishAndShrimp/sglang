@@ -223,6 +223,7 @@ class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
     # KV-sharded extend.
     kv_shard_slot_table: Optional[torch.Tensor] = None
     npu_prefill_inputs: Optional[object] = None
+    gbsa_meta_cache: Optional[dict] = None
 
 
 class QSAMTPSharedSparseIndices:
@@ -410,6 +411,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._graph_row_req_pool_indices = None
         self._trtllm_sparse_tables = {}
         self._mtp_shared_sparse_indices = None
+        self._reuse_gbsa_meta = (
+            _is_npu and os.getenv("SGLANG_NPU_QSA_REUSE_GBSA_META", "0") == "1"
+        )
         self._trtllm_workspace = None
         self._trtllm_counters = {}
         self._graph_extend_lens = None
@@ -981,6 +985,14 @@ class QwenSparseAttnBackend(AttentionBackend):
             indexer_metadata=indexer_metadata,
             row_req_pool_indices=row_req_pool_indices,
             npu_prefill_inputs=prefill_inputs,
+            gbsa_meta_cache=(
+                {}
+                if self._reuse_gbsa_meta
+                and indexer_metadata.defer_prefill_block_expansion
+                and forward_batch.forward_mode == ForwardMode.EXTEND
+                and getattr(forward_batch, "attn_cp_metadata", None) is None
+                else None
+            ),
         )
 
     def _make_npu_prefill_inputs(self, batch, lengths, token_table, rows):
@@ -1989,6 +2001,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                         _flatten_qsa_kv_cache(pool.layer_router.read(layer.layer_id).key(), "key"),
                         _flatten_qsa_kv_cache(pool.layer_router.read(layer.layer_id).value(), "value"),
                         topk_indices, metadata.npu_prefill_inputs, layer.scaling,
+                        meta_cache=metadata.gbsa_meta_cache,
                     )
                     return self._pad_extend_output(output, num_output_rows)
                 # Keep original sequence boundaries: GBSA computes all selected
@@ -2004,6 +2017,11 @@ class QwenSparseAttnBackend(AttentionBackend):
                     q.shape[0],
                     layer.scaling,
                     indices_are_blocks=self._uses_block_indices(topk_indices),
+                    meta_cache=(
+                        metadata.gbsa_meta_cache
+                        if num_valid_rows == metadata.token_to_batch_idx.numel()
+                        else None
+                    ),
                 )
                 return self._pad_extend_output(output, num_output_rows)
             # The token consumer can fuse compact expansion with slot mapping.
@@ -2115,6 +2133,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 for i, x in enumerate(chunks):
                     out[i, :count] = dispatch_sg_prefill(
                         x[:count], chunk_k, chunk_v, k, v, indices, metadata.npu_prefill_inputs, layer.scaling,
+                        meta_cache=metadata.gbsa_meta_cache,
                     )
             else:
                 slots = self._logical_to_physical(indices, metadata, layout.attention_slice)
@@ -2660,6 +2679,15 @@ class QwenSparseAttnBackend(AttentionBackend):
             groups, None, lengths, None, 1, scale,
             indices_are_blocks=True, page_table=pages, cu_seqlens_q=cu_q,
             sorted_block_counts=sorted_block_counts,
+            paged_step=(
+                metadata
+                if self._reuse_gbsa_meta
+                and sorted_block_counts is None
+                and self._mtp_shared_sparse_indices is None
+                and indexer.defer_block_expansion
+                and getattr(self.token_to_kv_pool, "qsa_compressed_dtype", None) == torch.bfloat16
+                else None
+            ),
         )
 
 

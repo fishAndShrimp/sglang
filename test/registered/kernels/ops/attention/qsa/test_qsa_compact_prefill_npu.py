@@ -66,6 +66,34 @@ def gbsa(c, compact):
                           c.table, c.lengths, c.extends, c.q.shape[0], indices_are_blocks=compact)
 
 
+def test_prefill_meta_reuse_across_layer_selections(monkeypatch):
+    from sgl_kernel_npu.operators import attention
+
+    c = make_case([17, 111], [3072, 4096])
+    cache = {}
+    build_meta = attention.generic_block_sparse_attention_metadata
+    builds = []
+
+    def track_build(*args, **kwargs):
+        meta = build_meta(*args, **kwargs)
+        builds.append(meta)
+        return meta
+
+    monkeypatch.setattr(attention, "generic_block_sparse_attention_metadata", track_build)
+    # Each row has at least 768 visible blocks, so rotating the selection is valid.
+    rotated = (c.groups + 1) % ((c.positions[:, None] + 1) // 4)
+    fewer = rotated.clone()
+    fewer[0, -1] = -1
+    for groups, expected_builds in ((c.groups, 1), (rotated, 1), (fewer, 2)):
+        args = (c.q, c.k, c.v, groups, c.table, c.lengths, c.extends, c.q.shape[0])
+        actual = qsa_gbsa_prefill(*args, indices_are_blocks=True, meta_cache=cache)
+        assert len(builds) == expected_builds
+        with monkeypatch.context() as patch:
+            patch.setattr(attention, "generic_block_sparse_attention_metadata", build_meta)
+            expected = qsa_gbsa_prefill(*args, indices_are_blocks=True)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("extends,prefixes", [([128], [0]), ([128], [2048]), ([128], [11001]), ([17, 111], [0, 3001])])
 def test_compact_tail_multisequence_and_replay(extends, prefixes):
     c = make_case(extends, prefixes)
