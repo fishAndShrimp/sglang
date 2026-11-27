@@ -156,6 +156,12 @@ class AscendOpsDispatcher(BaseDispatcher):
         self.quant_config: Optional[dict] = None
         self._ep_comm_name: Optional[str] = None
         self._pad_buffers: dict[tuple, tuple] = {}
+        self._constant_mask_table = None
+        if envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get() == 128:
+            device = torch.device("npu", torch.npu.current_device())
+            positions = torch.arange(128, device=device)
+            lengths = torch.arange(129, device=device)
+            self._constant_mask_table = positions[None, :] < lengths[:, None]
         if self.moe_ascend_ops_config.prefill == "allgather":
             if not (
                 parallel.tp_size == parallel.moe_ep_size
@@ -335,12 +341,15 @@ class AscendOpsDispatcher(BaseDispatcher):
         padded_ids[:num_tokens] = topk_ids
         padded_weights[:num_tokens] = topk_weights
 
-        mask[:num_tokens] = True
+        if self._constant_mask_table is not None and padded_bs == 128:
+            mask = self._constant_mask_table[num_tokens]
+        else:
+            mask[:num_tokens] = True
+            mask[num_tokens:] = False
         if filled > num_tokens:
             padded_x[num_tokens:filled] = 0
             padded_ids[num_tokens:filled] = 0
             padded_weights[num_tokens:filled] = 0
-            mask[num_tokens:filled] = False
 
         self._pad_buffers[key] = (
             padded_x,
