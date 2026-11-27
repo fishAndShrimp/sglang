@@ -1,4 +1,5 @@
 from functools import lru_cache
+import os
 from typing import Optional
 
 import msgspec
@@ -132,6 +133,12 @@ class HyperConnectionBase(nn.Module):
         return combined_output
 
 
+def _load_bf16_hc_up(param, loaded_weight):
+    from sglang.srt.model_loader.weight_utils import default_weight_loader
+
+    default_weight_loader(param, loaded_weight.to(torch.bfloat16))
+
+
 class GatedResidual(HyperConnectionBase):
     def __init__(
         self,
@@ -161,12 +168,19 @@ class GatedResidual(HyperConnectionBase):
                 bias=False,
                 dtype=config.params_dtype,
             )
+            resident_up = (
+                _is_npu
+                and config.params_dtype == torch.bfloat16
+                and os.getenv("SGLANG_NPU_HC_RESIDENT_UP_FP32") == "1"
+            )
             self.input_mix_weight_up = nn.Linear(
                 self.config.hc_lowrank,
                 self.hc_count * self.hidden_size,
                 bias=False,
-                dtype=config.params_dtype,
+                dtype=torch.float32 if resident_up else config.params_dtype,
             )
+            if resident_up:
+                self.input_mix_weight_up.weight.weight_loader = _load_bf16_hc_up
             lowrank = self.config.hc_lowrank
             self._jit_mix_ok = (
                 not _is_npu
