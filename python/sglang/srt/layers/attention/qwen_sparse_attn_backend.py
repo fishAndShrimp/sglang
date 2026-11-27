@@ -1677,6 +1677,17 @@ class QwenSparseAttnBackend(AttentionBackend):
             return self._pad_extend_output(output, num_output_rows)
         if _is_npu or not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
+            if _is_npu and self._uses_block_indices(topk_indices):
+                # Unlike decode, ordinary prefill has no defer_expansion option.
+                # Expanding here lets prefill accept either block IDs
+                # or token IDs from the indexer.
+                topk_indices = expand_qsa_block_indices(
+                    topk_indices,
+                    forward_batch.positions.flatten()[:num_valid_rows],
+                    metadata.indexer_metadata.get_seqlens_expanded(),
+                    self.compress_ratio,
+                    self.qsa_profile.budget,
+                )
             slots = self._logical_to_physical(topk_indices, metadata)
             pool = self.token_to_kv_pool
             if _is_npu:
