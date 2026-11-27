@@ -15,6 +15,7 @@ def _qsa_rmsnorm_mrope_kernel(
     input_ptr,
     weight_ptr,
     cos_sin_ptr,
+    positions_ptr,
     output_ptr,
     input_stride_token,
     input_stride_head,
@@ -22,6 +23,10 @@ def _qsa_rmsnorm_mrope_kernel(
     cos_sin_stride_token,
     output_stride_token,
     output_stride_head,
+    position_stride_axis,
+    position_stride_token,
+    cache_rows: tl.constexpr,
+    lookup_positions: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     eps: tl.constexpr,
@@ -47,13 +52,36 @@ def _qsa_rmsnorm_mrope_kernel(
     if has_mrope:
         h_mask = (rotary_offsets % 3 == 1) & (rotary_offsets < mrope_section_h * 3)
         w_mask = (rotary_offsets % 3 == 2) & (rotary_offsets < mrope_section_w * 3)
-        cache_row = cos_sin_ptr + token_id * cos_sin_stride_token
-        cos_t = tl.load(cache_row + rotary_offsets).to(tl.float32)
-        cos_h = tl.load(cache_row + cos_sin_stride_axis + rotary_offsets).to(tl.float32)
-        cos_w = tl.load(cache_row + 2 * cos_sin_stride_axis + rotary_offsets).to(tl.float32)
-        sin_t = tl.load(cache_row + rotary_offsets + half_rope_dim).to(tl.float32)
-        sin_h = tl.load(cache_row + cos_sin_stride_axis + rotary_offsets + half_rope_dim).to(tl.float32)
-        sin_w = tl.load(cache_row + 2 * cos_sin_stride_axis + rotary_offsets + half_rope_dim).to(tl.float32)
+        if lookup_positions:
+            pos = positions_ptr + token_id * position_stride_token
+            t = tl.load(pos)
+            h = tl.load(pos + position_stride_axis)
+            w = tl.load(pos + 2 * position_stride_axis)
+            # The 2-D ATen lookup accepts negative positions.
+            t = tl.where(t < 0, t + cache_rows, t)
+            h = tl.where(h < 0, h + cache_rows, h)
+            w = tl.where(w < 0, w + cache_rows, w)
+            ok_t = (t >= 0) & (t < cache_rows)
+            ok_h = (h >= 0) & (h < cache_rows)
+            ok_w = (w >= 0) & (w < cache_rows)
+            tl.device_assert(ok_t & ok_h & ok_w, "QSA MRoPE position out of range")
+            t_row = cos_sin_ptr + t * cos_sin_stride_token + rotary_offsets
+            h_row = cos_sin_ptr + h * cos_sin_stride_token + rotary_offsets
+            w_row = cos_sin_ptr + w * cos_sin_stride_token + rotary_offsets
+            cos_t = tl.load(t_row, mask=ok_t, other=0.).to(tl.bfloat16).to(tl.float32)
+            cos_h = tl.load(h_row, mask=ok_h, other=0.).to(tl.bfloat16).to(tl.float32)
+            cos_w = tl.load(w_row, mask=ok_w, other=0.).to(tl.bfloat16).to(tl.float32)
+            sin_t = tl.load(t_row + half_rope_dim, mask=ok_t, other=0.).to(tl.bfloat16).to(tl.float32)
+            sin_h = tl.load(h_row + half_rope_dim, mask=ok_h, other=0.).to(tl.bfloat16).to(tl.float32)
+            sin_w = tl.load(w_row + half_rope_dim, mask=ok_w, other=0.).to(tl.bfloat16).to(tl.float32)
+        else:
+            cache_row = cos_sin_ptr + token_id * cos_sin_stride_token
+            cos_t = tl.load(cache_row + rotary_offsets).to(tl.float32)
+            cos_h = tl.load(cache_row + cos_sin_stride_axis + rotary_offsets).to(tl.float32)
+            cos_w = tl.load(cache_row + 2 * cos_sin_stride_axis + rotary_offsets).to(tl.float32)
+            sin_t = tl.load(cache_row + rotary_offsets + half_rope_dim).to(tl.float32)
+            sin_h = tl.load(cache_row + cos_sin_stride_axis + rotary_offsets + half_rope_dim).to(tl.float32)
+            sin_w = tl.load(cache_row + 2 * cos_sin_stride_axis + rotary_offsets + half_rope_dim).to(tl.float32)
         cos = tl.where(h_mask, cos_h, tl.where(w_mask, cos_w, cos_t))
         sin = tl.where(h_mask, sin_h, tl.where(w_mask, sin_w, sin_t))
     else:
@@ -87,6 +115,7 @@ def triton_qsa_rmsnorm_mrope(
     eps: float,
     mrope_section: list[int],
     rope_dim: int,
+    positions=None,
 ) -> torch.Tensor:
     if tensor.ndim != 3:
         raise ValueError("QSA norm+RoPE input must be [tokens, heads, head_dim]")
@@ -98,11 +127,15 @@ def triton_qsa_rmsnorm_mrope(
         raise ValueError("QSA norm+RoPE received an invalid rotary cache view")
     if rope_dim <= 0 or rope_dim > tensor.shape[-1] or rope_dim % 2:
         raise ValueError("QSA norm+RoPE requires an even rotary width")
-    if cos_sin.shape[-2] != tensor.shape[0]:
+    if positions is None and cos_sin.shape[-2] != tensor.shape[0]:
         raise ValueError("QSA norm+RoPE token and rotary rows must match")
 
-    has_mrope = cos_sin.ndim == 3
-    if has_mrope:
+    has_mrope = positions is not None or cos_sin.ndim == 3
+    if positions is not None:
+        if positions.shape != (3, tensor.shape[0]) or cos_sin.ndim != 2 or cos_sin.stride(-1) != 1:
+            raise ValueError("invalid raw MRoPE lookup")
+        cos_sin_stride_axis = 0
+    elif has_mrope:
         if cos_sin.shape[0] != 3 or len(mrope_section) != 3:
             raise ValueError("QSA MRoPE requires three position axes and sections")
         cos_sin_stride_axis = cos_sin.stride(0)
@@ -117,6 +150,7 @@ def triton_qsa_rmsnorm_mrope(
         tensor,
         weight,
         cos_sin,
+        positions if positions is not None else cos_sin,
         output,
         tensor.stride(0),
         tensor.stride(1),
@@ -124,6 +158,10 @@ def triton_qsa_rmsnorm_mrope(
         cos_sin.stride(-2),
         output.stride(0),
         output.stride(1),
+        position_stride_axis=positions.stride(0) if positions is not None else 0,
+        position_stride_token=positions.stride(1) if positions is not None else 0,
+        cache_rows=cos_sin.shape[0] if positions is not None else 0,
+        lookup_positions=positions is not None,
         num_heads=num_heads,
         head_dim=head_dim,
         eps=eps,
@@ -179,6 +217,12 @@ def qsa_norm_rope_va(tensor, positions, weight, eps, rotary):
     """
     if tensor.numel() == 0:
         return tensor
+    if (positions.ndim == 2 and positions.shape[-1] <= 128
+            and rotary.cos_sin_cache.stride(-1) == 1):
+        return triton_qsa_rmsnorm_mrope(
+            tensor, weight, rotary.cos_sin_cache, eps, rotary.mrope_section,
+            rotary.rotary_dim, positions=positions,
+        )
     positions = positions.long()
     if positions.ndim == 1:
         cos_sin = rotary.cos_sin_cache.index_select(0, positions)
