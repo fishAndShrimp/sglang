@@ -6,7 +6,7 @@ contains only fields and transforms consumed by the indexer.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import msgspec
 import torch
@@ -15,6 +15,9 @@ from sglang.srt.layers.attention.qsa.kernel import (
     gather_qsa_compressed_keys,
     qsa_fast_topk,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.hardware_backend.npu.attention.qsa import NPUQSAMetadata
 
 
 def build_qsa_row_ranges(
@@ -97,7 +100,8 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     # Host copy of the extend sequence_lengths; lets prefill MQA skip a device sync.
     prefill_sequence_lengths_cpu: Optional[Tuple[int, ...]] = None
 
-    npu_qsa: Optional[object] = None
+    # The NPU indexer and attention backend share this batch's metadata.
+    npu_qsa: Optional[NPUQSAMetadata] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.sequence_lengths.to(torch.int32)

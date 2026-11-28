@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# FIA page handling is adapted from vllm_ascend/models/qwen4_exp/fia.py.
+# Prefill routing and the indexer's request layout follow attention_dispatch.py
+# and lightning_indexer.py in the same directory.
 """Qwen sparse attention with logical block IDs throughout the NPU path."""
 
 from functools import lru_cache
@@ -20,12 +22,14 @@ from sglang.srt.runtime_context import get_parallel
 
 @lru_cache(maxsize=1)
 def _qsa_ops():
+    """Load the packaged QSA operators on first use."""
     from sgl_kernel_npu._third_party.sgl_ops_transformer_qsa import ops
 
     return ops
 
 
 def norm_rope(tensor, positions, norm, rotary):
+    """Normalize and rotate indexer Q or K in one call, or return None to fall back."""
     if not (
         rotary.is_neox_style
         and tensor.dtype == norm.weight.dtype == torch.bfloat16
@@ -50,6 +54,7 @@ def norm_rope(tensor, positions, norm, rotary):
 
 class GBSAMetadata:
     def __init__(self, pages, cu_q, lengths, visible, heads, max_query):
+        """Prepare the page table, lengths and work schedule that QSA layers share."""
         self.pages = pages
         self.options = dict(
             cu_seqlens_q=cu_q,
@@ -70,6 +75,7 @@ class GBSAMetadata:
         self.schedule = self.build()
 
     def build(self):
+        """Split GBSA work across cores based on the block count for each query."""
         return _qsa_ops().generic_block_sparse_attention_metadata(
             self.shape,
             self.counts,
@@ -81,11 +87,13 @@ class GBSAMetadata:
         )
 
     def refresh_graph(self, lengths):
+        """Update lengths and the schedule at the addresses recorded in the graph."""
         self.options["seqused_kv"].copy_(lengths.clamp_min(1))
         self.counts.copy_((lengths // 4).clamp_max(512))
         self.schedule.copy_(self.build())
 
     def attend(self, q, k, v, blocks, scale):
+        """Run GBSA with this layer's selected block IDs and the shared schedule."""
         ids, counts = attention.qsa_sort_count_groups(blocks.contiguous())
         num_kv_heads = k.size(2)
         ids = ids.expand(num_kv_heads, -1, -1).contiguous()
@@ -107,10 +115,12 @@ class GBSAMetadata:
 
 @lru_cache(maxsize=1)
 def _fia_workspace(device, stream):
+    """Reuse the buffer that holds FIA's attention mask on this stream."""
     return attention.QSAFIAMaskWorkspace(device, 4096, 64 << 20, 520)
 
 
 def _fia(q, k, v, blocks, visible, pages, length, scale, out):
+    """Turn the selected blocks into a token mask and write FIA's result into out."""
     n, h, d = q.shape
     width = ((length + 127) // 128) * 128
     pages = pages[:, : width // 128]
@@ -155,7 +165,7 @@ def _fia(q, k, v, blocks, visible, pages, length, scale, out):
         attention.copy_qsa_fia_output(result.reshape(size, h, d), selected, out[rows])
 
 
-class LightningInputs:
+class LightningIndexerMetadata:
     """Request-level indexer inputs, shared by all layers in a batch."""
 
     def __init__(
@@ -169,6 +179,7 @@ class LightningInputs:
         query_rows=None,
         short_blocks=None
     ):
+        """Allocate the page, length and mask buffers used to score this batch."""
         self.cu_q = cu_q
         self.query_rows = query_rows
         self.short_blocks = short_blocks
@@ -198,6 +209,7 @@ class LightningInputs:
         self.refresh(pages, lengths, visible)
 
     def refresh(self, pages, lengths, visible):
+        """Split visible history into blocks and a tail (10 tokens = 2 blocks + 2 tokens)."""
         # A graph padding row may have no complete block. Score one safe key
         # on page zero and discard its result using the real visibility below.
         self.pages.copy_(torch.where(lengths[:, None] >= 4, pages, 0))
@@ -219,6 +231,7 @@ class LightningInputs:
                 self.meta.copy_(meta)
 
     def select(self, q, cache):
+        """Score the rows that need top-k and return block IDs in query order."""
         if self.query_rows is not None:
             q = q.index_select(0, self.query_rows)
         # The base package supplies IndexerV2 on CANN 9.2 arch22.
@@ -238,10 +251,11 @@ class LightningInputs:
         return blocks
 
 
-class QSAMetadata:
+class NPUQSAMetadata:
     """Batch-owned inputs for block selection and attention on NPU."""
 
     def __init__(self, backend, indexer_metadata, batch, mode, spec_info):
+        """Prepare paged GBSA inputs or group prefill queries by request."""
         config = backend.runner.model_config
         tp = get_parallel().attn_tp_size
         heads = (
@@ -312,7 +326,7 @@ class QSAMetadata:
                     else 1
                 )
                 last = slice(self.width - 1, None, self.width)
-                self.indexer = LightningInputs(
+                self.indexer = LightningIndexerMetadata(
                     pages[last],
                     lengths[last],
                     lengths,
@@ -323,6 +337,7 @@ class QSAMetadata:
         self._prepare_prefill(indexer_metadata, batch.extend_seq_lens_cpu, pages, heads)
 
     def _prepare_prefill(self, indexer_metadata, sizes, pages, heads):
+        """Choose which queries need top-k and which requests use FIA or GBSA."""
         ends = list(accumulate(sizes, initial=0))
         lengths = indexer_metadata.prefill_sequence_lengths_cpu
         scoring_rows, requests, scoring_sizes = [], [], []
@@ -356,7 +371,7 @@ class QSAMetadata:
                 device=pages.device,
                 dtype=torch.int32,
             )
-            self.indexer = LightningInputs(
+            self.indexer = LightningIndexerMetadata(
                 pages.index_select(0, req),
                 indexer_metadata.sequence_lengths.index_select(0, req),
                 visible,
@@ -400,6 +415,7 @@ class QSAMetadata:
                     )
 
     def refresh_graph(self, indexer_metadata):
+        """Refresh GBSA lengths and any indexer inputs for the next graph replay."""
         lengths = indexer_metadata.sequence_lengths
         self.paged.refresh_graph(lengths)
         if self.indexer is not None:
@@ -410,6 +426,7 @@ class QSAMetadata:
 
     @staticmethod
     def store_ring(pool, layer_id, slots, keys, positions):
+        """Keep token keys and positions until their four-token block is complete."""
         from sgl_kernel_npu.operators.mem_cache import qsa_store_cache_rows
         from sglang.srt.layers.attention.qsa.metadata import build_rope_position_matrix
 
@@ -421,6 +438,7 @@ class QSAMetadata:
         )
 
     def select(self, q, pool, layer_id):
+        """Keep all blocks when they fit, or let the indexer choose up to 512."""
         if self.indexer is None:
             return self.short_blocks
         cache = pool.get_qsa_compressed_k_buffer(layer_id).view(
@@ -429,6 +447,7 @@ class QSAMetadata:
         return self.indexer.select(q, cache)
 
     def attend(self, q, k, v, blocks, scale):
+        """Run each group's attention kernel and return results in query order."""
         k, v = k.view(-1, 128, *k.shape[-2:]), v.view(-1, 128, *v.shape[-2:])
         if self.paged is not None:
             return self.paged.attend(q, k, v, blocks, scale)
@@ -455,6 +474,9 @@ class DraftBlockIndices(QSAMTPSharedSparseIndices):
     """Reuse the captured block IDs during draft decode. GBSA reads the partial tail."""
 
     def __init__(self, *, layer_ids, num_requests, tail_width, device, token_topk):
+        """The caller passes 2051 token slots (2048 + 3 for the tail).
+        The draft cache only needs the 512 full block IDs (2051 // 4).
+        """
         super().__init__(
             layer_ids=layer_ids,
             num_requests=num_requests,
@@ -466,6 +488,7 @@ class DraftBlockIndices(QSAMTPSharedSparseIndices):
         self.max_new_blocks = (tail_width + 3) // 4
 
     def lookup(self, req_pool_indices, current_positions, layer_id):
+        """Reuse saved blocks and add any completed by the latest draft tokens."""
         slot = self.layer_slots[int(layer_id)]
         rows = req_pool_indices.long()
         blocks = self.indices[slot, rows]
@@ -473,7 +496,7 @@ class DraftBlockIndices(QSAMTPSharedSparseIndices):
         end = (current_positions + 1) // 4
         for offset in range(self.max_new_blocks):
             block = first + offset
-            # Fill an unused slot first; evict the oldest block at full budget.
+            # argmin picks an empty slot (-1) first, then the oldest block (lowest ID).
             dst = blocks.argmin(dim=1, keepdim=True)
             blocks.scatter_(
                 1,

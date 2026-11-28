@@ -909,6 +909,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
 
     def _prepare_npu_qsa(self, indexer_metadata, mode, spec_info, batch=None):
+        """Attach the batch data shared by NPU block selection and attention."""
         from sglang.srt.hardware_backend.npu.attention.qsa_config import (
             supports_qsa_block_attention,
         )
@@ -919,11 +920,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             and indexer_metadata.token_to_batch_idx.numel()
         ):
             return indexer_metadata
-        from sglang.srt.hardware_backend.npu.attention.qsa import QSAMetadata
+        from sglang.srt.hardware_backend.npu.attention.qsa import NPUQSAMetadata
 
         return msgspec.structs.replace(
             indexer_metadata,
-            npu_qsa=QSAMetadata(self, indexer_metadata, batch, mode, spec_info),
+            npu_qsa=NPUQSAMetadata(self, indexer_metadata, batch, mode, spec_info),
         )
 
     def init_forward_metadata(self, forward_batch):
@@ -1214,6 +1215,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             metadata.indexer_metadata, metadata.row_req_pool_indices
         )
         if _is_npu and metadata.indexer_metadata.npu_qsa is not None:
+            # [NPU QSA block path] After the shared page table and lengths are
+            # updated, use them to refresh the NPU inputs for this replay.
             metadata.indexer_metadata.npu_qsa.refresh_graph(metadata.indexer_metadata)
         self.forward_metadata = metadata
 
@@ -1708,17 +1711,15 @@ class QwenSparseAttnBackend(AttentionBackend):
             return self._pad_extend_output(output, num_output_rows)
         if _is_npu or not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
-            if (
-                _is_npu
-                and metadata.indexer_metadata.npu_qsa is not None
-                and self._uses_block_indices(topk_indices)
-            ):
-                cache = self.token_to_kv_pool.layer_router.read(layer.layer_id)
-                output = metadata.indexer_metadata.npu_qsa.attend(
-                    q, cache.key(), cache.value(), topk_indices, layer.scaling
-                )
-                return self._pad_extend_output(output, num_output_rows)
             if _is_npu and self._uses_block_indices(topk_indices):
+                plan = metadata.indexer_metadata.npu_qsa
+                if plan is not None:
+                    # [NPU QSA block path] Pass block IDs to the FIA/GBSA prefill plan.
+                    cache = self.token_to_kv_pool.layer_router.read(layer.layer_id)
+                    output = plan.attend(
+                        q, cache.key(), cache.value(), topk_indices, layer.scaling
+                    )
+                    return self._pad_extend_output(output, num_output_rows)
                 # Unlike decode, ordinary prefill has no defer_expansion option.
                 # Expanding here lets prefill accept either block IDs
                 # or token IDs from the indexer.
@@ -2243,7 +2244,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         v_buffer = pool.layer_router.read(layer.layer_id).value()
         metadata = self._resolve_metadata(forward_batch)
         plan = metadata.indexer_metadata.npu_qsa
-        if _is_npu and plan is not None and self._uses_block_indices(topk_indices):
+        if _is_npu and self._uses_block_indices(topk_indices) and plan is not None:
+            # [NPU QSA block path] GBSA reads block IDs directly for decode and verify.
             return plan.attend(
                 q, k_buffer, v_buffer, topk_indices, layer.scaling
             ).flatten(1)

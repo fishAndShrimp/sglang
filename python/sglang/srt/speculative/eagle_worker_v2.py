@@ -548,6 +548,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     DraftBlockIndices,
                 )
 
+                # [NPU QSA block path] Save draft-extend block IDs for later draft steps.
                 state_cls = DraftBlockIndices
         state = state_cls(
             layer_ids=layer_ids,

@@ -2,6 +2,7 @@ from sglang.srt.layers.attention.qsa.config import QSAProfile
 
 
 def supports_qsa_block_attention(profile: QSAProfile) -> bool:
+    """Check whether the NPU QSA kernels support this block layout."""
     return (
         # LightningIndexerV2 takes 128-wide Q/K and 1 to 64 query heads.
         profile.head_dim == 128

@@ -211,6 +211,7 @@ class QSAIndexer(MultiPlatformOp):
         if _is_npu:
             from sglang.srt.hardware_backend.npu.attention.qsa import norm_rope
 
+            # [NPU QSA block path] Fuse Q normalization and RoPE for each token.
             q = norm_rope(
                 q_raw.reshape(-1, self.index_n_heads, self.index_head_dim),
                 positions,
@@ -235,6 +236,7 @@ class QSAIndexer(MultiPlatformOp):
         if _is_npu:
             from sglang.srt.hardware_backend.npu.attention.qsa import norm_rope
 
+            # [NPU QSA block path] Apply RoPE to each pooled key at the block's start.
             k = norm_rope(
                 compressed_keys.reshape(-1, self.index_kv_heads, self.index_head_dim),
                 block_positions,
@@ -276,6 +278,7 @@ class QSAIndexer(MultiPlatformOp):
             from sgl_kernel_npu.operators.indexer import qsa_compress_group_slots
             from sgl_kernel_npu.operators.mem_cache import qsa_store_cache_rows
 
+            # [NPU QSA block path] Pool each group and cache one key per block.
             pooled, first = qsa_compress_group_slots(
                 source_keys, source_rope, group_locs
             )
@@ -347,8 +350,10 @@ class QSAIndexer(MultiPlatformOp):
                 _is_npu
                 and metadata.npu_qsa is not None
                 and metadata.npu_qsa.direct_ring_store
+                # qsa_store_cache_rows requires keys to match the cache dtype.
                 and token_k.dtype == pool.index_state_dtype
             ):
+                # [NPU QSA block path] Save pending keys and positions once.
                 metadata.npu_qsa.store_ring(
                     pool,
                     self.layer_id,
@@ -356,14 +361,13 @@ class QSAIndexer(MultiPlatformOp):
                     token_k,
                     rope_positions,
                 )
-                state_stored = True
-        if not state_stored:
-            pool.set_qsa_key_state_buffer(
-                self.layer_id, state_slots[: token_k.shape[0]], token_k
-            )
-            pool.set_qsa_rope_position_buffer(
-                state_slots[: token_k.shape[0]], rope_positions
-            )
+            else:
+                pool.set_qsa_key_state_buffer(
+                    self.layer_id, state_slots[: token_k.shape[0]], token_k
+                )
+                pool.set_qsa_rope_position_buffer(
+                    state_slots[: token_k.shape[0]], rope_positions
+                )
 
         if metadata.is_cuda_graph:
             self._compress_decode_cuda_graph(metadata)
@@ -404,10 +408,10 @@ class QSAIndexer(MultiPlatformOp):
                 )
             source_keys = pool.get_qsa_key_state_buffer(self.layer_id)
             source_rope = pool.qsa_rope_position_buffer
-        # The NPU plan checks the shape. Prefill can read keys from the chunk.
         if (
             _is_npu
             and metadata.npu_qsa is not None
+            # qsa_compress_group_slots averages four BF16 keys per block.
             and source_keys.dtype == torch.bfloat16
         ) or self._use_fused_compress(pool):
             self._fused_compress_store(
@@ -433,10 +437,10 @@ class QSAIndexer(MultiPlatformOp):
             raise RuntimeError("QSA CUDA graph compression metadata is incomplete")
         pool = metadata.token_to_kv_pool
         group_locs = metadata.graph_ring_group_locs
-        # Graph replay reads the keys from the cache, so its dtype applies here.
         if (
             _is_npu
             and metadata.npu_qsa is not None
+            # Replay reads the BF16 keys for qsa_compress_group_slots from the cache.
             and pool.index_state_dtype == torch.bfloat16
         ) or self._use_fused_compress(pool):
             self._fused_compress_store(
@@ -827,6 +831,8 @@ class QSAIndexer(MultiPlatformOp):
             state_stored=state_stored,
         )
         if _is_npu and indexer_metadata.npu_qsa is not None:
+            # [NPU QSA block path] Return block IDs. LightningIndexerV2 ranks them
+            # when needed; short prefill rows keep all visible complete blocks.
             return indexer_metadata.npu_qsa.select(
                 q, indexer_metadata.token_to_kv_pool, self.layer_id
             )
