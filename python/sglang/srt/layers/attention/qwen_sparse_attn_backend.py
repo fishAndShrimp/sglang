@@ -893,12 +893,37 @@ class QwenSparseAttnBackend(AttentionBackend):
             ),
             prefill_sequence_lengths_cpu=prefill_sequence_lengths_cpu,
         )
+        if _is_npu:
+            indexer_metadata = self._prepare_npu_qsa(
+                indexer_metadata,
+                forward_batch.forward_mode,
+                forward_batch.spec_info,
+                forward_batch,
+            )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,
             token_to_batch_idx=token_to_batch_idx,
             token_slot_table=token_slot_table,
             indexer_metadata=indexer_metadata,
             row_req_pool_indices=row_req_pool_indices,
+        )
+
+    def _prepare_npu_qsa(self, indexer_metadata, mode, spec_info, batch=None):
+        from sglang.srt.hardware_backend.npu.attention.qsa_config import (
+            supports_qsa_block_attention,
+        )
+
+        if not (
+            self.qsa_profile
+            and supports_qsa_block_attention(self.qsa_profile)
+            and indexer_metadata.token_to_batch_idx.numel()
+        ):
+            return indexer_metadata
+        from sglang.srt.hardware_backend.npu.attention.qsa import QSAMetadata
+
+        return msgspec.structs.replace(
+            indexer_metadata,
+            npu_qsa=QSAMetadata(self, indexer_metadata, batch, mode, spec_info),
         )
 
     def init_forward_metadata(self, forward_batch):
@@ -1112,6 +1137,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             graph_ring_group_locs=self._graph_ring_group_locs[:metadata_rows],
             defer_block_expansion=self._can_defer_block_expansion(forward_mode),
         )
+        if _is_npu:
+            indexer_metadata = self._prepare_npu_qsa(
+                indexer_metadata, forward_mode, spec_info
+            )
         metadata = QwenSparseAttnMetadata(
             sequence_lengths=self._graph_seq_lens[:metadata_rows],
             token_to_batch_idx=self._graph_token_to_batch[:metadata_rows],
@@ -1184,6 +1213,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._update_qsa_cuda_graph_metadata(
             metadata.indexer_metadata, metadata.row_req_pool_indices
         )
+        if _is_npu and metadata.indexer_metadata.npu_qsa is not None:
+            metadata.indexer_metadata.npu_qsa.refresh_graph(metadata.indexer_metadata)
         self.forward_metadata = metadata
 
     def _can_replay_with_gpu_kernels(self, metadata, seq_lens) -> bool:
@@ -1677,6 +1708,16 @@ class QwenSparseAttnBackend(AttentionBackend):
             return self._pad_extend_output(output, num_output_rows)
         if _is_npu or not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
+            if (
+                _is_npu
+                and metadata.indexer_metadata.npu_qsa is not None
+                and self._uses_block_indices(topk_indices)
+            ):
+                cache = self.token_to_kv_pool.layer_router.read(layer.layer_id)
+                output = metadata.indexer_metadata.npu_qsa.attend(
+                    q, cache.key(), cache.value(), topk_indices, layer.scaling
+                )
+                return self._pad_extend_output(output, num_output_rows)
             if _is_npu and self._uses_block_indices(topk_indices):
                 # Unlike decode, ordinary prefill has no defer_expansion option.
                 # Expanding here lets prefill accept either block IDs
@@ -2201,6 +2242,11 @@ class QwenSparseAttnBackend(AttentionBackend):
         k_buffer = pool.layer_router.read(layer.layer_id).key()
         v_buffer = pool.layer_router.read(layer.layer_id).value()
         metadata = self._resolve_metadata(forward_batch)
+        plan = metadata.indexer_metadata.npu_qsa
+        if _is_npu and plan is not None and self._uses_block_indices(topk_indices):
+            return plan.attend(
+                q, k_buffer, v_buffer, topk_indices, layer.scaling
+            ).flatten(1)
         topk_indices = self._expand_block_indices(topk_indices, metadata)
         if _is_npu or not q.is_cuda:
             slots = self._logical_to_physical(topk_indices, metadata)

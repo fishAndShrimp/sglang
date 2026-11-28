@@ -537,7 +537,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # The expansion emits token_topk + ratio - 1 columns (top-k blocks
         # plus the uncompressed tail of the capture position).
         expanded_width = pool.qsa_token_topk + pool.qsa_compress_ratio - 1
-        state = QSAMTPSharedSparseIndices(
+        state_cls = QSAMTPSharedSparseIndices
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.attention.qsa_config import (
+                supports_qsa_block_attention,
+            )
+
+            if supports_qsa_block_attention(self.draft_extend_attn_backend.qsa_profile):
+                from sglang.srt.hardware_backend.npu.attention.qsa import (
+                    DraftBlockIndices,
+                )
+
+                state_cls = DraftBlockIndices
+        state = state_cls(
             layer_ids=layer_ids,
             num_requests=self.draft_runner.req_to_token_pool.req_to_token.shape[0],
             token_topk=expanded_width,

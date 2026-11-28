@@ -97,6 +97,8 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     # Host copy of the extend sequence_lengths; lets prefill MQA skip a device sync.
     prefill_sequence_lengths_cpu: Optional[Tuple[int, ...]] = None
 
+    npu_qsa: Optional[object] = None
+
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.sequence_lengths.to(torch.int32)
 

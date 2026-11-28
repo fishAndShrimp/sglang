@@ -90,8 +90,16 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
         # Compressed slot = full_slot // ratio; all backends need page-aligned pages.
         # mamba_radix_cache_strategy resolves later, so do not gate on it.
         overrides["page_size"] = 64
+        if get_platform().is_npu:
+            from sglang.srt.hardware_backend.npu.attention.qsa_config import (
+                supports_qsa_block_attention,
+            )
+
+            if supports_qsa_block_attention(profile):
+                overrides["page_size"] = 128
         logger.info(
-            "Setting page size to 64 for compressed QSA "
-            "(full//ratio compressed addressing)."
+            "Setting page size to %d for compressed QSA "
+            "(full//ratio compressed addressing).",
+            overrides["page_size"],
         )
     return overrides

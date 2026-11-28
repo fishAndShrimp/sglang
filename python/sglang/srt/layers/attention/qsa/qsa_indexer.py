@@ -208,6 +208,19 @@ class QSAIndexer(MultiPlatformOp):
             )
             return q, token_k, True
         q_raw = qk[:, : self.index_n_heads * self.index_head_dim]
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.attention.qsa import norm_rope
+
+            q = norm_rope(
+                q_raw.reshape(-1, self.index_n_heads, self.index_head_dim),
+                positions,
+                self.q_layernorm,
+                self.rotary_emb,
+            )
+            if q is not None:
+                if pool is not None:
+                    q = q.to(pool.qsa_compressed_dtype)
+                return q, token_k, False
         q = self.q_layernorm(q_raw.reshape(-1, self.index_head_dim)).reshape(
             -1, self.index_n_heads, self.index_head_dim
         )
@@ -219,6 +232,17 @@ class QSAIndexer(MultiPlatformOp):
     def normalize_compressed_keys(
         self, compressed_keys: torch.Tensor, block_positions: torch.Tensor
     ) -> torch.Tensor:
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.attention.qsa import norm_rope
+
+            k = norm_rope(
+                compressed_keys.reshape(-1, self.index_kv_heads, self.index_head_dim),
+                block_positions,
+                self.k_layernorm,
+                self.rotary_emb,
+            )
+            if k is not None:
+                return k
         normalized = self.k_layernorm(
             compressed_keys.reshape(-1, self.index_head_dim)
         ).reshape(-1, self.index_kv_heads, self.index_head_dim)
@@ -248,6 +272,20 @@ class QSAIndexer(MultiPlatformOp):
         if source_rope is None:
             source_rope = pool.qsa_rope_position_buffer
         compressed_buffer = pool.get_qsa_compressed_k_buffer(self.layer_id)
+        if _is_npu:
+            from sgl_kernel_npu.operators.indexer import qsa_compress_group_slots
+            from sgl_kernel_npu.operators.mem_cache import qsa_store_cache_rows
+
+            pooled, first = qsa_compress_group_slots(
+                source_keys, source_rope, group_locs
+            )
+            k = self.normalize_compressed_keys(pooled, self._rope_from_matrix(first))
+            qsa_store_cache_rows(
+                compressed_buffer.unsqueeze(1),
+                write_locs,
+                k.to(compressed_buffer.dtype),
+            )
+            return
         qsa_index_k_compress_store(
             source_keys.reshape(source_keys.shape[0], -1)
             .contiguous()
@@ -305,6 +343,21 @@ class QSAIndexer(MultiPlatformOp):
                 state_slots = self._pending_ring_slots(
                     metadata, logical_positions, is_extend
                 )
+            if (
+                _is_npu
+                and metadata.npu_qsa is not None
+                and metadata.npu_qsa.direct_ring_store
+                and token_k.dtype == pool.index_state_dtype
+            ):
+                metadata.npu_qsa.store_ring(
+                    pool,
+                    self.layer_id,
+                    state_slots[: token_k.size(0)],
+                    token_k,
+                    rope_positions,
+                )
+                state_stored = True
+        if not state_stored:
             pool.set_qsa_key_state_buffer(
                 self.layer_id, state_slots[: token_k.shape[0]], token_k
             )
@@ -351,7 +404,12 @@ class QSAIndexer(MultiPlatformOp):
                 )
             source_keys = pool.get_qsa_key_state_buffer(self.layer_id)
             source_rope = pool.qsa_rope_position_buffer
-        if self._use_fused_compress(pool):
+        # The NPU plan checks the shape. Prefill can read keys from the chunk.
+        if (
+            _is_npu
+            and metadata.npu_qsa is not None
+            and source_keys.dtype == torch.bfloat16
+        ) or self._use_fused_compress(pool):
             self._fused_compress_store(
                 pool,
                 group_locs,
@@ -375,7 +433,12 @@ class QSAIndexer(MultiPlatformOp):
             raise RuntimeError("QSA CUDA graph compression metadata is incomplete")
         pool = metadata.token_to_kv_pool
         group_locs = metadata.graph_ring_group_locs
-        if self._use_fused_compress(pool):
+        # Graph replay reads the keys from the cache, so its dtype applies here.
+        if (
+            _is_npu
+            and metadata.npu_qsa is not None
+            and pool.index_state_dtype == torch.bfloat16
+        ) or self._use_fused_compress(pool):
             self._fused_compress_store(
                 pool,
                 group_locs,
@@ -763,6 +826,10 @@ class QSAIndexer(MultiPlatformOp):
             state_slots=state_slots,
             state_stored=state_stored,
         )
+        if _is_npu and indexer_metadata.npu_qsa is not None:
+            return indexer_metadata.npu_qsa.select(
+                q, indexer_metadata.token_to_kv_pool, self.layer_id
+            )
         if forward_mode.is_decode() or is_target_verify or is_draft_extend:
             compressed_cache, page_table, compressed_lengths, max_model_len = (
                 indexer_metadata.get_decode_mqa_inputs(self.layer_id)
